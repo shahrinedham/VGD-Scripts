@@ -1,7 +1,6 @@
--- 🚫 VGD STANDALONE ANTIFLING
--- Extracted from the current VGD GUI AntiFling section.
--- This standalone version initializes its own required services
--- and starts AntiFling automatically when loaded.
+-- 🚫 AF STANDALONE
+-- Standalone AntiFling extracted from the VGD GUI.
+-- Auto-starts when loaded.
 
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
@@ -3347,7 +3346,17 @@ end
 -- =========================================================
 
 -- =========================================================
--- AUTO-START STANDALONE ANTIFLING
+-- STANDALONE ANTIFLING UPDATE LOOP
+-- =========================================================
+
+RunService.RenderStepped:Connect(function()
+    if antiFling then
+        updateAntiFling()
+    end
+end)
+
+-- =========================================================
+-- AUTO-START
 -- =========================================================
 
 enableAntiFling()
