@@ -1,7 +1,7 @@
 -- 🌀 VGD Bring + TP + ESP + View + Others GUI
 -- Mobile + Emulator
 -- AntiFling v20 - Aggressive Instant NDS Hazard Protection
--- + Stronger Zero-Contact Unanchored-Part Collision Shield
+-- + Global Unanchored-Part Collision Shield
 -- + NDS Instant Hazard Disable
 -- + NDS Instant TouchInterest Removal
 -- + NDS Property Lock
@@ -10,7 +10,7 @@
 -- + No Fall Damage
 --
 -- Barrier = physical walls + anti-stuck recovery
--- AntiFling = global unanchored-part zero-contact
+-- AntiFling = global unanchored-part no-collision
 --            + nearby no-collision
 --            + player no-collision
 --            + local protection
@@ -1514,9 +1514,6 @@ local antiFlingOriginalCollisionGroups = {}
 local antiFlingPartConnections = {}
 local antiFlingCharacterParts = {}
 
--- Stronger zero-contact protection
-local antiFlingCollisionLocks = {}
-
 local antiFlingGlobalScanCounter = 0
 
 local ANTI_FLING_RADIUS = 14
@@ -1935,7 +1932,7 @@ local function neutralizeNDSPart(part)
         antiFlingNDSPartConnections[part] =
             connections
 
-    end)
+    end
 
 end
 
@@ -2786,11 +2783,6 @@ local function restoreAntiFlingCollisionGroup(part)
 
 end
 
-
--- =========================================================
--- STRONGER ZERO-CONTACT COLLISION PROTECTION
--- =========================================================
-
 local function protectAntiFlingCollisionPart(part)
 
     if not antiFling then
@@ -2861,144 +2853,16 @@ local function protectAntiFlingCollisionPart(part)
 
     end
 
-    -- =====================================================
-    -- IMMEDIATE ZERO-CONTACT SHIELD
-    -- =====================================================
-
     pcall(function()
 
         part.CollisionGroup =
             ANTI_FLING_PART_GROUP
 
-        part.CanCollide = false
-        part.CanTouch = false
-        part.CanQuery = false
-
     end)
 
-    -- =====================================================
-    -- PROPERTY LOCK
-    -- =====================================================
+    if not antiFlingPartConnections[part] then
 
-    if not antiFlingCollisionLocks[part] then
-
-        local connections = {}
-
-        table.insert(
-            connections,
-
-            part:GetPropertyChangedSignal(
-                "CanCollide"
-            ):Connect(
-                function()
-
-                    if not antiFling then
-                        return
-                    end
-
-                    if part
-                        and part.Parent
-                        and not part.Anchored
-                        and part.CanCollide then
-
-                        pcall(function()
-                            part.CanCollide = false
-                        end)
-
-                    end
-
-                end
-            )
-        )
-
-        table.insert(
-            connections,
-
-            part:GetPropertyChangedSignal(
-                "CanTouch"
-            ):Connect(
-                function()
-
-                    if not antiFling then
-                        return
-                    end
-
-                    if part
-                        and part.Parent
-                        and not part.Anchored
-                        and part.CanTouch then
-
-                        pcall(function()
-                            part.CanTouch = false
-                        end)
-
-                    end
-
-                end
-            )
-        )
-
-        table.insert(
-            connections,
-
-            part:GetPropertyChangedSignal(
-                "CanQuery"
-            ):Connect(
-                function()
-
-                    if not antiFling then
-                        return
-                    end
-
-                    if part
-                        and part.Parent
-                        and not part.Anchored
-                        and part.CanQuery then
-
-                        pcall(function()
-                            part.CanQuery = false
-                        end)
-
-                    end
-
-                end
-            )
-        )
-
-        table.insert(
-            connections,
-
-            part:GetPropertyChangedSignal(
-                "CollisionGroup"
-            ):Connect(
-                function()
-
-                    if not antiFling then
-                        return
-                    end
-
-                    if part
-                        and part.Parent
-                        and not part.Anchored
-                        and part.CollisionGroup ~=
-                            ANTI_FLING_PART_GROUP then
-
-                        pcall(function()
-
-                            part.CollisionGroup =
-                                ANTI_FLING_PART_GROUP
-
-                        end)
-
-                    end
-
-                end
-            )
-        )
-
-        table.insert(
-            connections,
-
+        antiFlingPartConnections[part] =
             part:GetPropertyChangedSignal(
                 "Anchored"
             ):Connect(
@@ -3008,14 +2872,9 @@ local function protectAntiFlingCollisionPart(part)
                         return
                     end
 
-                    if not part
-                        or not part.Parent then
-
-                        return
-
-                    end
-
-                    if not part.Anchored then
+                    if part
+                        and part.Parent
+                        and not part.Anchored then
 
                         protectAntiFlingCollisionPart(
                             part
@@ -3031,47 +2890,10 @@ local function protectAntiFlingCollisionPart(part)
 
                 end
             )
-        )
-
-        table.insert(
-            connections,
-
-            part.AncestryChanged:Connect(
-                function()
-
-                    if not antiFling then
-                        return
-                    end
-
-                    if part.Parent then
-
-                        task.defer(function()
-
-                            if antiFling
-                                and part.Parent
-                                and not part.Anchored then
-
-                                protectAntiFlingCollisionPart(
-                                    part
-                                )
-
-                            end
-
-                        end)
-
-                    end
-
-                end
-            )
-        )
-
-        antiFlingCollisionLocks[part] =
-            connections
 
     end
 
 end
-
 
 local function scanAllAntiFlingCollisionParts()
 
@@ -3216,34 +3038,6 @@ local function restoreAllAntiFlingCollisionGroups()
         end
 
         antiFlingPartConnections[part] =
-            nil
-
-    end
-
-    -- Clear stronger collision property locks
-    for part, connections in pairs(
-        antiFlingCollisionLocks
-    ) do
-
-        if connections then
-
-            for _, connection in ipairs(
-                connections
-            ) do
-
-                if connection then
-
-                    pcall(function()
-                        connection:Disconnect()
-                    end)
-
-                end
-
-            end
-
-        end
-
-        antiFlingCollisionLocks[part] =
             nil
 
     end
@@ -3786,6 +3580,7 @@ local function addOtherPartToPair(
 
     if not otherPart.Parent then
         return
+
     end
 
     for _, localPart in ipairs(
@@ -4059,7 +3854,6 @@ local function antiFlingNewPartCheck(part)
 
     end
 
-    -- Immediate zero-contact protection
     protectAntiFlingCollisionPart(part)
 
     if part.Anchored then
@@ -4309,7 +4103,6 @@ local function scanAntiFlingParts()
 
             if not partCharacter then
 
-                -- Immediate zero-contact protection
                 protectAntiFlingCollisionPart(
                     part
                 )
@@ -4591,17 +4384,17 @@ local function enableAntiFling()
                     return
                 end
 
-                -- IMPORTANT:
-                -- Protect immediately.
-                -- No task.defer here.
-                protectAntiFlingCollisionPart(
-                    descendant
-                )
+                task.defer(function()
 
-                -- Additional nearby/assembly protection
-                antiFlingNewPartCheck(
-                    descendant
-                )
+                    if not antiFling then
+                        return
+                    end
+
+                    antiFlingNewPartCheck(
+                        descendant
+                    )
+
+                end)
 
             end
         )
