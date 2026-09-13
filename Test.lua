@@ -6783,11 +6783,13 @@ Instance.new(
         8
     )
 
-local vgdDragging = false
-local vgdDragStart
-local vgdStartPosition
-local vgdActiveInput
-local vgdMoved = false
+local vgdState = {
+    dragging = false,
+    dragStart = nil,
+    startPosition = nil,
+    activeInput = nil,
+    moved = false
+}
 
 VGDButton.InputBegan:Connect(
     function(input)
@@ -6797,14 +6799,14 @@ VGDButton.InputBegan:Connect(
             or input.UserInputType ==
             Enum.UserInputType.MouseButton1 then
 
-            vgdDragging = true
-            vgdMoved = false
-            vgdActiveInput = input
+            vgdState.dragging = true
+            vgdState.moved = false
+            vgdState.activeInput = input
 
-            vgdDragStart =
+            vgdState.dragStart =
                 input.Position
 
-            vgdStartPosition =
+            vgdState.startPosition =
                 VGDButton.Position
 
         end
@@ -6815,32 +6817,32 @@ VGDButton.InputBegan:Connect(
 UserInputService.InputChanged:Connect(
     function(input)
 
-        if not vgdDragging then
+        if not vgdState.dragging then
             return
         end
 
-        if input ~= vgdActiveInput then
+        if input ~= vgdState.activeInput then
             return
         end
 
         local delta =
             input.Position -
-            vgdDragStart
+            vgdState.dragStart
 
         if math.abs(delta.X) > 5
             or math.abs(delta.Y) > 5 then
 
-            vgdMoved = true
+            vgdState.moved = true
 
         end
 
         VGDButton.Position =
             UDim2.new(
-                vgdStartPosition.X.Scale,
-                vgdStartPosition.X.Offset +
+                vgdState.startPosition.X.Scale,
+                vgdState.startPosition.X.Offset +
                     delta.X,
-                vgdStartPosition.Y.Scale,
-                vgdStartPosition.Y.Offset +
+                vgdState.startPosition.Y.Scale,
+                vgdState.startPosition.Y.Offset +
                     delta.Y
             )
 
@@ -6850,24 +6852,24 @@ UserInputService.InputChanged:Connect(
 UserInputService.InputEnded:Connect(
     function(input)
 
-        if not vgdDragging then
+        if not vgdState.dragging then
             return
         end
 
-        if input ~= vgdActiveInput then
+        if input ~= vgdState.activeInput then
             return
         end
 
-        vgdDragging = false
+        vgdState.dragging = false
 
-        if not vgdMoved then
+        if not vgdState.moved then
 
             Frame.Visible =
                 not Frame.Visible
 
         end
 
-        vgdActiveInput = nil
+        vgdState.activeInput = nil
 
     end
 )
