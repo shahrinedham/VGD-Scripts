@@ -3149,9 +3149,44 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- =========================================================
--- AUTO ENABLE
+-- PUBLIC CONTROLLER API
 -- =========================================================
 
-enableAntiFling()
+local VGD_AntiFling = {}
+local VGD_AntiFlingGUIControlled = _G.VGD_AntiFling_GUIControlled == true
 
-print("[VGD AntiFling] Standalone loaded and enabled")
+-- Direct standalone execution keeps the old behavior: enable immediately.
+-- The full GUI sets VGD_AntiFling_GUIControlled first, so the GUI starts OFF
+-- and controls AntiFling through the API below.
+if not VGD_AntiFlingGUIControlled then
+    enableAntiFling()
+end
+
+function VGD_AntiFling.Enable()
+    if not antiFling then
+        enableAntiFling()
+    end
+    return antiFling
+end
+
+function VGD_AntiFling.Disable()
+    if antiFling then
+        disableAntiFling()
+    end
+    return antiFling
+end
+
+function VGD_AntiFling.Toggle()
+    if antiFling then
+        disableAntiFling()
+    else
+        enableAntiFling()
+    end
+    return antiFling
+end
+
+function VGD_AntiFling.IsEnabled()
+    return antiFling
+end
+
+return VGD_AntiFling
