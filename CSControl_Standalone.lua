@@ -44,6 +44,7 @@ local csJoystickTouch = nil
 local csJoystickVector = Vector3.zero
 local csJumpRequested = false
 local csTouchStart = nil
+local csTouchGuiWatchConnection = nil
 
 local function getPlayerControls()
     local controls = nil
@@ -92,16 +93,29 @@ local function destroyCSCustomControls()
 end
 
 local function createCSCustomControls()
-    if not UserInputService.TouchEnabled or csTouchGui then
+    if not UserInputService.TouchEnabled then
         return
+    end
+    if csTouchGui and csTouchGui.Parent then
+        csTouchGui.Enabled = true
+        return
+    end
+    if csTouchGui then
+        csTouchGui = nil
+        csJoystickBase = nil
+        csJoystickKnob = nil
+        csJumpButton = nil
     end
 
     local gui = Instance.new("ScreenGui")
     gui.Name = "VGD_CSControl_TouchGui"
     gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 2000
-    gui.Parent = game.CoreGui
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+    gui.DisplayOrder = 1000000
+    gui.Enabled = true
+    local playerGui = player:FindFirstChildOfClass("PlayerGui")
+    gui.Parent = playerGui or game.CoreGui
     csTouchGui = gui
 
     local base = Instance.new("Frame")
@@ -111,6 +125,7 @@ local function createCSCustomControls()
     base.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
     base.BackgroundTransparency = 0.35
     base.Active = true
+    base.ZIndex = 100
     base.Parent = gui
     Instance.new("UICorner", base).CornerRadius = UDim.new(1, 0)
     csJoystickBase = base
@@ -122,6 +137,7 @@ local function createCSCustomControls()
     knob.BackgroundColor3 = Color3.fromRGB(220, 220, 220)
     knob.BackgroundTransparency = 0.15
     knob.Active = false
+    knob.ZIndex = 101
     knob.Parent = base
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
     csJoystickKnob = knob
@@ -138,6 +154,7 @@ local function createCSCustomControls()
     jump.TextSize = 16
     jump.AutoButtonColor = false
     jump.Active = true
+    jump.ZIndex = 100
     jump.Parent = gui
     Instance.new("UICorner", jump).CornerRadius = UDim.new(1, 0)
     csJumpButton = jump
@@ -191,6 +208,30 @@ local function createCSCustomControls()
             csJoystickKnob.Position = UDim2.new(0.5, -22, 0.5, -22)
         end
     end)
+end
+
+local function startCSCustomControlsWatchdog()
+    if csTouchGuiWatchConnection then return end
+    if not UserInputService.TouchEnabled then return end
+
+    csTouchGuiWatchConnection = RunService.RenderStepped:Connect(function()
+        if not csControlEnabled then return end
+
+        -- Cutscenes can disable/destroy custom ScreenGuis or rebuild PlayerGui.
+        -- Keep our independent controls alive while CS Control is active.
+        if not csTouchGui or not csTouchGui.Parent then
+            createCSCustomControls()
+        else
+            csTouchGui.Enabled = true
+        end
+    end)
+end
+
+local function stopCSCustomControlsWatchdog()
+    if csTouchGuiWatchConnection then
+        csTouchGuiWatchConnection:Disconnect()
+        csTouchGuiWatchConnection = nil
+    end
 end
 
 local function disableCharacterCutsceneMovers(character)
@@ -454,6 +495,7 @@ local function enableCSControl()
     end
 
     createCSCustomControls()
+    startCSCustomControlsWatchdog()
 
     if not csControlRenderBound then
         RunService:BindToRenderStep(CS_CONTROL_BIND_NAME, Enum.RenderPriority.Last.Value, function(dt)
@@ -517,6 +559,7 @@ local function disableCSControl()
     csJumpGraceUntil = 0
 
     destroyCSCustomControls()
+    stopCSCustomControlsWatchdog()
     csControlControls = nil
     csControlSaved = nil
 end
