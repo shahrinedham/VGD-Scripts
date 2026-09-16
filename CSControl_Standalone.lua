@@ -24,11 +24,15 @@ local csLastPosition = nil
 local csStuckTime = 0
 local csDirectMode = false
 local csJumpGraceUntil = 0
+local csGrounded = false
+local csLandingRecoveryUntil = 0
 local CS_CONTROL_BIND_NAME = "VGD_CSControl_Movement"
 local CS_DIRECT_SPEED = 18
 local CS_JUMP_SPEED = 50
 local CS_GRAVITY = workspace.Gravity
 local CS_STUCK_THRESHOLD = 0.30
+local CS_GROUND_OFFSET = 0.05
+local csAnimationTracks = {}
 
 -- Universal fallback mobile controls. Some games completely disable/sink
 -- Roblox's normal PlayerModule input during cutscenes, so we provide our own
@@ -166,7 +170,7 @@ local function createCSCustomControls()
     local function updateJoystick(position)
         if not csJoystickBase or not csJoystickKnob then return end
         local center = csJoystickBase.AbsolutePosition + csJoystickBase.AbsoluteSize / 2
-        local delta = position - center
+        local delta = Vector2.new(position.X, position.Y) - center
         if delta.Magnitude > CS_JOYSTICK_RADIUS then
             delta = delta.Unit * CS_JOYSTICK_RADIUS
         end
@@ -181,21 +185,19 @@ local function createCSCustomControls()
         end
     end
 
-    csControlInputBegan = UserInputService.InputBegan:Connect(function(input)
-        if not csControlEnabled or input.UserInputType ~= Enum.UserInputType.Touch then
-            return
-        end
+    -- Capture touch directly from the joystick GuiObject. This avoids relying
+    -- on global InputChanged events that a game can consume during cutscenes.
+    csControlInputBegan = csJoystickBase.InputBegan:Connect(function(input)
+        if not csControlEnabled or input.UserInputType ~= Enum.UserInputType.Touch then return end
         if csJoystickTouch then return end
-        if csJoystickBase and input.Position.X <= csJoystickBase.AbsolutePosition.X + csJoystickBase.AbsoluteSize.X
-            and input.Position.Y >= csJoystickBase.AbsolutePosition.Y - 20 then
-            csJoystickTouch = input
-            csTouchStart = input.Position
-            updateJoystick(input.Position)
-        end
+        csJoystickTouch = input
+        csTouchStart = input.Position
+        updateJoystick(input.Position)
     end)
 
-    csControlInputChanged = UserInputService.InputChanged:Connect(function(input)
-        if not csControlEnabled or input ~= csJoystickTouch then return end
+    csControlInputChanged = csJoystickBase.InputChanged:Connect(function(input)
+        if not csControlEnabled or input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if input ~= csJoystickTouch then return end
         updateJoystick(input.Position)
     end)
 
@@ -333,6 +335,138 @@ local function directCSJump(root, humanoid)
     end)
 end
 
+local function getCSGroundY(character, root, humanoid, hitPositionY)
+    -- Use Roblox's Humanoid root/hip geometry instead of estimating the
+    -- lowest body-part position. The previous body-part scan could be affected
+    -- by rotated/custom parts and leave the feet slightly inside the floor.
+    -- Root center -> ground is approximately HipHeight + half the root height.
+    local rootHalfHeight = root.Size.Y * 0.5
+    local rootToGround = humanoid.HipHeight + rootHalfHeight
+    return hitPositionY + rootToGround + CS_GROUND_OFFSET
+end
+
+local function getCSAnimationObjects(character)
+    local walkAnimations = {}
+    local runAnimations = {}
+
+    local animate = character and character:FindFirstChild("Animate")
+    if not animate then
+        return walkAnimations, runAnimations
+    end
+
+    for _, obj in ipairs(animate:GetDescendants()) do
+        if obj:IsA("Animation") then
+            local pathNames = {}
+            local current = obj
+            while current and current ~= animate do
+                table.insert(pathNames, string.lower(current.Name or ""))
+                current = current.Parent
+            end
+
+            local path = table.concat(pathNames, "/")
+            if string.find(path, "run", 1, true) then
+                table.insert(runAnimations, obj)
+            elseif string.find(path, "walk", 1, true) then
+                table.insert(walkAnimations, obj)
+            end
+        end
+    end
+
+    return walkAnimations, runAnimations
+end
+
+local function loadCSAnimationTracks(humanoid)
+    if not humanoid then return end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then
+        pcall(function()
+            animator = Instance.new("Animator")
+            animator.Parent = humanoid
+        end)
+    end
+    if not animator then return end
+
+    local character = humanoid.Parent
+    local walkAnimations, runAnimations = getCSAnimationObjects(character)
+
+    -- Keep the joystick/input system completely separate. This only refreshes
+    -- the animation tracks used by the direct movement fallback.
+    csAnimationTracks = {
+        Walk = {},
+        Run = {},
+        Animator = animator,
+    }
+
+    for _, animation in ipairs(walkAnimations) do
+        pcall(function()
+            local track = animator:LoadAnimation(animation)
+            track.Priority = Enum.AnimationPriority.Movement
+            table.insert(csAnimationTracks.Walk, track)
+        end)
+    end
+
+    for _, animation in ipairs(runAnimations) do
+        pcall(function()
+            local track = animator:LoadAnimation(animation)
+            track.Priority = Enum.AnimationPriority.Movement
+            table.insert(csAnimationTracks.Run, track)
+        end)
+    end
+end
+
+local function stopCSLocomotionTracks()
+    for _, group in pairs({csAnimationTracks.Walk or {}, csAnimationTracks.Run or {}}) do
+        for _, track in ipairs(group) do
+            pcall(function() track:Stop(0.10) end)
+        end
+    end
+end
+
+local function updateCSAnimations(humanoid, moving, grounded)
+    if not humanoid or not grounded then return end
+
+    if not csAnimationTracks.Animator or csAnimationTracks.Animator.Parent ~= humanoid then
+        loadCSAnimationTracks(humanoid)
+    end
+
+    if not moving then
+        stopCSLocomotionTracks()
+        return
+    end
+
+    -- Direct CFrame movement does not always feed Roblox's Animate script a
+    -- physical velocity, so explicitly drive the game's own walk/run assets.
+    -- We prefer Run when the game provides one, otherwise Walk.
+    local preferred = csAnimationTracks.Run
+    if not preferred or #preferred == 0 then
+        preferred = csAnimationTracks.Walk
+    end
+
+    if not preferred or #preferred == 0 then return end
+
+    for _, track in ipairs(preferred) do
+        pcall(function()
+            if not track.IsPlaying then
+                track:Play(0.10, 1, 1)
+            end
+            track.Priority = Enum.AnimationPriority.Movement
+            track:AdjustSpeed(1)
+        end)
+    end
+
+    -- Prevent idle locomotion conflicts while our movement track is active.
+    local animator = csAnimationTracks.Animator
+    if animator then
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            local name = string.lower(track.Name or "")
+            if string.find(name, "idle", 1, true) and track ~= preferred[1] then
+                pcall(function() track:Stop(0.10) end)
+            end
+        end
+    end
+end
+
 local function updateDirectCSMovement(moveVector, dt, root, humanoid)
     if not root then return end
 
@@ -367,20 +501,81 @@ local function updateDirectCSMovement(moveVector, dt, root, humanoid)
             csDirectPosition += direction * CS_DIRECT_SPEED * dt
         end
 
-        -- Simple local jump/fall integration for the hard fallback.
+        -- Local jump/fall integration for the hard fallback. Keep the working
+        -- joystick/input path from v18.1 untouched. Only adjust vertical landing
+        -- placement and avoid forcing Running, so the normal Animate script can
+        -- choose idle/walk/run naturally.
+        local grounded = false
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        rayParams.FilterDescendantsInstances = {player.Character}
+
+        local groundHit = workspace:Raycast(
+            csDirectPosition + Vector3.new(0, 2, 0),
+            Vector3.new(0, -8, 0),
+            rayParams
+        )
+
+        if groundHit then
+            local groundY = getCSGroundY(player.Character, root, humanoid, groundHit.Position.Y)
+            local distanceToGround = csDirectPosition.Y - groundY
+            grounded = distanceToGround <= 0.18 and csDirectVelocityY <= 0
+        end
+
         if csDirectVelocityY ~= 0 then
             csDirectVelocityY -= CS_GRAVITY * dt
             csDirectPosition += Vector3.new(0, csDirectVelocityY * dt, 0)
 
-            local rayParams = RaycastParams.new()
-            rayParams.FilterType = Enum.RaycastFilterType.Exclude
-            rayParams.FilterDescendantsInstances = {player.Character}
-            local hit = workspace:Raycast(csDirectPosition + Vector3.new(0, 2, 0), Vector3.new(0, -5, 0), rayParams)
-            if hit and csDirectVelocityY <= 0 then
-                csDirectPosition = Vector3.new(csDirectPosition.X, hit.Position.Y + humanoid.HipHeight + 0.5, csDirectPosition.Z)
-                csDirectVelocityY = 0
+            groundHit = workspace:Raycast(
+                csDirectPosition + Vector3.new(0, 2, 0),
+                Vector3.new(0, -8, 0),
+                rayParams
+            )
+
+            if groundHit and csDirectVelocityY <= 0 then
+                local groundY = getCSGroundY(player.Character, root, humanoid, groundHit.Position.Y)
+                if csDirectPosition.Y <= groundY then
+                    csDirectPosition = Vector3.new(csDirectPosition.X, groundY, csDirectPosition.Z)
+                    csDirectVelocityY = 0
+                    grounded = true
+                    csGrounded = true
+                    csLandingRecoveryUntil = os.clock() + 0.12
+                    -- Clear the jump flag on touchdown. Do not force Running:
+                    -- Roblox's Animate script should select idle/walk/run from
+                    -- the actual movement speed.
+                    pcall(function() humanoid.Jump = false end)
+                    pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Landed) end)
+                end
             end
         end
+
+        if grounded and csDirectVelocityY == 0 then
+            csGrounded = true
+            pcall(function() humanoid.Jump = false end)
+            -- Do not force Landed every frame. Doing that prevents Roblox's
+            -- Animate script from seeing a normal running state, which makes
+            -- the run animation fall back to idle. Only enter Landed on the
+            -- actual touchdown; while moving, let Humanoid:Move drive Running.
+            if direction.Magnitude > CS_TOUCH_DEADZONE then
+                pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Running) end)
+            end
+        elseif csDirectVelocityY > 0 then
+            csGrounded = false
+            pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end)
+        elseif csDirectVelocityY < 0 then
+            csGrounded = false
+            pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Freefall) end)
+        end
+
+        if csGrounded and os.clock() < csLandingRecoveryUntil then
+            pcall(function() humanoid.Jump = false end)
+        end
+
+        updateCSAnimations(
+            humanoid,
+            direction.Magnitude > CS_TOUCH_DEADZONE,
+            csGrounded and csDirectVelocityY == 0
+        )
 
         local currentLook = root.CFrame.LookVector
         local faceDirection = direction.Magnitude > 0.05 and direction or Vector3.new(currentLook.X, 0, currentLook.Z)
@@ -488,6 +683,9 @@ local function enableCSControl()
     csStuckTime = 0
     csDirectMode = false
     csJumpGraceUntil = 0
+    csAnimationTracks = {}
+    csGrounded = false
+    csLandingRecoveryUntil = 0
     csControlEnabled = true
 
     if csControlControls then
@@ -557,6 +755,23 @@ local function disableCSControl()
     csStuckTime = 0
     csDirectMode = false
     csJumpGraceUntil = 0
+    csAnimationTracks = {}
+    csGrounded = false
+    csLandingRecoveryUntil = 0
+
+    local restoreCharacter = player.Character
+    local restoreHumanoid = restoreCharacter and restoreCharacter:FindFirstChildOfClass("Humanoid")
+    if restoreHumanoid then
+        local animator = restoreHumanoid:FindFirstChildOfClass("Animator")
+        if animator then
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                local name = string.lower(track.Name or "")
+                if string.find(name, "walk", 1, true) or string.find(name, "run", 1, true) then
+                    pcall(function() track:Stop(0.1) end)
+                end
+            end
+        end
+    end
 
     destroyCSCustomControls()
     stopCSCustomControlsWatchdog()
