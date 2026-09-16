@@ -122,45 +122,74 @@ local function createCSCustomControls()
     gui.Parent = playerGui or game.CoreGui
     csTouchGui = gui
 
-    local base = Instance.new("Frame")
+    -- Roblox-native Thumbstick visual.
+    -- This uses the same sprite sheet regions as Roblox's TouchThumbstick
+    -- CoreScript, while deliberately keeping our existing 116x116 footprint
+    -- and the existing position so the control itself does not move.
+    local base = Instance.new("ImageLabel")
     base.Name = "JoystickBase"
     base.Size = UDim2.fromOffset(CS_JOYSTICK_RADIUS * 2, CS_JOYSTICK_RADIUS * 2)
     base.Position = UDim2.new(0, CS_JOYSTICK_CENTER.X - CS_JOYSTICK_RADIUS, 1, -145)
-    base.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-    base.BackgroundTransparency = 0.35
+    base.BackgroundTransparency = 1
+    base.BorderSizePixel = 0
+    base.Image = "rbxasset://textures/ui/TouchControlsSheet.png"
+    base.ImageRectOffset = Vector2.new(0, 0)
+    base.ImageRectSize = Vector2.new(220, 220)
     base.Active = true
     base.ZIndex = 100
     base.Parent = gui
-    Instance.new("UICorner", base).CornerRadius = UDim.new(1, 0)
     csJoystickBase = base
 
-    local knob = Instance.new("Frame")
+    local knob = Instance.new("ImageLabel")
     knob.Name = "JoystickKnob"
-    knob.Size = UDim2.fromOffset(44, 44)
-    knob.Position = UDim2.new(0.5, -22, 0.5, -22)
-    knob.BackgroundColor3 = Color3.fromRGB(220, 220, 220)
-    knob.BackgroundTransparency = 0.15
+    knob.Size = UDim2.fromOffset(CS_JOYSTICK_RADIUS, CS_JOYSTICK_RADIUS)
+    knob.Position = UDim2.new(0.5, -CS_JOYSTICK_RADIUS / 2, 0.5, -CS_JOYSTICK_RADIUS / 2)
+    knob.BackgroundTransparency = 1
+    knob.BorderSizePixel = 0
+    knob.Image = "rbxasset://textures/ui/TouchControlsSheet.png"
+    knob.ImageRectOffset = Vector2.new(220, 0)
+    knob.ImageRectSize = Vector2.new(111, 111)
     knob.Active = false
     knob.ZIndex = 101
     knob.Parent = base
-    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
     csJoystickKnob = knob
 
-    local jump = Instance.new("TextButton")
+    -- Roblox-native jump button visual.
+    -- Match Roblox's CoreScript sizing and positioning rules instead of
+    -- hard-coding a single size/offset.
+    local jump = Instance.new("ImageButton")
     jump.Name = "JumpButton"
-    jump.Size = UDim2.fromOffset(68, 68)
-    jump.Position = UDim2.new(1, -100, 1, -145)
-    jump.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-    jump.BackgroundTransparency = 0.25
-    jump.Text = "JUMP"
-    jump.TextColor3 = Color3.new(1, 1, 1)
-    jump.Font = Enum.Font.SourceSansBold
-    jump.TextSize = 16
+    jump.BackgroundTransparency = 1
+    jump.BorderSizePixel = 0
     jump.AutoButtonColor = false
     jump.Active = true
+    jump.Image = "rbxasset://textures/ui/Input/TouchControlsSheetV2.png"
+    jump.ImageRectOffset = Vector2.new(1, 146)
+    jump.ImageRectSize = Vector2.new(144, 144)
     jump.ZIndex = 100
     jump.Parent = gui
-    Instance.new("UICorner", jump).CornerRadius = UDim.new(1, 0)
+
+    local function updateJumpButtonLayout()
+        if not jump or not jump.Parent then return end
+
+        local camera = workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+        local minAxis = math.min(viewport.X, viewport.Y)
+
+        -- These values mirror Roblox's TouchJump CoreScript:
+        -- small screen: 70x70
+        -- regular screen: 120x120
+        local isSmallScreen = minAxis <= 500
+        local jumpButtonSize = isSmallScreen and 70 or 120
+
+        jump.Size = UDim2.fromOffset(jumpButtonSize, jumpButtonSize)
+        jump.Position = isSmallScreen
+            and UDim2.new(1, -(jumpButtonSize * 1.5 - 10), 1, -jumpButtonSize - 20)
+            or UDim2.new(1, -(jumpButtonSize * 1.5 - 10), 1, -jumpButtonSize * 1.75)
+    end
+
+    updateJumpButtonLayout()
+
     csJumpButton = jump
 
     jump.Activated:Connect(function()
@@ -174,7 +203,7 @@ local function createCSCustomControls()
         if delta.Magnitude > CS_JOYSTICK_RADIUS then
             delta = delta.Unit * CS_JOYSTICK_RADIUS
         end
-        csJoystickKnob.Position = UDim2.new(0.5, delta.X - 22, 0.5, delta.Y - 22)
+        csJoystickKnob.Position = UDim2.new(0.5, delta.X - (csJoystickKnob.AbsoluteSize.X / 2), 0.5, delta.Y - (csJoystickKnob.AbsoluteSize.Y / 2))
         local x = delta.X / CS_JOYSTICK_RADIUS
         local y = delta.Y / CS_JOYSTICK_RADIUS
         local magnitude = math.sqrt(x * x + y * y)
@@ -207,7 +236,7 @@ local function createCSCustomControls()
         csTouchStart = nil
         csJoystickVector = Vector3.zero
         if csJoystickKnob then
-            csJoystickKnob.Position = UDim2.new(0.5, -22, 0.5, -22)
+            csJoystickKnob.Position = UDim2.new(0.5, -(csJoystickKnob.AbsoluteSize.X / 2), 0.5, -(csJoystickKnob.AbsoluteSize.Y / 2))
         end
     end)
 end
@@ -225,6 +254,26 @@ local function startCSCustomControlsWatchdog()
             createCSCustomControls()
         else
             csTouchGui.Enabled = true
+            if csJumpButton then
+                local camera = workspace.CurrentCamera
+                local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+                local minAxis = math.min(viewport.X, viewport.Y)
+                local isSmallScreen = minAxis <= 500
+                local jumpButtonSize = isSmallScreen and 70 or 120
+
+                if csJumpButton.AbsoluteSize.X ~= jumpButtonSize or
+                   csJumpButton.AbsoluteSize.Y ~= jumpButtonSize then
+                    csJumpButton.Size = UDim2.fromOffset(jumpButtonSize, jumpButtonSize)
+                end
+
+                local targetPosition = isSmallScreen
+                    and UDim2.new(1, -(jumpButtonSize * 1.5 - 10), 1, -jumpButtonSize - 20)
+                    or UDim2.new(1, -(jumpButtonSize * 1.5 - 10), 1, -jumpButtonSize * 1.75)
+
+                if csJumpButton.Position ~= targetPosition then
+                    csJumpButton.Position = targetPosition
+                end
+            end
         end
     end)
 end
