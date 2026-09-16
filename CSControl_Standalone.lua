@@ -28,7 +28,7 @@ local CS_CONTROL_BIND_NAME = "VGD_CSControl_Movement"
 local CS_DIRECT_SPEED = 18
 local CS_JUMP_SPEED = 50
 local CS_GRAVITY = workspace.Gravity
-local CS_STUCK_THRESHOLD = 0.10
+local CS_STUCK_THRESHOLD = 0.30
 
 -- Universal fallback mobile controls. Some games completely disable/sink
 -- Roblox's normal PlayerModule input during cutscenes, so we provide our own
@@ -341,43 +341,57 @@ local function updateDirectCSMovement(moveVector, dt, root, humanoid)
     end
 
     local direction = getDirectMoveDirection(moveVector)
-
-    -- CS Control is intentionally always in hard takeover mode. The normal
-    -- Humanoid controller can remain enabled for animations/input, but the
-    -- character's physical position is driven by our own CFrame mover.
-    csDirectMode = true
+    local moved = (csLastPosition and (root.Position - csLastPosition).Magnitude) or 0
 
     if direction.Magnitude > CS_TOUCH_DEADZONE then
-        csDirectPosition += direction * CS_DIRECT_SPEED * dt
-    end
-
-    -- Local jump/fall integration. The root is anchored, so Roblox physics
-    -- cannot immediately cancel the movement or the vertical impulse.
-    if csDirectVelocityY ~= 0 then
-        csDirectVelocityY -= CS_GRAVITY * dt
-        csDirectPosition += Vector3.new(0, csDirectVelocityY * dt, 0)
-
-        local rayParams = RaycastParams.new()
-        rayParams.FilterType = Enum.RaycastFilterType.Exclude
-        rayParams.FilterDescendantsInstances = {player.Character}
-        local hit = workspace:Raycast(csDirectPosition + Vector3.new(0, 2, 0), Vector3.new(0, -5, 0), rayParams)
-        if hit and csDirectVelocityY <= 0 then
-            csDirectPosition = Vector3.new(csDirectPosition.X, hit.Position.Y + humanoid.HipHeight + 0.5, csDirectPosition.Z)
-            csDirectVelocityY = 0
+        if moved < 0.05 then
+            csStuckTime += dt
+        else
+            csStuckTime = 0
         end
+    else
+        csStuckTime = 0
     end
 
-    local currentLook = root.CFrame.LookVector
-    local faceDirection = direction.Magnitude > 0.05 and direction or Vector3.new(currentLook.X, 0, currentLook.Z)
-    if faceDirection.Magnitude > 0.01 then
-        faceDirection = Vector3.new(faceDirection.X, 0, faceDirection.Z).Unit
-        pcall(function()
-            root.CFrame = CFrame.lookAt(csDirectPosition, csDirectPosition + faceDirection)
-        end)
-    else
-        pcall(function()
-            root.CFrame = CFrame.new(csDirectPosition) * (root.CFrame - root.CFrame.Position)
-        end)
+    -- Only take over the root when normal Humanoid movement is demonstrably
+    -- being blocked. Once takeover begins, keep our own position instead of
+    -- copying root.Position every frame; cutscene scripts may continuously
+    -- snap the HumanoidRootPart back to their own target.
+    if csDirectMode or csStuckTime >= CS_STUCK_THRESHOLD then
+        if not csDirectMode then
+            csDirectMode = true
+            csDirectPosition = root.Position
+        end
+
+        if direction.Magnitude > CS_TOUCH_DEADZONE then
+            csDirectPosition += direction * CS_DIRECT_SPEED * dt
+        end
+
+        -- Simple local jump/fall integration for the hard fallback.
+        if csDirectVelocityY ~= 0 then
+            csDirectVelocityY -= CS_GRAVITY * dt
+            csDirectPosition += Vector3.new(0, csDirectVelocityY * dt, 0)
+
+            local rayParams = RaycastParams.new()
+            rayParams.FilterType = Enum.RaycastFilterType.Exclude
+            rayParams.FilterDescendantsInstances = {player.Character}
+            local hit = workspace:Raycast(csDirectPosition + Vector3.new(0, 2, 0), Vector3.new(0, -5, 0), rayParams)
+            if hit and csDirectVelocityY <= 0 then
+                csDirectPosition = Vector3.new(csDirectPosition.X, hit.Position.Y + humanoid.HipHeight + 0.5, csDirectPosition.Z)
+                csDirectVelocityY = 0
+            end
+        end
+
+        local currentLook = root.CFrame.LookVector
+        local faceDirection = direction.Magnitude > 0.05 and direction or Vector3.new(currentLook.X, 0, currentLook.Z)
+        if faceDirection.Magnitude > 0.01 then
+            faceDirection = Vector3.new(faceDirection.X, 0, faceDirection.Z).Unit
+            pcall(function()
+                root.CFrame = CFrame.lookAt(csDirectPosition, csDirectPosition + faceDirection)
+            end)
+        else
+            pcall(function() root.CFrame = CFrame.new(csDirectPosition) * (root.CFrame - root.CFrame.Position) end)
+        end
     end
 
     csLastPosition = root.Position
@@ -421,10 +435,10 @@ local function forceCSControlCharacter(dt)
     local root = character and character:FindFirstChild("HumanoidRootPart")
     if not humanoid or not root then return end
 
-    -- Hard takeover: anchor the root immediately. This mirrors the behavior
-    -- that already proved effective with VGD Freeze: cutscene movement code
-    -- cannot physically drive the character while our direct mover owns it.
-    pcall(function() root.Anchored = true end)
+    -- In hard takeover mode, locally anchor the root so common cutscene
+    -- Humanoid movement/physics cannot immediately take control back. Our
+    -- direct CFrame mover below becomes the movement source instead.
+    pcall(function() root.Anchored = csDirectMode end)
     pcall(function() humanoid.PlatformStand = false end)
     disableCharacterCutsceneMovers(character)
     pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end)
@@ -472,7 +486,7 @@ local function enableCSControl()
     csDirectVelocityY = 0
     csLastPosition = root.Position
     csStuckTime = 0
-    csDirectMode = true
+    csDirectMode = false
     csJumpGraceUntil = 0
     csControlEnabled = true
 
