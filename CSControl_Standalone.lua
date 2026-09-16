@@ -7,6 +7,7 @@ local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 
 local csControlEnabled = false
 local csControlRenderBound = false
@@ -49,6 +50,7 @@ local csJoystickVector = Vector3.zero
 local csJumpRequested = false
 local csTouchStart = nil
 local csTouchGuiWatchConnection = nil
+local csDynamicFirstTouch = true
 
 local function getPlayerControls()
     local controls = nil
@@ -87,6 +89,7 @@ local function destroyCSCustomControls()
     csJoystickVector = Vector3.zero
     csJumpRequested = false
     csTouchStart = nil
+    csDynamicFirstTouch = true
     if csTouchGui then
         csTouchGui:Destroy()
         csTouchGui = nil
@@ -122,41 +125,335 @@ local function createCSCustomControls()
     gui.Parent = playerGui or game.CoreGui
     csTouchGui = gui
 
-    -- Roblox-native Thumbstick visual.
-    -- This uses the same sprite sheet regions as Roblox's TouchThumbstick
-    -- CoreScript, while deliberately keeping our existing 116x116 footprint
-    -- and the existing position so the control itself does not move.
-    local base = Instance.new("ImageLabel")
-    base.Name = "JoystickBase"
-    base.Size = UDim2.fromOffset(CS_JOYSTICK_RADIUS * 2, CS_JOYSTICK_RADIUS * 2)
-    base.Position = UDim2.new(0, CS_JOYSTICK_CENTER.X - CS_JOYSTICK_RADIUS, 1, -145)
-    base.BackgroundTransparency = 1
-    base.BorderSizePixel = 0
-    base.Image = "rbxasset://textures/ui/TouchControlsSheet.png"
-    base.ImageRectOffset = Vector2.new(0, 0)
-    base.ImageRectSize = Vector2.new(220, 220)
-    base.Active = true
-    base.ZIndex = 100
-    base.Parent = gui
-    csJoystickBase = base
+    -- ================================================================
+    -- Roblox Dynamic Thumbstick recreation.
+    -- Based on Roblox's DynamicThumbstick CoreScript implementation:
+    --   * 45px stick / 20px ring on normal mobile screens
+    --   * all dimensions double when min(viewport.X, viewport.Y) > 500
+    --   * portrait control zone = bottom 40% of the screen
+    --   * landscape control zone = left 40%, lower 2/3 of the screen
+    --   * thumbstick appears at the point where the finger first touches
+    --   * the visual uses Roblox's TouchControlsSheetV2 sprite region
+    -- ================================================================
+    local DYNAMIC_SHEET = "rbxasset://textures/ui/Input/TouchControlsSheetV2.png"
+    local ThumbstickSize = 45
+    local ThumbstickRingSize = 20
+    local MiddleSize = 10
+    local MiddleSpacing = MiddleSize + 4
+    local RadiusOfDeadZone = 2
+    local RadiusOfMaxSpeed = 50
 
-    local knob = Instance.new("ImageLabel")
-    knob.Name = "JoystickKnob"
-    knob.Size = UDim2.fromOffset(CS_JOYSTICK_RADIUS, CS_JOYSTICK_RADIUS)
-    knob.Position = UDim2.new(0.5, -CS_JOYSTICK_RADIUS / 2, 0.5, -CS_JOYSTICK_RADIUS / 2)
-    knob.BackgroundTransparency = 1
-    knob.BorderSizePixel = 0
-    knob.Image = "rbxasset://textures/ui/TouchControlsSheet.png"
-    knob.ImageRectOffset = Vector2.new(220, 0)
-    knob.ImageRectSize = Vector2.new(111, 111)
-    knob.Active = false
-    knob.ZIndex = 101
-    knob.Parent = base
-    csJoystickKnob = knob
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+    local isBigScreen = math.min(viewport.X, viewport.Y) > 500
+    if isBigScreen then
+        ThumbstickSize *= 2
+        ThumbstickRingSize *= 2
+        MiddleSize *= 2
+        MiddleSpacing *= 2
+        RadiusOfDeadZone *= 2
+        RadiusOfMaxSpeed *= 2
+    end
 
-    -- Roblox-native jump button visual.
-    -- Match Roblox's CoreScript sizing and positioning rules instead of
-    -- hard-coding a single size/offset.
+    local thumbstickFrame = Instance.new("Frame")
+    thumbstickFrame.Name = "DynamicThumbstickFrame"
+    thumbstickFrame.Active = true
+    thumbstickFrame.Visible = true
+    thumbstickFrame.BackgroundTransparency = 1
+    thumbstickFrame.BorderSizePixel = 0
+    thumbstickFrame.ZIndex = 90
+    thumbstickFrame.Parent = gui
+
+    local gestureArea = Instance.new("Frame")
+    gestureArea.Name = "GestureArea"
+    gestureArea.Active = false
+    gestureArea.Visible = true
+    gestureArea.BackgroundTransparency = 1
+    gestureArea.BorderSizePixel = 0
+    gestureArea.ZIndex = 89
+    gestureArea.Parent = gui
+
+    local function layoutDynamicFrame()
+        local cam = workspace.CurrentCamera
+        local size = cam and cam.ViewportSize or Vector2.new(800, 600)
+        local portraitMode = size.X < size.Y
+
+        if portraitMode then
+            thumbstickFrame.Size = UDim2.new(1, 0, 0.4, 0)
+            thumbstickFrame.Position = UDim2.new(0, 0, 0.6, 0)
+            gestureArea.Size = UDim2.new(1, 0, 0.6, 0)
+            gestureArea.Position = UDim2.new(0, 0, 0, 0)
+        else
+            thumbstickFrame.Size = UDim2.new(0.4, 0, 2 / 3, 0)
+            thumbstickFrame.Position = UDim2.new(0, 0, 1 / 3, 0)
+            gestureArea.Size = UDim2.new(1, 0, 1, 0)
+            gestureArea.Position = UDim2.new(0, 0, 0, 0)
+        end
+    end
+
+    layoutDynamicFrame()
+
+    local startImage = Instance.new("ImageLabel")
+    startImage.Name = "ThumbstickStart"
+    startImage.Visible = true
+    startImage.BackgroundTransparency = 1
+    startImage.BorderSizePixel = 0
+    startImage.Image = DYNAMIC_SHEET
+    startImage.ImageRectOffset = Vector2.new(1, 1)
+    startImage.ImageRectSize = Vector2.new(144, 144)
+    startImage.ImageColor3 = Color3.new(0, 0, 0)
+    startImage.ImageTransparency = 1
+    startImage.AnchorPoint = Vector2.new(0.5, 0.5)
+    startImage.Position = UDim2.new(0, ThumbstickRingSize * 3.3, 1, -ThumbstickRingSize * 2.8)
+    startImage.Size = UDim2.fromOffset(ThumbstickRingSize * 3.7, ThumbstickRingSize * 3.7)
+    startImage.ZIndex = 100
+    startImage.Parent = thumbstickFrame
+
+    local endImage = Instance.new("ImageLabel")
+    endImage.Name = "ThumbstickEnd"
+    endImage.Visible = true
+    endImage.BackgroundTransparency = 1
+    endImage.BorderSizePixel = 0
+    endImage.Image = DYNAMIC_SHEET
+    endImage.ImageRectOffset = Vector2.new(1, 1)
+    endImage.ImageRectSize = Vector2.new(144, 144)
+    endImage.AnchorPoint = Vector2.new(0.5, 0.5)
+    endImage.Position = startImage.Position
+    endImage.Size = UDim2.fromOffset(ThumbstickSize * 0.8, ThumbstickSize * 0.8)
+    endImage.ImageTransparency = 1
+    endImage.ZIndex = 100
+    endImage.Parent = thumbstickFrame
+
+    local middleImages = {}
+    local middleTransparencies = {
+        1 - 0.89,
+        1 - 0.70,
+        1 - 0.60,
+        1 - 0.50,
+        1 - 0.40,
+        1 - 0.30,
+        1 - 0.25,
+    }
+
+    for i, transparency in ipairs(middleTransparencies) do
+        local image = Instance.new("ImageLabel")
+        image.Name = "ThumbstickMiddle"
+        image.Visible = false
+        image.BackgroundTransparency = 1
+        image.BorderSizePixel = 0
+        image.Image = DYNAMIC_SHEET
+        image.ImageRectOffset = Vector2.new(1, 1)
+        image.ImageRectSize = Vector2.new(144, 144)
+        image.ImageTransparency = transparency
+        image.AnchorPoint = Vector2.new(0.5, 0.5)
+        image.ZIndex = 99
+        image.Parent = thumbstickFrame
+        middleImages[i] = image
+    end
+
+    csJoystickBase = thumbstickFrame
+    csJoystickKnob = endImage
+
+    local moveTouchObject = nil
+    local moveTouchStartPosition = nil
+    local currentDynamicVector = Vector3.zero
+    local dynamicMoveConnection = nil
+    local dynamicEndConnection = nil
+    local dynamicViewportConnection = nil
+
+    local function setDynamicVector(direction)
+        local magnitude = direction.Magnitude
+        if magnitude < RadiusOfDeadZone then
+            currentDynamicVector = Vector3.zero
+            return
+        end
+
+        local normalized = direction.Unit
+        local scaled = math.clamp(
+            (magnitude - RadiusOfDeadZone) / math.max(1, RadiusOfMaxSpeed - RadiusOfDeadZone),
+            0,
+            1
+        )
+        currentDynamicVector = Vector3.new(normalized.X * scaled, 0, normalized.Y * scaled)
+        csJoystickVector = currentDynamicVector
+    end
+
+    local function layoutMiddleImages(startPos, endPos)
+        local startDist = (ThumbstickSize / 2) + MiddleSize
+        local vector = endPos - startPos
+        local distance = vector.Magnitude
+        if distance < 0.001 then
+            for _, image in ipairs(middleImages) do
+                image.Visible = false
+            end
+            return
+        end
+
+        local distAvailable = distance - (ThumbstickRingSize / 2) - MiddleSize
+        local direction = vector.Unit
+        local distNeeded = MiddleSpacing * #middleImages
+        local spacing = MiddleSpacing
+        if distNeeded < distAvailable then
+            spacing = distAvailable / #middleImages
+        end
+
+        for i, image in ipairs(middleImages) do
+            local distWithout = startDist + (spacing * (i - 2))
+            local currentDist = startDist + (spacing * (i - 1))
+            if distWithout < distAvailable then
+                local pos = endPos - direction * currentDist
+                local exposedFraction = math.clamp(
+                    1 - ((currentDist - distAvailable) / spacing),
+                    0,
+                    1
+                )
+                image.Visible = true
+                image.Position = UDim2.fromOffset(pos.X, pos.Y)
+                image.Size = UDim2.fromOffset(MiddleSize * exposedFraction, MiddleSize * exposedFraction)
+            else
+                image.Visible = false
+            end
+        end
+    end
+
+    local function moveDynamicStick(position)
+        if not moveTouchStartPosition then return end
+
+        local startPos = Vector2.new(
+            moveTouchStartPosition.X - thumbstickFrame.AbsolutePosition.X,
+            moveTouchStartPosition.Y - thumbstickFrame.AbsolutePosition.Y
+        )
+        local endPos = Vector2.new(
+            position.X - thumbstickFrame.AbsolutePosition.X,
+            position.Y - thumbstickFrame.AbsolutePosition.Y
+        )
+
+        local relative = endPos - startPos
+        local distance = relative.Magnitude
+        local maxLength = RadiusOfMaxSpeed
+        local clamped = math.min(distance, maxLength)
+        local output = distance > maxLength and relative.Unit * maxLength or relative
+        local clampedEnd = startPos + output
+
+        endImage.Position = UDim2.fromOffset(clampedEnd.X, clampedEnd.Y)
+        layoutMiddleImages(startPos, clampedEnd)
+        setDynamicVector(Vector2.new(
+            clampedEnd.X - startPos.X,
+            clampedEnd.Y - startPos.Y
+        ))
+    end
+
+    local fadeInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+
+    local function fadeDynamicStick(visible)
+        if visible then
+            TweenService:Create(startImage, fadeInfo, {ImageTransparency = 0}):Play()
+            TweenService:Create(endImage, fadeInfo, {ImageTransparency = 0.2}):Play()
+            for i, image in ipairs(middleImages) do
+                TweenService:Create(image, fadeInfo, {ImageTransparency = middleTransparencies[i]}):Play()
+            end
+        else
+            TweenService:Create(startImage, fadeInfo, {ImageTransparency = 1}):Play()
+            TweenService:Create(endImage, fadeInfo, {ImageTransparency = 1}):Play()
+            for _, image in ipairs(middleImages) do
+                TweenService:Create(image, fadeInfo, {ImageTransparency = 1}):Play()
+            end
+        end
+    end
+
+    local function hideDynamicStick()
+        moveTouchObject = nil
+        moveTouchStartPosition = nil
+        currentDynamicVector = Vector3.zero
+        csJoystickVector = Vector3.zero
+        fadeDynamicStick(false)
+    end
+
+    local function showDynamicStick(input)
+        moveTouchObject = input
+        moveTouchStartPosition = input.Position
+
+        local startPos = Vector2.new(
+            input.Position.X - thumbstickFrame.AbsolutePosition.X,
+            input.Position.Y - thumbstickFrame.AbsolutePosition.Y
+        )
+
+        startImage.Visible = true
+        endImage.Visible = true
+        startImage.Position = UDim2.fromOffset(startPos.X, startPos.Y)
+        endImage.Position = startImage.Position
+
+        if csDynamicFirstTouch then
+            csDynamicFirstTouch = false
+            startImage.Size = UDim2.fromOffset(ThumbstickRingSize * 3.7, ThumbstickRingSize * 3.7)
+            endImage.Size = UDim2.fromOffset(ThumbstickSize * 0.8, ThumbstickSize * 0.8)
+
+            TweenService:Create(
+                startImage,
+                TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                {Size = UDim2.fromOffset(0, 0)}
+            ):Play()
+
+            TweenService:Create(
+                endImage,
+                TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                {Size = UDim2.fromOffset(ThumbstickSize, ThumbstickSize), ImageColor3 = Color3.new(0, 0, 0)}
+            ):Play()
+        else
+            startImage.Size = UDim2.fromOffset(0, 0)
+            endImage.Size = UDim2.fromOffset(ThumbstickSize, ThumbstickSize)
+            endImage.ImageColor3 = Color3.new(0, 0, 0)
+        end
+
+        for i, image in ipairs(middleImages) do
+            image.ImageTransparency = middleTransparencies[i]
+        end
+
+        layoutMiddleImages(startPos, startPos)
+        setDynamicVector(Vector2.zero)
+        fadeDynamicStick(true)
+    end
+
+    csControlInputBegan = thumbstickFrame.InputBegan:Connect(function(input)
+        if not csControlEnabled then return end
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if input.UserInputState ~= Enum.UserInputState.Begin then return end
+        if moveTouchObject then return end
+        showDynamicStick(input)
+        moveDynamicStick(input.Position)
+    end)
+
+    dynamicMoveConnection = UserInputService.TouchMoved:Connect(function(input)
+        if not csControlEnabled then return end
+        if input ~= moveTouchObject then return end
+        moveDynamicStick(input.Position)
+    end)
+
+    dynamicEndConnection = UserInputService.TouchEnded:Connect(function(input)
+        if input ~= moveTouchObject then return end
+        hideDynamicStick()
+    end)
+
+    csControlInputChanged = dynamicMoveConnection
+    csControlInputEnded = dynamicEndConnection
+
+    dynamicViewportConnection = workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        layoutDynamicFrame()
+    end)
+
+    local function connectViewportSize()
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        return cam:GetPropertyChangedSignal("ViewportSize"):Connect(layoutDynamicFrame)
+    end
+
+    local viewportConnection = connectViewportSize()
+
+    -- Roblox's Dynamic Thumbstick starts hidden and only appears at the
+    -- finger's touch point. Keep the screen clean until the player touches.
+    hideDynamicStick()
+
+    -- Roblox-native jump button visual, matching v18.12 exactly.
     local jump = Instance.new("ImageButton")
     jump.Name = "JumpButton"
     jump.BackgroundTransparency = 1
@@ -171,14 +468,9 @@ local function createCSCustomControls()
 
     local function updateJumpButtonLayout()
         if not jump or not jump.Parent then return end
-
-        local camera = workspace.CurrentCamera
-        local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
-        local minAxis = math.min(viewport.X, viewport.Y)
-
-        -- These values mirror Roblox's TouchJump CoreScript:
-        -- small screen: 70x70
-        -- regular screen: 120x120
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        local minAxis = math.min(vp.X, vp.Y)
         local isSmallScreen = minAxis <= 500
         local jumpButtonSize = isSmallScreen and 70 or 120
 
@@ -189,55 +481,27 @@ local function createCSCustomControls()
     end
 
     updateJumpButtonLayout()
-
     csJumpButton = jump
 
     jump.Activated:Connect(function()
         csJumpRequested = true
     end)
 
-    local function updateJoystick(position)
-        if not csJoystickBase or not csJoystickKnob then return end
-        local center = csJoystickBase.AbsolutePosition + csJoystickBase.AbsoluteSize / 2
-        local delta = Vector2.new(position.X, position.Y) - center
-        if delta.Magnitude > CS_JOYSTICK_RADIUS then
-            delta = delta.Unit * CS_JOYSTICK_RADIUS
-        end
-        csJoystickKnob.Position = UDim2.new(0.5, delta.X - (csJoystickKnob.AbsoluteSize.X / 2), 0.5, delta.Y - (csJoystickKnob.AbsoluteSize.Y / 2))
-        local x = delta.X / CS_JOYSTICK_RADIUS
-        local y = delta.Y / CS_JOYSTICK_RADIUS
-        local magnitude = math.sqrt(x * x + y * y)
-        if magnitude < CS_TOUCH_DEADZONE then
-            csJoystickVector = Vector3.zero
-        else
-            csJoystickVector = Vector3.new(x, 0, y)
-        end
-    end
+    -- Keep jump layout responsive without touching the dynamic thumbstick's
+    -- actual touch behavior.
+    local jumpViewportConnection = workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(updateJumpButtonLayout)
+    local jumpCamera = workspace.CurrentCamera
+    local jumpViewportSizeConnection = jumpCamera and jumpCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateJumpButtonLayout) or nil
 
-    -- Capture touch directly from the joystick GuiObject. This avoids relying
-    -- on global InputChanged events that a game can consume during cutscenes.
-    csControlInputBegan = csJoystickBase.InputBegan:Connect(function(input)
-        if not csControlEnabled or input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if csJoystickTouch then return end
-        csJoystickTouch = input
-        csTouchStart = input.Position
-        updateJoystick(input.Position)
-    end)
-
-    csControlInputChanged = csJoystickBase.InputChanged:Connect(function(input)
-        if not csControlEnabled or input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if input ~= csJoystickTouch then return end
-        updateJoystick(input.Position)
-    end)
-
-    csControlInputEnded = UserInputService.InputEnded:Connect(function(input)
-        if input ~= csJoystickTouch then return end
-        csJoystickTouch = nil
-        csTouchStart = nil
-        csJoystickVector = Vector3.zero
-        if csJoystickKnob then
-            csJoystickKnob.Position = UDim2.new(0.5, -(csJoystickKnob.AbsoluteSize.X / 2), 0.5, -(csJoystickKnob.AbsoluteSize.Y / 2))
-        end
+    -- Store cleanup connections on the GUI so destroying the GUI also releases
+    -- all dynamic-thumbstick listeners cleanly.
+    gui.Destroying:Connect(function()
+        if dynamicMoveConnection then dynamicMoveConnection:Disconnect() end
+        if dynamicEndConnection then dynamicEndConnection:Disconnect() end
+        if dynamicViewportConnection then dynamicViewportConnection:Disconnect() end
+        if viewportConnection then viewportConnection:Disconnect() end
+        if jumpViewportConnection then jumpViewportConnection:Disconnect() end
+        if jumpViewportSizeConnection then jumpViewportSizeConnection:Disconnect() end
     end)
 end
 
@@ -649,6 +913,7 @@ local function saveCSControlState(humanoid, root)
         UseJumpPower = humanoid.UseJumpPower,
         AutoRotate = humanoid.AutoRotate,
         PlatformStand = humanoid.PlatformStand,
+        AutoJumpEnabled = humanoid.AutoJumpEnabled,
         RootAnchored = root.Anchored,
         JumpingEnabled = humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping),
         FreefallEnabled = humanoid:GetStateEnabled(Enum.HumanoidStateType.Freefall),
@@ -665,6 +930,9 @@ local function restoreCSControlState(humanoid, root)
     pcall(function() humanoid.UseJumpPower = csControlSaved.UseJumpPower end)
     pcall(function() humanoid.AutoRotate = csControlSaved.AutoRotate end)
     pcall(function() humanoid.PlatformStand = csControlSaved.PlatformStand end)
+    if csControlSaved.AutoJumpEnabled ~= nil then
+        pcall(function() humanoid.AutoJumpEnabled = csControlSaved.AutoJumpEnabled end)
+    end
     pcall(function() root.Anchored = csControlSaved.RootAnchored end)
     pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, csControlSaved.JumpingEnabled) end)
     pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, csControlSaved.FreefallEnabled) end)
@@ -694,6 +962,11 @@ local function forceCSControlCharacter(dt)
         pcall(function() humanoid.WalkSpeed = math.max(1, csControlSaved.WalkSpeed) end)
         pcall(function() humanoid.JumpPower = math.max(1, csControlSaved.JumpPower) end)
         pcall(function() humanoid.JumpHeight = math.max(1, csControlSaved.JumpHeight) end)
+    end
+
+    if UserInputService.TouchEnabled then
+        -- Dynamic Thumbstick enables AutoJump while it is active.
+        pcall(function() humanoid.AutoJumpEnabled = true end)
     end
 
     local moveVector = getCSMoveVector()
