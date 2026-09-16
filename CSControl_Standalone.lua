@@ -265,15 +265,15 @@ local function createCSCustomControls()
         local magnitude = direction.Magnitude
         if magnitude < RadiusOfDeadZone then
             currentDynamicVector = Vector3.zero
+            csJoystickVector = Vector3.zero
             return
         end
 
+        -- Match Roblox DynamicThumbstick's scaled radial dead-zone exactly:
+        -- after the dead-zone, output magnitude is the raw displacement
+        -- divided by RadiusOfMaxSpeed, clamped only at the upper end.
         local normalized = direction.Unit
-        local scaled = math.clamp(
-            (magnitude - RadiusOfDeadZone) / math.max(1, RadiusOfMaxSpeed - RadiusOfDeadZone),
-            0,
-            1
-        )
+        local scaled = math.clamp(magnitude / RadiusOfMaxSpeed, 0, 1)
         currentDynamicVector = Vector3.new(normalized.X * scaled, 0, normalized.Y * scaled)
         csJoystickVector = currentDynamicVector
     end
@@ -329,18 +329,13 @@ local function createCSCustomControls()
         )
 
         local relative = endPos - startPos
-        local distance = relative.Magnitude
-        local maxLength = RadiusOfMaxSpeed
-        local clamped = math.min(distance, maxLength)
-        local output = distance > maxLength and relative.Unit * maxLength or relative
-        local clampedEnd = startPos + output
 
-        endImage.Position = UDim2.fromOffset(clampedEnd.X, clampedEnd.Y)
-        layoutMiddleImages(startPos, clampedEnd)
-        setDynamicVector(Vector2.new(
-            clampedEnd.X - startPos.X,
-            clampedEnd.Y - startPos.Y
-        ))
+        -- Roblox keeps using the ACTUAL finger position for movement and for
+        -- the visual thumbstick. There is no local touch-distance clamp here.
+        -- The movement vector itself is capped at full speed by setDynamicVector().
+        endImage.Position = UDim2.fromOffset(endPos.X, endPos.Y)
+        layoutMiddleImages(startPos, endPos)
+        setDynamicVector(relative)
     end
 
     local fadeInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
@@ -623,9 +618,19 @@ local function getDirectMoveDirection(moveVector)
         flatRight = flatRight.Unit
     end
 
+    -- Preserve the Dynamic Thumbstick magnitude. Roblox's movement pipeline
+    -- receives both direction AND analog magnitude; the previous fallback
+    -- normalized this vector and therefore made partial thumbstick input move
+    -- at full speed.
+    local inputMagnitude = math.clamp(moveVector.Magnitude, 0, 1)
     local direction = flatRight * moveVector.X + flatLook * (-moveVector.Z)
-    if direction.Magnitude > 1 then direction = direction.Unit end
-    return direction
+    if direction.Magnitude < 0.001 then
+        return Vector3.zero
+    end
+
+    -- Keep the camera-relative direction normalized, but retain the original
+    -- thumbstick magnitude for the direct movement fallback.
+    return direction.Unit * inputMagnitude
 end
 
 local function directCSJump(root, humanoid)
@@ -811,6 +816,8 @@ local function updateDirectCSMovement(moveVector, dt, root, humanoid)
         end
 
         if direction.Magnitude > CS_TOUCH_DEADZONE then
+            -- Match Roblox Dynamic Thumbstick analog speed: a half-pushed
+            -- thumbstick should move at roughly half of full movement speed.
             csDirectPosition += direction * CS_DIRECT_SPEED * dt
         end
 
