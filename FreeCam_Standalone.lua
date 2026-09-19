@@ -1069,19 +1069,18 @@ local function positionFreecamSwapButton()
     local camera = workspace.CurrentCamera
     local viewport = camera and camera.ViewportSize or Vector2.new(1536, 864)
 
-    -- Match the VGD shortcut horizontally and sit directly above it.
-    -- VGDButton uses AnchorPoint (0.5, 0.5) and Position
-    -- UDim2.new(1, -55, 0.55, -150).
+    -- Keep Swap at a stable fixed distance from the top of the screen.
+    -- Horizontal alignment still matches the VGD shortcut.
     freecamSwapButton.AnchorPoint = Vector2.new(0.5, 0.5)
 
-    local vgdCenterY = viewport.Y * 0.55 - 150
-    local swapCenterY = vgdCenterY - 22 - 2 - 19
+    local swapTop = 100
+    local swapCenterY = swapTop + 19
 
     freecamSwapButton.Position = UDim2.new(
         1,
         -55,
         0,
-        math.floor(swapCenterY + 0.5)
+        swapCenterY
     )
 end
 
