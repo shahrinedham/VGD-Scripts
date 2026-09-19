@@ -1070,6 +1070,7 @@ local function enableFreecam()
     if FreecamSpeedInput then
         FreecamSpeedInput.Text = tostring(math.floor(FREECAM_SPEED + 0.5))
         FreecamSpeedInput.Visible = true
+        positionFreecamSpeedInput()
     end
     freecamSavedCFrame = root.CFrame
     freecamSavedCameraType = camera.CameraType
@@ -1623,18 +1624,40 @@ FreecamSpeedInput:GetPropertyChangedSignal("Text"):Connect(function()
 end)
 
 function positionFreecamSpeedInput()
-    -- Match the FPS/Ping display height and place the speed input
-    -- immediately to its right with the same compact visual gap.
-    local fpsPosition = FPSPingDisplay.AbsolutePosition
-    local fpsSize = FPSPingDisplay.AbsoluteSize
-    local gap = 12
-    local x = math.floor(fpsPosition.X + fpsSize.X + gap)
-    local y = math.floor(fpsPosition.Y)
+    -- Keep the speed box beside the Freecam FPS/Ping display, but calculate
+    -- the position from the camera viewport instead of depending on the
+    -- AbsolutePosition of another ScreenGui. This keeps the control visible
+    -- even when FPS/Ping itself is hidden.
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1536, 864)
 
-    FreecamSpeedInput.Position = UDim2.new(0, x, 0, y)
+    local fpsX = math.floor(viewport.X * 0.295)
+    local fpsY = math.floor(viewport.Y * 0.031)
+    local fpsWidth = 130
+    local gap = 12
+
+    local x = fpsX + fpsWidth + gap
+    local y = fpsY
+
+    -- Keep the box inside the viewport on narrow/mobile layouts.
+    local boxWidth = FreecamSpeedInput.AbsoluteSize.X
+    local boxHeight = FreecamSpeedInput.AbsoluteSize.Y
+    x = math.clamp(x, 8, math.max(8, viewport.X - boxWidth - 8))
+    y = math.clamp(y, 8, math.max(8, viewport.Y - boxHeight - 8))
+
+    FreecamSpeedInput.Position = UDim2.fromOffset(x, y)
 end
 
 positionFreecamSpeedInput()
+
+local freecamSpeedViewportConnection = nil
+if workspace.CurrentCamera then
+    freecamSpeedViewportConnection = workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        if FreecamSpeedInput then
+            positionFreecamSpeedInput()
+        end
+    end)
+end
 
 if task and task.defer then
     task.defer(positionFreecamSpeedInput)
