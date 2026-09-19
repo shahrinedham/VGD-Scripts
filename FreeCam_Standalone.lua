@@ -1073,7 +1073,7 @@ local function positionFreecamSwapButton()
     -- Horizontal alignment still matches the VGD shortcut.
     freecamSwapButton.AnchorPoint = Vector2.new(0.5, 0.5)
 
-    local swapTop = 10
+    local swapTop = 20
     local swapCenterY = swapTop + 19
 
     freecamSwapButton.Position = UDim2.new(
