@@ -1069,20 +1069,20 @@ local function positionFreecamSwapButton()
     local camera = workspace.CurrentCamera
     local viewport = camera and camera.ViewportSize or Vector2.new(1536, 864)
 
-    -- Keep Swap completely separate from the speed box: top-right corner.
-    local marginRight = 18
-    local marginTop = 70
-    local buttonWidth = freecamSwapButton.AbsoluteSize.X
-    local buttonHeight = freecamSwapButton.AbsoluteSize.Y
+    -- Match the VGD shortcut horizontally and sit directly above it.
+    -- VGDButton uses AnchorPoint (0.5, 0.5) and Position
+    -- UDim2.new(1, -55, 0.55, -150).
+    freecamSwapButton.AnchorPoint = Vector2.new(0.5, 0.5)
 
-    local x = math.max(8, viewport.X - buttonWidth - marginRight)
-    local y = math.max(8, marginTop)
+    local vgdCenterY = viewport.Y * 0.55 - 150
+    local swapCenterY = vgdCenterY - 22 - 6 - 19
 
-    -- Keep it inside the viewport on narrow/mobile layouts.
-    x = math.clamp(x, 8, math.max(8, viewport.X - buttonWidth - 8))
-    y = math.clamp(y, 8, math.max(8, viewport.Y - buttonHeight - 8))
-
-    freecamSwapButton.Position = UDim2.fromOffset(x, y)
+    freecamSwapButton.Position = UDim2.new(
+        1,
+        -55,
+        0,
+        math.floor(swapCenterY + 0.5)
+    )
 end
 
 local function setFreecamControlMode(mode)
@@ -1708,7 +1708,7 @@ FreecamSpeedInput.Parent = StandaloneGui
 -- Hologram <-> real body swap shortcut.
 freecamSwapButton = Instance.new("TextButton")
 freecamSwapButton.Name = "FreecamSwapButton"
-freecamSwapButton.Size = UDim2.fromOffset(106, 38)
+freecamSwapButton.Size = UDim2.fromOffset(96, 38)
 freecamSwapButton.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 freecamSwapButton.BackgroundTransparency = 0.1
 freecamSwapButton.BorderSizePixel = 0
