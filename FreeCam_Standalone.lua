@@ -20,29 +20,29 @@ local freecamEnabled = false
 local stateChangedEvent = Instance.new("BindableEvent")
 local freecamConnection = nil
 local freecamCharacterConnection = nil
-freecamDeathConnection = nil
-freecamRespawnConnection = nil
+local freecamDeathConnection = nil
+local freecamRespawnConnection = nil
 local freecamSavedCFrame = nil
 local freecamSavedCameraType = nil
 local freecamSavedCameraSubject = nil
 local freecamSavedAnchored = nil
 local freecamPosition = nil
-freecamInitialPosition = nil
-freecamHologram = nil
-freecamHologramCameraOffset = Vector3.new()
-freecamCameraOffset = Vector3.new()
+local freecamInitialPosition = nil
+local freecamHologram = nil
+local freecamHologramCameraOffset = Vector3.new()
+local freecamCameraOffset = Vector3.new()
 -- Roblox-style Freecam Shift Lock.  The button is shown only while Freecam
 -- is active, and the Settings toggle controls whether the feature is shown.
-freecamShiftLockOn = true
-freecamShiftLockButton = nil
-freecamShiftLockShiftedOffset = Vector3.new()
-freecamShiftLockUnshiftedOffset = Vector3.new()
-freecamShiftLockRightVector = Vector3.new(1, 0, 0)
-freecamBodyYaw = 0
-freecamFlightBankBlend = 0
-freecamFlightSpeedBlend = 0
-freecamFlightPreviousDesiredYaw = nil
-freecamFlightPreviousMoveDirection = Vector3.new()
+local freecamShiftLockOn = true
+local freecamShiftLockButton = nil
+local freecamShiftLockShiftedOffset = Vector3.new()
+local freecamShiftLockUnshiftedOffset = Vector3.new()
+local freecamShiftLockRightVector = Vector3.new(1, 0, 0)
+local freecamBodyYaw = 0
+local freecamFlightBankBlend = 0
+local freecamFlightSpeedBlend = 0
+local freecamFlightPreviousDesiredYaw = nil
+local freecamFlightPreviousMoveDirection = Vector3.new()
 
 -- FREECAM INPUT / CAMERA FEEL
 -- =========================================================
@@ -53,14 +53,14 @@ freecamFlightPreviousMoveDirection = Vector3.new()
 -- mobile camera instead of reacting directly to every InputChanged event.
 
 -- Adjustable in the top slider while Freecam is enabled.
-FREECAM_SPEED = 35
-FREECAM_SPEED_MIN = 1
-FREECAM_SPEED_MAX = 1000
+local FREECAM_SPEED = 35
+local FREECAM_SPEED_MIN = 1
+local FREECAM_SPEED_MAX = 1000
 
 -- Roblox CameraInput uses Vector2.new(1, 0.66) * 1 degree per touch pixel.
 local FREECAM_TOUCH_ROTATION_SPEED = Vector2.new(0.82, 0.54) * math.rad(1)
 local FREECAM_MOUSE_ROTATION_SPEED = Vector2.new(1, 0.77) * math.rad(0.5)
-FREECAM_LOOK_SMOOTHNESS = 34
+local FREECAM_LOOK_SMOOTHNESS = 34
 local FREECAM_MIN_PITCH = math.rad(-89)
 local FREECAM_MAX_PITCH = math.rad(89)
 
@@ -72,9 +72,9 @@ local freecamMouseDelta = Vector2.new()
 -- mobile camera look. Binding all world touches at high priority can prevent
 -- UserInputService.TouchPinch from firing, so keeping the two touch positions
 -- here makes pinch zoom reliable while preserving joystick + camera swipe.
-freecamZoomTouchPositions = {}
-freecamPinchLastDiameter = nil
-freecamTouchEndedCleanupConnection = nil
+local freecamZoomTouchPositions = {}
+local freecamPinchLastDiameter = nil
+local freecamTouchEndedCleanupConnection = nil
 
 local function freecamIsInDynamicThumbstickArea(position)
     local playerGui = player:FindFirstChildOfClass("PlayerGui")
@@ -152,7 +152,7 @@ local function freecamResetInput()
     freecamLastLookPosition = nil
     freecamMouseLooking = false
     table.clear(freecamZoomTouchPositions)
-    freecamPinchLastDiameter = nil
+    local freecamPinchLastDiameter = nil
 end
 
 function freecamSmoothLook(dt)
@@ -346,7 +346,7 @@ function createFreecamHologram()
 
     if freecamHologram then
         pcall(function() freecamHologram:Destroy() end)
-        freecamHologram = nil
+        local freecamHologram = nil
     end
 
     local character = player.Character
@@ -821,6 +821,36 @@ function updateFreecamHologram(cameraCFrame, moveDirection, isMoving, dt, flight
     end)
 
 end
+local function updateFreecamShiftLockButton()
+    if not freecamShiftLockButton then
+        return
+    end
+
+    freecamShiftLockButton.Visible = freecamEnabled == true
+    freecamShiftLockButton.Image = freecamShiftLockOn
+        and "rbxasset://textures/ui/mouseLock_on@2x.png"
+        or "rbxasset://textures/ui/mouseLock_off@2x.png"
+end
+
+local function applyFreecamShiftLockState()
+    if freecamShiftLockOn then
+        freecamCameraOffset = freecamShiftLockShiftedOffset
+    else
+        freecamCameraOffset = freecamShiftLockUnshiftedOffset
+    end
+
+    updateFreecamShiftLockButton()
+end
+
+local function toggleFreecamShiftLock()
+    if not freecamEnabled then
+        return
+    end
+
+    freecamShiftLockOn = not freecamShiftLockOn
+    applyFreecamShiftLockState()
+end
+
 local function disableFreecam()
     local wasFreecamActive = freecamEnabled
 
@@ -838,15 +868,15 @@ local function disableFreecam()
 
     if freecamHologram then
         pcall(function() freecamHologram:Destroy() end)
-        freecamHologram = nil
+        local freecamHologram = nil
     end
     if FreecamSpeedInput then
         FreecamSpeedInput.Visible = false
     end
-    freecamShiftLockOn = true
-    freecamShiftLockShiftedOffset = Vector3.new()
-    freecamShiftLockUnshiftedOffset = Vector3.new()
-    freecamCameraOffset = Vector3.new()
+    local freecamShiftLockOn = true
+    local freecamShiftLockShiftedOffset = Vector3.new()
+    local freecamShiftLockUnshiftedOffset = Vector3.new()
+    local freecamCameraOffset = Vector3.new()
     updateFreecamShiftLockButton()
 
     pcall(function()
@@ -865,7 +895,7 @@ local function disableFreecam()
 
     if freecamDeathConnection then
         freecamDeathConnection:Disconnect()
-        freecamDeathConnection = nil
+        local freecamDeathConnection = nil
     end
 
     if freecamCharacterConnection then
@@ -875,7 +905,7 @@ local function disableFreecam()
 
     if freecamTouchEndedCleanupConnection then
         freecamTouchEndedCleanupConnection:Disconnect()
-        freecamTouchEndedCleanupConnection = nil
+        local freecamTouchEndedCleanupConnection = nil
     end
 
     freecamResetInput()
@@ -902,31 +932,31 @@ local function disableFreecam()
         end
     end
 
-    freecamSavedFOV = nil
-    freecamFOV = 70
-    freecamTargetFOV = 70
-    freecamPinchBaseFOV = 70
-    freecamHologramCameraOffset = Vector3.new()
+    local freecamSavedFOV = nil
+    local freecamFOV = 70
+    local freecamTargetFOV = 70
+    local freecamPinchBaseFOV = 70
+    local freecamHologramCameraOffset = Vector3.new()
     freecamHologramAnimTime = 0
     freecamHologramHoverBlend = 0
     freecamHologramMoveBlend = 0
     freecamHologramLeanBlend = 0
     freecamHologramSideLeanBlend = 0
-    freecamCameraOffset = Vector3.new()
+    local freecamCameraOffset = Vector3.new()
     freecamSavedCFrame = nil
     freecamSavedCameraType = nil
     freecamSavedCameraSubject = nil
     freecamSavedAnchored = nil
     freecamPosition = nil
-    freecamInitialPosition = nil
-    freecamPitch = 0
-    freecamYaw = 0
-    freecamBodyYaw = 0
-    freecamFlightBankBlend = 0
-    freecamFlightSpeedBlend = 0
-    freecamFlightPreviousDesiredYaw = nil
-    freecamFlightPreviousMoveDirection = Vector3.new()
-    freecamLookInput = nil
+    local freecamInitialPosition = nil
+    local freecamPitch = 0
+    local freecamYaw = 0
+    local freecamBodyYaw = 0
+    local freecamFlightBankBlend = 0
+    local freecamFlightSpeedBlend = 0
+    local freecamFlightPreviousDesiredYaw = nil
+    local freecamFlightPreviousMoveDirection = Vector3.new()
+    local freecamLookInput = nil
 
 end
 
@@ -951,7 +981,7 @@ local function enableFreecam()
     -- the respawn and ensures the Freecam Shift Lock button disappears.
     if freecamDeathConnection then
         freecamDeathConnection:Disconnect()
-        freecamDeathConnection = nil
+        local freecamDeathConnection = nil
     end
     freecamDeathConnection = humanoid.Died:Connect(function()
         if freecamEnabled then
@@ -966,7 +996,6 @@ local function enableFreecam()
     freecamEnabled = true
     stateChangedEvent:Fire(true)
     freecamHologramHoverBlend = 0
-    updateNormalShiftLockButton()
     if FreecamSpeedInput then
         FreecamSpeedInput.Text = tostring(math.floor(FREECAM_SPEED + 0.5))
         FreecamSpeedInput.Visible = true
@@ -993,8 +1022,8 @@ local function enableFreecam()
             (camera.CFrame.Position - root.Position).Magnitude
     end
 
-    freecamZoomMin = 2
-    freecamZoomMax = 24
+    local freecamZoomMin = 2
+    local freecamZoomMax = 24
     freecamZoomDistance = math.clamp(
         normalCameraDistance,
         freecamZoomMin,
@@ -1019,7 +1048,7 @@ local function enableFreecam()
     freecamShiftLockShiftedOffset = freecamCameraOffset
     freecamShiftLockUnshiftedOffset =
         freecamCameraOffset - freecamShiftLockRightVector * shoulderAmount
-    freecamShiftLockOn = true
+    local freecamShiftLockOn = true
     applyFreecamShiftLockState()
 
     freecamPitch, freecamYaw = camera.CFrame:ToOrientation()
@@ -1027,17 +1056,17 @@ local function enableFreecam()
     -- unshifted, it behaves like a normal character: it keeps its current
     -- facing direction while idle and turns toward its movement direction.
     freecamBodyYaw = freecamYaw
-    freecamFlightBankBlend = 0
-    freecamFlightSpeedBlend = 0
+    local freecamFlightBankBlend = 0
+    local freecamFlightSpeedBlend = 0
     freecamFlightPreviousDesiredYaw = freecamYaw
-    freecamFlightPreviousMoveDirection = Vector3.new()
+    local freecamFlightPreviousMoveDirection = Vector3.new()
 
     -- The hologram is the subject, so start it exactly on the real body.
     -- The camera itself starts at the same distance as the normal camera
     -- (clamped to 2-24 studs) and can still be changed with pinch/wheel.
     freecamPosition = root.Position
     freecamInitialPosition = freecamPosition
-    freecamHologramCameraOffset = Vector3.new()
+    local freecamHologramCameraOffset = Vector3.new()
     createFreecamHologram()
 
     -- Put the hologram at the real body immediately. It will then mirror
@@ -1299,7 +1328,7 @@ local function enableFreecam()
                     zoomTouchCount += 1
                 end
                 if zoomTouchCount < 2 then
-                    freecamPinchLastDiameter = nil
+                    local freecamPinchLastDiameter = nil
                 end
 
                 return Enum.ContextActionResult.Sink
@@ -1335,7 +1364,7 @@ local function enableFreecam()
         end
 
         if zoomTouchCount < 2 then
-            freecamPinchLastDiameter = nil
+            local freecamPinchLastDiameter = nil
         end
     end)
 
