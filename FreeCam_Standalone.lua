@@ -201,6 +201,69 @@ local function freecamApplyLookInput()
     end
 end
 
+
+-- Standalone FPS/Ping display used by the Freecam speed control.
+-- In v130 this lived in the main VGD GUI; it must be recreated here so
+-- Freecam has no dependency on the main panel.
+local fpsPing = false
+local fpsPingConnection = nil
+local fpsPingFrames = 0
+local fpsPingElapsed = 0
+local fpsPingValue = 0
+local pingValue = 0
+
+local FPSPingScreenGui = Instance.new("ScreenGui")
+FPSPingScreenGui.Name = "VGD_FreecamFPSPingGui"
+FPSPingScreenGui.ResetOnSpawn = false
+FPSPingScreenGui.IgnoreGuiInset = true
+FPSPingScreenGui.DisplayOrder = 1999
+FPSPingScreenGui.Parent = game:GetService("CoreGui")
+
+local FPSPingDisplay = Instance.new("Frame")
+FPSPingDisplay.Name = "VGD_FreecamFPSPingDisplay"
+FPSPingDisplay.Size = UDim2.new(0, 130, 0, 43)
+FPSPingDisplay.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+FPSPingDisplay.BackgroundTransparency = 0.1
+FPSPingDisplay.Visible = false
+FPSPingDisplay.ZIndex = 1999
+FPSPingDisplay.Parent = FPSPingScreenGui
+
+Instance.new("UICorner", FPSPingDisplay).CornerRadius = UDim.new(0, 22)
+
+local FPSPingLabel = Instance.new("TextLabel")
+FPSPingLabel.Size = UDim2.new(1, -16, 1, 0)
+FPSPingLabel.Position = UDim2.new(0, 8, 0, 0)
+FPSPingLabel.BackgroundTransparency = 1
+FPSPingLabel.Text = "0 FPS | 0ms"
+FPSPingLabel.TextColor3 = Color3.new(1, 1, 1)
+FPSPingLabel.Font = Enum.Font.SourceSansBold
+FPSPingLabel.TextSize = 18
+FPSPingLabel.TextXAlignment = Enum.TextXAlignment.Center
+FPSPingLabel.ZIndex = 2000
+FPSPingLabel.Parent = FPSPingDisplay
+
+function positionFPSPingDisplay()
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1536, 864)
+    local x = math.floor(viewport.X * 0.295)
+    FPSPingDisplay.Position = UDim2.new(0, x, 0.031, 0)
+end
+
+positionFPSPingDisplay()
+
+local fpsViewportConnection = workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    positionFPSPingDisplay()
+end)
+
+if workspace.CurrentCamera then
+    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        positionFPSPingDisplay()
+        if FreecamSpeedInput then
+            positionFreecamSpeedInput()
+        end
+    end)
+end
+
 local function getCurrentPing()
     local ping = 0
 
