@@ -1071,7 +1071,7 @@ local function positionFreecamSwapButton()
 
     -- Keep Swap completely separate from the speed box: top-right corner.
     local marginRight = 18
-    local marginTop = 18
+    local marginTop = 70
     local buttonWidth = freecamSwapButton.AbsoluteSize.X
     local buttonHeight = freecamSwapButton.AbsoluteSize.Y
 
@@ -1708,7 +1708,7 @@ FreecamSpeedInput.Parent = StandaloneGui
 -- Hologram <-> real body swap shortcut.
 freecamSwapButton = Instance.new("TextButton")
 freecamSwapButton.Name = "FreecamSwapButton"
-freecamSwapButton.Size = UDim2.fromOffset(116, 38)
+freecamSwapButton.Size = UDim2.fromOffset(106, 38)
 freecamSwapButton.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 freecamSwapButton.BackgroundTransparency = 0.1
 freecamSwapButton.BorderSizePixel = 0
