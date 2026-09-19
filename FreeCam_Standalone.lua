@@ -1112,10 +1112,6 @@ local function toggleFreecamControlMode()
     end
 end
 
-freecamSwapButton.Activated:Connect(toggleFreecamControlMode)
-updateFreecamSwapButton()
-positionFreecamSwapButton()
-
 local function enableFreecam()
     disableFreecam()
 
@@ -1729,6 +1725,10 @@ local freecamSwapStroke = Instance.new("UIStroke")
 freecamSwapStroke.Thickness = 1
 freecamSwapStroke.Transparency = 0.35
 freecamSwapStroke.Parent = freecamSwapButton
+
+freecamSwapButton.Activated:Connect(toggleFreecamControlMode)
+updateFreecamSwapButton()
+positionFreecamSwapButton()
 
 
 Instance.new("UICorner", FreecamSpeedInput).CornerRadius = UDim.new(0, 22)
