@@ -1,6 +1,6 @@
 -- VGD Freecam Standalone
 -- Extracted from VGD_Design2_v130_HOVER_ONLY.lua
--- Controller API: Enable(), Disable(), IsEnabled()
+-- Controller API: Enable(), Disable(), IsEnabled(), SetSpeed()\n-- v132 audit: GUI-safe touch arbitration + state cleanup hardening
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -43,6 +43,24 @@ local freecamFlightBankBlend = 0
 local freecamFlightSpeedBlend = 0
 local freecamFlightPreviousDesiredYaw = nil
 local freecamFlightPreviousMoveDirection = Vector3.new()
+local freecamSavedFOV = nil
+local freecamFOV = 70
+local freecamTargetFOV = 70
+local freecamPinchBaseFOV = 70
+local freecamPitch = 0
+local freecamYaw = 0
+local freecamTargetPitch = 0
+local freecamTargetYaw = 0
+local freecamLookInput = nil
+local freecamZoomMin = 2
+local freecamZoomMax = 24
+local freecamZoomDistance = 8
+local freecamTargetZoomDistance = 8
+local freecamHologramHoverBlend = 0
+local freecamHologramMoveBlend = 0
+local freecamHologramLeanBlend = 0
+local freecamHologramSideLeanBlend = 0
+local freecamHologramAnimTime = 0
 
 -- FREECAM INPUT / CAMERA FEEL
 -- =========================================================
@@ -115,8 +133,12 @@ local function freecamIsOverGui(position)
         return false
     end
 
+    -- Any visible GUI at the touch point must win over Freecam's
+    -- world-camera gesture.  The previous version only recognized objects
+    -- belonging to StandaloneGui, so touches on the main VGD GUI (including
+    -- its X button) were still consumed by Freecam.
     for _, object in ipairs(objects) do
-        if object:IsDescendantOf(StandaloneGui) then
+        if object.Visible ~= false then
             return true
         end
     end
@@ -152,7 +174,7 @@ local function freecamResetInput()
     freecamLastLookPosition = nil
     freecamMouseLooking = false
     table.clear(freecamZoomTouchPositions)
-    local freecamPinchLastDiameter = nil
+    freecamPinchLastDiameter = nil
 end
 
 function freecamSmoothLook(dt)
@@ -346,7 +368,7 @@ function createFreecamHologram()
 
     if freecamHologram then
         pcall(function() freecamHologram:Destroy() end)
-        local freecamHologram = nil
+        freecamHologram = nil
     end
 
     local character = player.Character
@@ -868,15 +890,14 @@ local function disableFreecam()
 
     if freecamHologram then
         pcall(function() freecamHologram:Destroy() end)
-        local freecamHologram = nil
+        freecamHologram = nil
     end
     if FreecamSpeedInput then
         FreecamSpeedInput.Visible = false
     end
-    local freecamShiftLockOn = true
-    local freecamShiftLockShiftedOffset = Vector3.new()
-    local freecamShiftLockUnshiftedOffset = Vector3.new()
-    local freecamCameraOffset = Vector3.new()
+    freecamShiftLockOn = true
+    freecamShiftLockShiftedOffset = Vector3.new()
+    freecamShiftLockUnshiftedOffset = Vector3.new()
     updateFreecamShiftLockButton()
 
     pcall(function()
@@ -895,7 +916,7 @@ local function disableFreecam()
 
     if freecamDeathConnection then
         freecamDeathConnection:Disconnect()
-        local freecamDeathConnection = nil
+        freecamDeathConnection = nil
     end
 
     if freecamCharacterConnection then
@@ -905,7 +926,7 @@ local function disableFreecam()
 
     if freecamTouchEndedCleanupConnection then
         freecamTouchEndedCleanupConnection:Disconnect()
-        local freecamTouchEndedCleanupConnection = nil
+        freecamTouchEndedCleanupConnection = nil
     end
 
     freecamResetInput()
@@ -932,31 +953,17 @@ local function disableFreecam()
         end
     end
 
-    local freecamSavedFOV = nil
-    local freecamFOV = 70
-    local freecamTargetFOV = 70
-    local freecamPinchBaseFOV = 70
-    local freecamHologramCameraOffset = Vector3.new()
     freecamHologramAnimTime = 0
     freecamHologramHoverBlend = 0
     freecamHologramMoveBlend = 0
     freecamHologramLeanBlend = 0
     freecamHologramSideLeanBlend = 0
-    local freecamCameraOffset = Vector3.new()
+    freecamCameraOffset = Vector3.new()
     freecamSavedCFrame = nil
     freecamSavedCameraType = nil
     freecamSavedCameraSubject = nil
     freecamSavedAnchored = nil
     freecamPosition = nil
-    local freecamInitialPosition = nil
-    local freecamPitch = 0
-    local freecamYaw = 0
-    local freecamBodyYaw = 0
-    local freecamFlightBankBlend = 0
-    local freecamFlightSpeedBlend = 0
-    local freecamFlightPreviousDesiredYaw = nil
-    local freecamFlightPreviousMoveDirection = Vector3.new()
-    local freecamLookInput = nil
 
 end
 
@@ -981,7 +988,7 @@ local function enableFreecam()
     -- the respawn and ensures the Freecam Shift Lock button disappears.
     if freecamDeathConnection then
         freecamDeathConnection:Disconnect()
-        local freecamDeathConnection = nil
+        freecamDeathConnection = nil
     end
     freecamDeathConnection = humanoid.Died:Connect(function()
         if freecamEnabled then
@@ -1022,8 +1029,6 @@ local function enableFreecam()
             (camera.CFrame.Position - root.Position).Magnitude
     end
 
-    local freecamZoomMin = 2
-    local freecamZoomMax = 24
     freecamZoomDistance = math.clamp(
         normalCameraDistance,
         freecamZoomMin,
@@ -1048,7 +1053,6 @@ local function enableFreecam()
     freecamShiftLockShiftedOffset = freecamCameraOffset
     freecamShiftLockUnshiftedOffset =
         freecamCameraOffset - freecamShiftLockRightVector * shoulderAmount
-    local freecamShiftLockOn = true
     applyFreecamShiftLockState()
 
     freecamPitch, freecamYaw = camera.CFrame:ToOrientation()
@@ -1056,17 +1060,13 @@ local function enableFreecam()
     -- unshifted, it behaves like a normal character: it keeps its current
     -- facing direction while idle and turns toward its movement direction.
     freecamBodyYaw = freecamYaw
-    local freecamFlightBankBlend = 0
-    local freecamFlightSpeedBlend = 0
     freecamFlightPreviousDesiredYaw = freecamYaw
-    local freecamFlightPreviousMoveDirection = Vector3.new()
 
     -- The hologram is the subject, so start it exactly on the real body.
     -- The camera itself starts at the same distance as the normal camera
     -- (clamped to 2-24 studs) and can still be changed with pinch/wheel.
     freecamPosition = root.Position
     freecamInitialPosition = freecamPosition
-    local freecamHologramCameraOffset = Vector3.new()
     createFreecamHologram()
 
     -- Put the hologram at the real body immediately. It will then mirror
@@ -1328,7 +1328,7 @@ local function enableFreecam()
                     zoomTouchCount += 1
                 end
                 if zoomTouchCount < 2 then
-                    local freecamPinchLastDiameter = nil
+                    freecamPinchLastDiameter = nil
                 end
 
                 return Enum.ContextActionResult.Sink
@@ -1364,7 +1364,7 @@ local function enableFreecam()
         end
 
         if zoomTouchCount < 2 then
-            local freecamPinchLastDiameter = nil
+            freecamPinchLastDiameter = nil
         end
     end)
 
