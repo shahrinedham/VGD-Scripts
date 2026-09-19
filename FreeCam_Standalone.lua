@@ -995,11 +995,21 @@ local function disableFreecam()
 
     local camera = workspace.CurrentCamera
     if camera then
+        -- The saved CameraSubject can belong to the character that died.
+        -- Never restore a dead Humanoid after a respawn. The live character's
+        -- Humanoid must become the subject so Roblox's normal camera starts
+        -- from the CURRENT body rather than the last Freecam position.
+        local currentCharacter = player.Character
+        local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+
         if freecamSavedCameraType then
             camera.CameraType = freecamSavedCameraType
         end
 
-        if freecamSavedCameraSubject then
+        if currentHumanoid then
+            camera.CameraSubject = currentHumanoid
+        elseif freecamSavedCameraSubject and freecamSavedCameraSubject.Parent then
+            -- Only use the saved subject when it is still a live/valid object.
             camera.CameraSubject = freecamSavedCameraSubject
         end
 
@@ -1157,20 +1167,22 @@ local function enableFreecam()
 
             local currentCharacter = player.Character
             local currentRoot = currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
+            local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+            local currentCamera = workspace.CurrentCamera
 
             -- Respawn is NOT a Freecam state transition. Keep the soul/camera
-            -- session alive and lock the newly spawned physical body as soon
-            -- as its root exists. The camera remains Scriptable throughout.
+            -- session alive even during the tiny interval where Roblox has
+            -- removed the old character but has not finished constructing the
+            -- new one. The camera remains Scriptable and keeps being driven
+            -- from the last Freecam state, so Roblox cannot briefly take it
+            -- over and produce a flicker/stutter.
             if currentCharacter and currentCharacter ~= freecamLockedCharacter and currentRoot then
                 lockCharacterForFreecam(currentCharacter)
             elseif currentCharacter and currentRoot and not freecamCharacterStates[currentCharacter] then
                 lockCharacterForFreecam(currentCharacter)
             end
 
-            local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
-            local currentCamera = workspace.CurrentCamera
-
-            if not currentRoot or not currentHumanoid or not currentCamera then
+            if not currentCamera then
                 return
             end
 
@@ -1184,7 +1196,7 @@ local function enableFreecam()
             freecamZoomDistance = freecamZoomDistance
                 + (freecamTargetZoomDistance - freecamZoomDistance) * zoomAlpha
 
-            local moveDirection = currentHumanoid.MoveDirection
+            local moveDirection = currentHumanoid and currentHumanoid.MoveDirection or Vector3.zero
             local horizontalMove = Vector3.new(moveDirection.X, 0, moveDirection.Z)
             local cameraLook = currentCamera.CFrame.LookVector
             local right = currentCamera.CFrame.RightVector
@@ -1249,6 +1261,12 @@ local function enableFreecam()
                 cameraPosition + freecamCameraLook
             )
 
+            -- Roblox may temporarily retarget the camera when the physical
+            -- Humanoid dies/respawns. Freecam owns the camera for the entire
+            -- session, so keep it Scriptable before applying this frame.
+            if currentCamera.CameraType ~= Enum.CameraType.Scriptable then
+                currentCamera.CameraType = Enum.CameraType.Scriptable
+            end
             currentCamera.CFrame = cameraCFrame
             currentCamera.FieldOfView = freecamFOV
             currentCamera.Focus = CFrame.new(subjectPosition)
@@ -1555,24 +1573,14 @@ freecamRespawnConnection = player.CharacterAdded:Connect(function(character)
         return
     end
 
-    -- CharacterAdded itself is cheap and does not touch the camera. Lock the
-    -- root as soon as it is available. The RenderStep below repeats the lock
-    -- as a safety net without doing any per-frame allocations.
+    -- Do not wait for the character here. Waiting/yielding is unnecessary for
+    -- the camera and can make respawn handling more complicated. The
+    -- RenderStep above keeps driving the existing Freecam camera immediately
+    -- and locks the new root as soon as Roblox creates it.
     local root = character:FindFirstChild("HumanoidRootPart")
     if root then
         lockCharacterForFreecam(character)
     end
-
-    task.spawn(function()
-        if not freecamEnabled or not character.Parent then
-            return
-        end
-
-        local readyRoot = character:WaitForChild("HumanoidRootPart", 2)
-        if freecamEnabled and readyRoot and character.Parent then
-            lockCharacterForFreecam(character)
-        end
-    end)
 end)
 
 FreecamSpeedInput = Instance.new("TextBox")
