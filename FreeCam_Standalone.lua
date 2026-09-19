@@ -1,6 +1,6 @@
 -- VGD Freecam Standalone
 -- Extracted from VGD_Design2_v130_HOVER_ONLY.lua
--- Controller API: Enable(), Disable(), IsEnabled(), SetSpeed()\n-- v132 audit: GUI-safe touch arbitration + state cleanup hardening
+-- Controller API: Enable(), Disable(), IsEnabled()
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -22,6 +22,10 @@ local freecamConnection = nil
 local freecamCharacterConnection = nil
 local freecamDeathConnection = nil
 local freecamRespawnConnection = nil
+-- Physical-character state is tracked per character so a respawn can be
+-- locked without overwriting the original character's state.
+local freecamCharacterStates = setmetatable({}, {__mode = "k"})
+local freecamLockedCharacter = nil
 local freecamSavedCFrame = nil
 local freecamSavedCameraType = nil
 local freecamSavedCameraSubject = nil
@@ -43,24 +47,6 @@ local freecamFlightBankBlend = 0
 local freecamFlightSpeedBlend = 0
 local freecamFlightPreviousDesiredYaw = nil
 local freecamFlightPreviousMoveDirection = Vector3.new()
-local freecamSavedFOV = nil
-local freecamFOV = 70
-local freecamTargetFOV = 70
-local freecamPinchBaseFOV = 70
-local freecamPitch = 0
-local freecamYaw = 0
-local freecamTargetPitch = 0
-local freecamTargetYaw = 0
-local freecamLookInput = nil
-local freecamZoomMin = 2
-local freecamZoomMax = 24
-local freecamZoomDistance = 8
-local freecamTargetZoomDistance = 8
-local freecamHologramHoverBlend = 0
-local freecamHologramMoveBlend = 0
-local freecamHologramLeanBlend = 0
-local freecamHologramSideLeanBlend = 0
-local freecamHologramAnimTime = 0
 
 -- FREECAM INPUT / CAMERA FEEL
 -- =========================================================
@@ -133,12 +119,8 @@ local function freecamIsOverGui(position)
         return false
     end
 
-    -- Any visible GUI at the touch point must win over Freecam's
-    -- world-camera gesture.  The previous version only recognized objects
-    -- belonging to StandaloneGui, so touches on the main VGD GUI (including
-    -- its X button) were still consumed by Freecam.
     for _, object in ipairs(objects) do
-        if object.Visible ~= false then
+        if object:IsDescendantOf(StandaloneGui) then
             return true
         end
     end
@@ -174,7 +156,7 @@ local function freecamResetInput()
     freecamLastLookPosition = nil
     freecamMouseLooking = false
     table.clear(freecamZoomTouchPositions)
-    freecamPinchLastDiameter = nil
+    local freecamPinchLastDiameter = nil
 end
 
 function freecamSmoothLook(dt)
@@ -368,7 +350,7 @@ function createFreecamHologram()
 
     if freecamHologram then
         pcall(function() freecamHologram:Destroy() end)
-        freecamHologram = nil
+        local freecamHologram = nil
     end
 
     local character = player.Character
@@ -873,6 +855,68 @@ local function toggleFreecamShiftLock()
     applyFreecamShiftLockState()
 end
 
+local function lockCharacterForFreecam(character)
+    if not freecamEnabled or not character then
+        return nil
+    end
+
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return nil
+    end
+
+    if not freecamCharacterStates[character] then
+        freecamCharacterStates[character] = {
+            root = root,
+            anchored = root.Anchored,
+        }
+    else
+        -- Refresh the root reference if Roblox replaced the part during
+        -- character initialization.
+        freecamCharacterStates[character].root = root
+    end
+
+    -- The physical body must stay completely out of the Freecam session.
+    -- Anchoring only the root preserves Humanoid.MoveDirection, which the
+    -- Freecam uses as its movement input, while preventing the real body from
+    -- walking/jumping away from its spawn point.
+    root.Anchored = true
+    freecamLockedCharacter = character
+
+    return root
+end
+
+local function restoreCharacterAfterFreecam(character)
+    local state = character and freecamCharacterStates[character]
+    if not state then
+        return
+    end
+
+    local root = state.root
+    if root and root.Parent then
+        root.Anchored = state.anchored
+    end
+
+    freecamCharacterStates[character] = nil
+
+    if freecamLockedCharacter == character then
+        freecamLockedCharacter = nil
+    end
+end
+
+local function lockCurrentCharacterForFreecam()
+    if not freecamEnabled then
+        return nil
+    end
+
+    local character = player.Character
+    if not character then
+        return nil
+    end
+
+    return lockCharacterForFreecam(character)
+end
+
 local function disableFreecam()
     local wasFreecamActive = freecamEnabled
 
@@ -890,14 +934,15 @@ local function disableFreecam()
 
     if freecamHologram then
         pcall(function() freecamHologram:Destroy() end)
-        freecamHologram = nil
+        local freecamHologram = nil
     end
     if FreecamSpeedInput then
         FreecamSpeedInput.Visible = false
     end
-    freecamShiftLockOn = true
-    freecamShiftLockShiftedOffset = Vector3.new()
-    freecamShiftLockUnshiftedOffset = Vector3.new()
+    local freecamShiftLockOn = true
+    local freecamShiftLockShiftedOffset = Vector3.new()
+    local freecamShiftLockUnshiftedOffset = Vector3.new()
+    local freecamCameraOffset = Vector3.new()
     updateFreecamShiftLockButton()
 
     pcall(function()
@@ -916,7 +961,7 @@ local function disableFreecam()
 
     if freecamDeathConnection then
         freecamDeathConnection:Disconnect()
-        freecamDeathConnection = nil
+        local freecamDeathConnection = nil
     end
 
     if freecamCharacterConnection then
@@ -926,15 +971,25 @@ local function disableFreecam()
 
     if freecamTouchEndedCleanupConnection then
         freecamTouchEndedCleanupConnection:Disconnect()
-        freecamTouchEndedCleanupConnection = nil
+        local freecamTouchEndedCleanupConnection = nil
     end
 
     freecamResetInput()
 
+    -- Restore whichever physical character was last locked by Freecam.
+    -- This matters after a respawn: player.Character is the NEW character,
+    -- while the enable-time saved state belongs to the old character.
     local character = player.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
+    restoreCharacterAfterFreecam(character)
 
-    if root and freecamSavedAnchored ~= nil then
+    if freecamLockedCharacter then
+        restoreCharacterAfterFreecam(freecamLockedCharacter)
+    end
+
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if root and freecamSavedAnchored ~= nil and not freecamCharacterStates[character] then
+        -- Compatibility fallback for a character that was locked before the
+        -- per-character state table was introduced.
         root.Anchored = freecamSavedAnchored
     end
 
@@ -953,17 +1008,33 @@ local function disableFreecam()
         end
     end
 
+    local freecamSavedFOV = nil
+    local freecamFOV = 70
+    local freecamTargetFOV = 70
+    local freecamPinchBaseFOV = 70
+    local freecamHologramCameraOffset = Vector3.new()
     freecamHologramAnimTime = 0
     freecamHologramHoverBlend = 0
     freecamHologramMoveBlend = 0
     freecamHologramLeanBlend = 0
     freecamHologramSideLeanBlend = 0
-    freecamCameraOffset = Vector3.new()
+    local freecamCameraOffset = Vector3.new()
     freecamSavedCFrame = nil
     freecamSavedCameraType = nil
     freecamSavedCameraSubject = nil
     freecamSavedAnchored = nil
+    freecamLockedCharacter = nil
+    table.clear(freecamCharacterStates)
     freecamPosition = nil
+    local freecamInitialPosition = nil
+    local freecamPitch = 0
+    local freecamYaw = 0
+    local freecamBodyYaw = 0
+    local freecamFlightBankBlend = 0
+    local freecamFlightSpeedBlend = 0
+    local freecamFlightPreviousDesiredYaw = nil
+    local freecamFlightPreviousMoveDirection = Vector3.new()
+    local freecamLookInput = nil
 
 end
 
@@ -982,23 +1053,6 @@ local function enableFreecam()
     if not root or not humanoid or not camera then
         return false
     end
-
-    -- If the real character dies while Freecam is active, immediately leave
-    -- Freecam. This prevents the camera/hologram state from surviving into
-    -- the respawn and ensures the Freecam Shift Lock button disappears.
-    if freecamDeathConnection then
-        freecamDeathConnection:Disconnect()
-        freecamDeathConnection = nil
-    end
-    freecamDeathConnection = humanoid.Died:Connect(function()
-        if freecamEnabled then
-            task.defer(function()
-                if freecamEnabled then
-                    disableFreecam()
-                end
-            end)
-        end
-    end)
 
     freecamEnabled = true
     stateChangedEvent:Fire(true)
@@ -1029,6 +1083,8 @@ local function enableFreecam()
             (camera.CFrame.Position - root.Position).Magnitude
     end
 
+    local freecamZoomMin = 2
+    local freecamZoomMax = 24
     freecamZoomDistance = math.clamp(
         normalCameraDistance,
         freecamZoomMin,
@@ -1053,6 +1109,7 @@ local function enableFreecam()
     freecamShiftLockShiftedOffset = freecamCameraOffset
     freecamShiftLockUnshiftedOffset =
         freecamCameraOffset - freecamShiftLockRightVector * shoulderAmount
+    local freecamShiftLockOn = true
     applyFreecamShiftLockState()
 
     freecamPitch, freecamYaw = camera.CFrame:ToOrientation()
@@ -1060,13 +1117,17 @@ local function enableFreecam()
     -- unshifted, it behaves like a normal character: it keeps its current
     -- facing direction while idle and turns toward its movement direction.
     freecamBodyYaw = freecamYaw
+    local freecamFlightBankBlend = 0
+    local freecamFlightSpeedBlend = 0
     freecamFlightPreviousDesiredYaw = freecamYaw
+    local freecamFlightPreviousMoveDirection = Vector3.new()
 
     -- The hologram is the subject, so start it exactly on the real body.
     -- The camera itself starts at the same distance as the normal camera
     -- (clamped to 2-24 studs) and can still be changed with pinch/wheel.
     freecamPosition = root.Position
     freecamInitialPosition = freecamPosition
+    local freecamHologramCameraOffset = Vector3.new()
     createFreecamHologram()
 
     -- Put the hologram at the real body immediately. It will then mirror
@@ -1080,7 +1141,10 @@ local function enableFreecam()
     freecamTargetYaw = freecamYaw
     freecamResetInput()
 
-    root.Anchored = true
+    -- Lock the physical body without disabling its Humanoid input. The
+    -- joystick still supplies MoveDirection to Freecam, but the real body
+    -- cannot walk or jump away from the point where the soul departed.
+    lockCharacterForFreecam(character)
     camera.CameraType = Enum.CameraType.Scriptable
 
     local freecamRenderConnection = RunService:BindToRenderStep(
@@ -1093,6 +1157,16 @@ local function enableFreecam()
 
             local currentCharacter = player.Character
             local currentRoot = currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
+
+            -- Respawn is NOT a Freecam state transition. Keep the soul/camera
+            -- session alive and lock the newly spawned physical body as soon
+            -- as its root exists. The camera remains Scriptable throughout.
+            if currentCharacter and currentCharacter ~= freecamLockedCharacter and currentRoot then
+                lockCharacterForFreecam(currentCharacter)
+            elseif currentCharacter and currentRoot and not freecamCharacterStates[currentCharacter] then
+                lockCharacterForFreecam(currentCharacter)
+            end
+
             local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
             local currentCamera = workspace.CurrentCamera
 
@@ -1328,7 +1402,7 @@ local function enableFreecam()
                     zoomTouchCount += 1
                 end
                 if zoomTouchCount < 2 then
-                    freecamPinchLastDiameter = nil
+                    local freecamPinchLastDiameter = nil
                 end
 
                 return Enum.ContextActionResult.Sink
@@ -1364,7 +1438,7 @@ local function enableFreecam()
         end
 
         if zoomTouchCount < 2 then
-            freecamPinchLastDiameter = nil
+            local freecamPinchLastDiameter = nil
         end
     end)
 
@@ -1476,14 +1550,29 @@ end
 if freecamRespawnConnection then
     freecamRespawnConnection:Disconnect()
 end
-freecamRespawnConnection = player.CharacterAdded:Connect(function()
-    if freecamEnabled then
-        task.defer(function()
-            if freecamEnabled then
-                disableFreecam()
-            end
-        end)
+freecamRespawnConnection = player.CharacterAdded:Connect(function(character)
+    if not freecamEnabled then
+        return
     end
+
+    -- CharacterAdded itself is cheap and does not touch the camera. Lock the
+    -- root as soon as it is available. The RenderStep below repeats the lock
+    -- as a safety net without doing any per-frame allocations.
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root then
+        lockCharacterForFreecam(character)
+    end
+
+    task.spawn(function()
+        if not freecamEnabled or not character.Parent then
+            return
+        end
+
+        local readyRoot = character:WaitForChild("HumanoidRootPart", 2)
+        if freecamEnabled and readyRoot and character.Parent then
+            lockCharacterForFreecam(character)
+        end
+    end)
 end)
 
 FreecamSpeedInput = Instance.new("TextBox")
