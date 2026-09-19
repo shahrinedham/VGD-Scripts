@@ -17,6 +17,8 @@ StandaloneGui.DisplayOrder = 2000
 StandaloneGui.Parent = game:GetService("CoreGui")
 
 local freecamEnabled = false
+local freecamControlMode = "Hologram"
+local freecamSwapButton = nil
 local stateChangedEvent = Instance.new("BindableEvent")
 local freecamConnection = nil
 local freecamCharacterConnection = nil
@@ -264,6 +266,9 @@ if workspace.CurrentCamera then
         positionFPSPingDisplay()
         if FreecamSpeedInput then
             positionFreecamSpeedInput()
+        end
+        if freecamSwapButton then
+            positionFreecamSwapButton()
         end
     end)
 end
@@ -938,6 +943,8 @@ local function disableFreecam()
     end
     if FreecamSpeedInput then
         FreecamSpeedInput.Visible = false
+        freecamSwapButton.Visible = false
+        freecamControlMode = "Hologram"
     end
     local freecamShiftLockOn = true
     local freecamShiftLockShiftedOffset = Vector3.new()
@@ -1048,6 +1055,67 @@ local function disableFreecam()
 
 end
 
+local function updateFreecamSwapButton()
+    if not freecamSwapButton then return end
+    if freecamControlMode == "Body" then
+        freecamSwapButton.Text = "🧍  SWAP"
+    else
+        freecamSwapButton.Text = "👻  SWAP"
+    end
+end
+
+local function positionFreecamSwapButton()
+    if not freecamSwapButton then return end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1536, 864)
+
+    local speedX = math.floor(viewport.X * 0.295)
+    local speedY = math.floor(viewport.Y * 0.031)
+    local x = speedX + FreecamSpeedInput.AbsoluteSize.X + 10
+    local y = speedY
+
+    x = math.clamp(x, 8, math.max(8, viewport.X - freecamSwapButton.AbsoluteSize.X - 8))
+    y = math.clamp(y, 8, math.max(8, viewport.Y - freecamSwapButton.AbsoluteSize.Y - 8))
+
+    freecamSwapButton.Position = UDim2.fromOffset(x, y)
+end
+
+local function setFreecamControlMode(mode)
+    if mode ~= "Hologram" and mode ~= "Body" then return end
+
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+
+    freecamControlMode = mode
+
+    if root then
+        if mode == "Body" then
+            -- Release the physical body. Its normal Humanoid controls remain
+            -- active, while the hologram stays at its own Freecam position.
+            root.Anchored = false
+        else
+            -- Freeze the physical body again when returning to the soul.
+            root.Anchored = true
+        end
+    end
+
+    updateFreecamSwapButton()
+end
+
+local function toggleFreecamControlMode()
+    if not freecamEnabled then return end
+
+    if freecamControlMode == "Hologram" then
+        setFreecamControlMode("Body")
+    else
+        setFreecamControlMode("Hologram")
+    end
+end
+
+freecamSwapButton.Activated:Connect(toggleFreecamControlMode)
+updateFreecamSwapButton()
+positionFreecamSwapButton()
+
 local function enableFreecam()
     disableFreecam()
 
@@ -1070,6 +1138,10 @@ local function enableFreecam()
     if FreecamSpeedInput then
         FreecamSpeedInput.Text = tostring(math.floor(FREECAM_SPEED + 0.5))
         FreecamSpeedInput.Visible = true
+        freecamControlMode = "Hologram"
+        updateFreecamSwapButton()
+        freecamSwapButton.Visible = true
+        positionFreecamSwapButton()
         positionFreecamSpeedInput()
     end
     freecamSavedCFrame = root.CFrame
@@ -1228,7 +1300,13 @@ local function enableFreecam()
                 moveVector = moveVector.Unit
             end
 
-            freecamPosition = freecamPosition + moveVector * FREECAM_SPEED * dt
+            if freecamControlMode == "Hologram" then
+                freecamPosition = freecamPosition + moveVector * FREECAM_SPEED * dt
+            else
+                -- Body mode: the real Humanoid receives the joystick input;
+                -- keep the hologram parked at its last Freecam position.
+                moveVector = Vector3.zero
+            end
 
             -- Freecam Shift Lock ON: the hologram faces wherever the camera
             -- is looking, matching the current Shift Lock behavior.
@@ -1248,19 +1326,38 @@ local function enableFreecam()
             -- rotates the hologram. Zoom still uses the same physical camera
             -- distance and the existing camera offset remains untouched.
             local subjectPosition = freecamPosition
-            local cameraLookCFrame =
-                CFrame.new(subjectPosition) *
-                CFrame.Angles(0, freecamYaw, 0) *
-                CFrame.Angles(freecamPitch, 0, 0)
-            local freecamCameraLook = cameraLookCFrame.LookVector
-            local cameraPosition =
-                subjectPosition - freecamCameraLook * freecamZoomDistance
-                + freecamCameraOffset
+            local cameraCFrame
 
-            local cameraCFrame = CFrame.lookAt(
-                cameraPosition,
-                cameraPosition + freecamCameraLook
-            )
+            if freecamControlMode == "Body" and currentRoot and currentHumanoid then
+                subjectPosition = currentRoot.Position
+                local bodyLookCFrame =
+                    CFrame.new(subjectPosition) *
+                    CFrame.Angles(0, freecamYaw, 0) *
+                    CFrame.Angles(freecamPitch, 0, 0)
+                local bodyCameraLook = bodyLookCFrame.LookVector
+                local bodyCameraPosition =
+                    subjectPosition - bodyCameraLook * freecamZoomDistance
+                    + freecamCameraOffset
+
+                cameraCFrame = CFrame.lookAt(
+                    bodyCameraPosition,
+                    bodyCameraPosition + bodyCameraLook
+                )
+            else
+                local cameraLookCFrame =
+                    CFrame.new(subjectPosition) *
+                    CFrame.Angles(0, freecamYaw, 0) *
+                    CFrame.Angles(freecamPitch, 0, 0)
+                local freecamCameraLook = cameraLookCFrame.LookVector
+                local cameraPosition =
+                    subjectPosition - freecamCameraLook * freecamZoomDistance
+                    + freecamCameraOffset
+
+                cameraCFrame = CFrame.lookAt(
+                    cameraPosition,
+                    cameraPosition + freecamCameraLook
+                )
+            end
 
             -- Roblox may temporarily retarget the camera when the physical
             -- Humanoid dies/respawns. Freecam owns the camera for the entire
@@ -1580,7 +1677,12 @@ freecamRespawnConnection = player.CharacterAdded:Connect(function(character)
     -- and locks the new root as soon as Roblox creates it.
     local root = character:FindFirstChild("HumanoidRootPart")
     if root then
-        lockCharacterForFreecam(character)
+        if freecamControlMode == "Body" then
+            root.Anchored = false
+            freecamLockedCharacter = nil
+        else
+            lockCharacterForFreecam(character)
+        end
     end
 end)
 
@@ -1601,6 +1703,33 @@ FreecamSpeedInput.Visible = false
 FreecamSpeedInput.Active = true
 FreecamSpeedInput.ZIndex = 2000
 FreecamSpeedInput.Parent = StandaloneGui
+
+-- Hologram <-> real body swap shortcut.
+freecamSwapButton = Instance.new("TextButton")
+freecamSwapButton.Name = "FreecamSwapButton"
+freecamSwapButton.Size = UDim2.fromOffset(118, 38)
+freecamSwapButton.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+freecamSwapButton.BackgroundTransparency = 0.1
+freecamSwapButton.BorderSizePixel = 0
+freecamSwapButton.Font = Enum.Font.GothamBold
+freecamSwapButton.TextSize = 13
+freecamSwapButton.TextColor3 = Color3.new(1, 1, 1)
+freecamSwapButton.Text = "👻  SWAP"
+freecamSwapButton.AutoButtonColor = true
+freecamSwapButton.Visible = false
+freecamSwapButton.Active = true
+freecamSwapButton.ZIndex = 2000
+freecamSwapButton.Parent = StandaloneGui
+
+local freecamSwapCorner = Instance.new("UICorner")
+freecamSwapCorner.CornerRadius = UDim.new(0, 8)
+freecamSwapCorner.Parent = freecamSwapButton
+
+local freecamSwapStroke = Instance.new("UIStroke")
+freecamSwapStroke.Thickness = 1
+freecamSwapStroke.Transparency = 0.35
+freecamSwapStroke.Parent = freecamSwapButton
+
 
 Instance.new("UICorner", FreecamSpeedInput).CornerRadius = UDim.new(0, 22)
 
