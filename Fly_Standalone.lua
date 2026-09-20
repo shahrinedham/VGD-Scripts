@@ -192,6 +192,16 @@ local flyFlightPreviousDesiredYaw = nil
 local flyHologramMoveBlend = 0
 local flyAnimTime = 0
 
+-- Match the Freecam camera feel: keep a smoothed camera orientation
+-- separate from the real body orientation. This prevents the real body
+-- turning from feeding back into the camera and makes camera-direction
+-- changes use the same exponential look smoothing as Freecam.
+local flyCameraYaw = nil
+local flyCameraPitch = nil
+local FLY_CAMERA_LOOK_SMOOTHNESS = 34
+local FLY_CAMERA_MIN_PITCH = math.rad(-89)
+local FLY_CAMERA_MAX_PITCH = math.rad(89)
+
 local function shortestAngleDelta(fromAngle, toAngle)
     return math.atan2(math.sin(toAngle - fromAngle), math.cos(toAngle - fromAngle))
 end
@@ -214,10 +224,37 @@ local function updateFly(deltaTime)
     -- No velocity flight, no physics smoothing, no separate body steering.
     -- ================================================================
 
+    -- ================================================================
+    -- FREECAM-MATCHED CAMERA FEEL
+    -- ================================================================
+    -- Roblox's normal camera has already processed this frame's input. Keep
+    -- that orientation as the target, then apply the exact same exponential
+    -- smoothing model used by Freecam (34). The smoothed orientation becomes
+    -- the camera direction used for flight AND the orientation shown to the
+    -- player. The body's rotation therefore cannot instantly jerk the view.
+    local targetPitch, targetYaw = cam.CFrame:ToEulerAnglesYXZ()
+    targetPitch = math.clamp(targetPitch, FLY_CAMERA_MIN_PITCH, FLY_CAMERA_MAX_PITCH)
+
+    if flyCameraYaw == nil or flyCameraPitch == nil then
+        flyCameraYaw = targetYaw
+        flyCameraPitch = targetPitch
+    else
+        local yawDelta = shortestAngleDelta(flyCameraYaw, targetYaw)
+        local lookAlpha = 1 - math.exp(-FLY_CAMERA_LOOK_SMOOTHNESS * dt)
+        flyCameraYaw = flyCameraYaw + yawDelta * lookAlpha
+        flyCameraPitch = flyCameraPitch
+            + (targetPitch - flyCameraPitch) * lookAlpha
+    end
+
+    local smoothedCameraCFrame =
+        CFrame.new(cam.CFrame.Position)
+        * CFrame.Angles(0, flyCameraYaw, 0)
+        * CFrame.Angles(flyCameraPitch, 0, 0)
+
     local moveDirection = humanoid.MoveDirection
     local horizontalMove = Vector3.new(moveDirection.X, 0, moveDirection.Z)
-    local cameraLook = cam.CFrame.LookVector
-    local cameraRight = cam.CFrame.RightVector
+    local cameraLook = smoothedCameraCFrame.LookVector
+    local cameraRight = smoothedCameraCFrame.RightVector
 
     local horizontalLook = Vector3.new(cameraLook.X, 0, cameraLook.Z)
     local horizontalRight = Vector3.new(cameraRight.X, 0, cameraRight.Z)
@@ -447,11 +484,16 @@ local function updateFly(deltaTime)
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
 
+    -- Keep the camera's smoothed orientation independent from the body's new
+    -- rotation, then translate it by exactly the same body displacement.
     local bodyDelta = root.Position - previousRootPosition
-    if bodyDelta.Magnitude > 0.000001 then
-        cam.CFrame = cam.CFrame + bodyDelta
-        cam.Focus = cam.Focus + bodyDelta
-    end
+    local cameraPosition = cam.CFrame.Position + bodyDelta
+    local finalCameraCFrame =
+        CFrame.new(cameraPosition)
+        * CFrame.Angles(0, flyCameraYaw, 0)
+        * CFrame.Angles(flyCameraPitch, 0, 0)
+    cam.CFrame = finalCameraCFrame
+    cam.Focus = CFrame.new(cam.Focus.Position + bodyDelta)
 end
 
 local function verticalAction(_, inputState, inputObject)
@@ -489,6 +531,8 @@ local function enableFly()
     flyFlightPreviousDesiredYaw = flyBodyYaw
     flyHologramMoveBlend = 0
     flyAnimTime = 0
+    flyCameraYaw = nil
+    flyCameraPitch = nil
     humanoid.PlatformStand = true
     humanoid.AutoRotate = false
     root.Anchored = true
@@ -548,6 +592,8 @@ player.CharacterAdded:Connect(function(character)
                         flyPosition = root.Position
                         flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
                         flyFlightPreviousDesiredYaw = flyBodyYaw
+                        flyCameraYaw = nil
+                        flyCameraPitch = nil
                         loadFlyAnimations(humanoid)
                     end
                 end
