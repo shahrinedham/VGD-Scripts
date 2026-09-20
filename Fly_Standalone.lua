@@ -1,4 +1,4 @@
--- VGD Fly Standalone v44
+-- VGD Fly Standalone v48
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -1278,6 +1278,13 @@ local function updateFly(deltaTime)
         moveVector = moveVector.Unit
     end
 
+    -- Keep a world-space horizontal movement vector available for the
+    -- Shift Lock OFF body-heading logic below. In the raw PlayerModule
+    -- input path, the old code only created `horizontalMove` inside the
+    -- fallback branch, so disabling Shift Lock left it nil and caused the
+    -- render loop to error before updating the camera/body.
+    local horizontalMove = Vector3.new(moveVector.X, 0, moveVector.Z)
+
     -- The real-body Fly follows the same camera-pitch flight as the hologram.
     -- Space/Ctrl remains an optional extra vertical input, but the normal
     -- flight path itself is entirely driven by joystick + camera look.
@@ -1596,9 +1603,11 @@ local function enableFly()
 
     flyEnabled = true
     flyShiftLockOn = true
-    flyNoClipOn = true
+    -- Preserve the user's last No Clip preference across Fly disable/enable.
+    -- No Clip is ON by default only for the first Fly session; after the user
+    -- turns it OFF, disabling and re-enabling Fly keeps it OFF.
     updateFlyShiftLockButton()
-    setFlyNoClip(true)
+    setFlyNoClip(flyNoClipOn)
     flyVerticalInput = 0
     forwardBlend, rightBlend, flightPitchBlend, flightBankBlend, speedBlend, hoverBlend = 0, 0, 0, 0, 0, 0
     flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
