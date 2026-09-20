@@ -19,6 +19,8 @@ local flyVerticalInput = 0
 local flyRenderConnection = nil
 local flySaved = nil
 local flyPosition = nil
+local flyAnimateScript = nil
+local flyAnimateScriptDisabled = false
 local flyTracks = {}
 local stateChangedEvent = Instance.new("BindableEvent")
 
@@ -143,6 +145,18 @@ local function saveCharacterState(humanoid, root)
         rootVelocity = root.AssemblyLinearVelocity,
         rootAngularVelocity = root.AssemblyAngularVelocity,
     }
+
+    -- The hologram has no default Animate script because its scripts are
+    -- stripped from the clone. The real character still has Roblox's Animate
+    -- controller, which can fight the flight tracks and cause visible jitter.
+    local character = humanoid.Parent
+    local animate = character and character:FindFirstChild("Animate")
+    flyAnimateScript = animate
+    flyAnimateScriptDisabled = false
+    if animate and (animate:IsA("LocalScript") or animate:IsA("Script")) then
+        flyAnimateScriptDisabled = animate.Disabled
+        animate.Disabled = true
+    end
 end
 
 local function restoreCharacterState()
@@ -158,6 +172,12 @@ local function restoreCharacterState()
         humanoid.PlatformStand = saved and saved.platformStand or false
         humanoid.AutoRotate = saved and saved.autoRotate or true
     end
+
+    if flyAnimateScript and flyAnimateScript.Parent then
+        flyAnimateScript.Disabled = flyAnimateScriptDisabled
+    end
+    flyAnimateScript = nil
+    flyAnimateScriptDisabled = false
     if root then
         root.Anchored = saved and saved.anchored or false
         root.AssemblyLinearVelocity = Vector3.zero
@@ -463,8 +483,20 @@ local function enableFly()
     loadFlyAnimations(humanoid)
     bindVerticalControls()
 
-    if flyRenderConnection then flyRenderConnection:Disconnect() end
-    flyRenderConnection = RunService.RenderStepped:Connect(updateFly)
+    if flyRenderConnection then
+        RunService:UnbindFromRenderStep("VGD_FlySmooth")
+        flyRenderConnection = nil
+    end
+
+    -- Run immediately before Roblox's camera update. The hologram's camera and
+    -- flight pose are calculated in one render pass; the real body needs its
+    -- CFrame committed before the default CameraModule samples the character.
+    RunService:BindToRenderStep(
+        "VGD_FlySmooth",
+        Enum.RenderPriority.Camera.Value - 1,
+        updateFly
+    )
+    flyRenderConnection = true
     stateChangedEvent:Fire(true)
     return true
 end
@@ -473,7 +505,10 @@ local function disableFly()
     if not flyEnabled then return false end
     flyEnabled = false
     unbindVerticalControls()
-    if flyRenderConnection then flyRenderConnection:Disconnect(); flyRenderConnection = nil end
+    if flyRenderConnection then
+        RunService:UnbindFromRenderStep("VGD_FlySmooth")
+        flyRenderConnection = nil
+    end
     restoreCharacterState()
     stateChangedEvent:Fire(false)
     return false
