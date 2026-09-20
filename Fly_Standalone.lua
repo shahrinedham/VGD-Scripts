@@ -1,4 +1,4 @@
--- VGD Fly Standalone v29
+-- VGD Fly Standalone v44
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -59,6 +59,276 @@ local flyCameraTouchDelta = Vector2.new()
 local flyCameraMouseDelta = Vector2.new()
 local flyCameraMouseLooking = false
 local flyCameraConnections = {}
+
+-- Read the same PlayerModule movement vector that Roblox mobile/keyboard
+-- controls use. This keeps the joystick alive when Fly switches Humanoid
+-- into PlatformStand, instead of relying only on Humanoid.MoveDirection.
+local flyMoveControls = nil
+
+-- Mobile joystick continuity. Roblox's PlatformStand state prevents the
+-- Humanoid from moving, and community testing/source inspection shows the
+-- default movement controller can therefore return zero even while the
+-- physical thumbstick is still held. We keep a small independent copy of the
+-- thumbstick state so Fly can consume the same input without asking the
+-- Humanoid to walk.
+local flyJoystickTouch = nil
+local flyJoystickStartPosition = nil
+local flyJoystickVector = Vector3.zero
+local flyJoystickReleasedSinceLastStart = false
+local flyJoystickConnections = {}
+
+local function getDynamicThumbstickFrame()
+    local playerGui = player:FindFirstChildOfClass("PlayerGui")
+    local touchGui = playerGui and playerGui:FindFirstChild("TouchGui")
+    if not touchGui then return nil end
+
+    local touchControlFrame = touchGui:FindFirstChild("TouchControlFrame")
+    return touchControlFrame and touchControlFrame:FindFirstChild("DynamicThumbstickFrame")
+end
+
+local function pointInsideGui(guiObject, position)
+    if not guiObject or not guiObject.Visible then return false end
+    local p = guiObject.AbsolutePosition
+    local s = guiObject.AbsoluteSize
+    return position.X >= p.X
+        and position.X <= p.X + s.X
+        and position.Y >= p.Y
+        and position.Y <= p.Y + s.Y
+end
+
+local function getThumbstickCenter()
+    local frame = getDynamicThumbstickFrame()
+    if not frame then return nil end
+
+    -- Roblox's DynamicThumbstick source moves ThumbstickStart to the exact
+    -- touch-start position and ThumbstickEnd to the current touch position.
+    -- Reading those UI positions lets us identify the existing held finger
+    -- even when Fly is enabled after the finger was already placed.
+    local startImage = frame:FindFirstChild("ThumbstickStart")
+    if startImage then
+        return startImage.AbsolutePosition + startImage.AbsoluteSize * 0.5
+    end
+
+    return nil
+end
+
+local function computeJoystickVector(startPosition, currentPosition)
+    if not startPosition or not currentPosition then
+        return Vector3.zero
+    end
+
+    local delta = currentPosition - startPosition
+    local frame = getDynamicThumbstickFrame()
+    local maxLength = 50
+
+    if frame then
+        -- Match the DynamicThumbstick's screen-size scaling as closely as
+        -- possible. Its historical source uses a 50px max-radius on normal
+        -- screens and doubles it on large screens.
+        maxLength = math.min(frame.AbsoluteSize.X, frame.AbsoluteSize.Y)
+        if maxLength <= 0 then maxLength = 50 end
+        maxLength = math.min(50, maxLength)
+        if math.min(frame.AbsoluteSize.X, frame.AbsoluteSize.Y) > 500 then
+            maxLength = 100
+        end
+    end
+
+    local magnitude = delta.Magnitude
+    if magnitude < 2 then
+        return Vector3.zero
+    end
+
+    local clamped = math.min(magnitude, maxLength)
+    local unit = delta.Unit
+    local scaled = clamped / maxLength
+
+    -- Touch Y increases downward; Roblox movement Z increases backward.
+    -- Therefore screen-right = +X and screen-up = -Z.
+    return Vector3.new(
+        unit.X * scaled,
+        0,
+        unit.Y * scaled
+    )
+end
+
+local function clearFlyJoystick()
+    flyJoystickTouch = nil
+    flyJoystickStartPosition = nil
+    flyJoystickVector = Vector3.zero
+end
+
+local function disconnectFlyJoystickTracking()
+    for _, connection in pairs(flyJoystickConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(flyJoystickConnections)
+    clearFlyJoystick()
+end
+
+local function connectFlyJoystickTracking()
+    disconnectFlyJoystickTracking()
+
+    if not UserInputService.TouchEnabled then
+        return
+    end
+
+    flyJoystickConnections.TouchStarted = UserInputService.TouchStarted:Connect(function(inputObject)
+        local frame = getDynamicThumbstickFrame()
+        if not frame or not pointInsideGui(frame, inputObject.Position) then
+            return
+        end
+
+        -- Do not steal the camera's touch if Roblox has already assigned a
+        -- different thumbstick touch. The dynamic thumbstick's StartImage is
+        -- the stronger signal for an already-active joystick.
+        if flyJoystickTouch then
+            return
+        end
+
+        flyJoystickReleasedSinceLastStart = false
+        flyJoystickTouch = inputObject
+        flyJoystickStartPosition = Vector2.new(
+            inputObject.Position.X,
+            inputObject.Position.Y
+        )
+        flyJoystickVector = computeJoystickVector(
+            flyJoystickStartPosition,
+            flyJoystickStartPosition
+        )
+    end)
+
+    flyJoystickConnections.TouchMoved = UserInputService.TouchMoved:Connect(function(inputObject)
+        local position = Vector2.new(inputObject.Position.X, inputObject.Position.Y)
+
+        if flyJoystickTouch == inputObject then
+            flyJoystickVector = computeJoystickVector(
+                flyJoystickStartPosition,
+                position
+            )
+            return
+        end
+
+        if flyJoystickTouch then
+            return
+        end
+
+        -- Fly may have been enabled while the joystick finger was already
+        -- down. In that case TouchStarted happened before our connection.
+        -- Match the current touch against Roblox's live ThumbstickEnd visual
+        -- and recover the original center from ThumbstickStart.
+        local frame = getDynamicThumbstickFrame()
+        local startCenter = getThumbstickCenter()
+        local endImage = frame and frame:FindFirstChild("ThumbstickEnd")
+        if frame and startCenter and endImage and endImage.Visible
+            and pointInsideGui(frame, position) then
+            local endCenter = endImage.AbsolutePosition + endImage.AbsoluteSize * 0.5
+            if (position - endCenter).Magnitude <= 35 then
+                flyJoystickTouch = inputObject
+                flyJoystickStartPosition = startCenter
+                flyJoystickVector = computeJoystickVector(
+                    flyJoystickStartPosition,
+                    position
+                )
+            end
+        end
+    end)
+
+    flyJoystickConnections.TouchEnded = UserInputService.TouchEnded:Connect(function(inputObject)
+        local frame = getDynamicThumbstickFrame()
+        local endedInsideThumbstick = frame and pointInsideGui(frame, inputObject.Position)
+
+        if flyJoystickTouch == inputObject then
+            flyJoystickReleasedSinceLastStart = true
+            clearFlyJoystick()
+            return
+        end
+
+        -- If Fly was enabled while the joystick finger was already held, we
+        -- may never have obtained the InputObject identity. Use Roblox's
+        -- ThumbstickEnd visual as the release-side fallback so the latched
+        -- movement is cleared instead of continuing forever.
+        if flyJoystickVector.Magnitude > 0.001 then
+            local endImage = frame and frame:FindFirstChild("ThumbstickEnd")
+            local position = Vector2.new(inputObject.Position.X, inputObject.Position.Y)
+            if frame and endImage and endImage.Visible
+                and pointInsideGui(frame, position) then
+                local endCenter = endImage.AbsolutePosition + endImage.AbsoluteSize * 0.5
+                if (position - endCenter).Magnitude <= 40 then
+                    flyJoystickReleasedSinceLastStart = true
+                    clearFlyJoystick()
+                end
+            end
+        elseif endedInsideThumbstick then
+            -- The joystick may have been released before our tracker could
+            -- identify the original InputObject. Remember that release so the
+            -- disable path cannot mistake stale ThumbstickStart/End visuals
+            -- for a currently held joystick.
+            flyJoystickReleasedSinceLastStart = true
+        end
+    end)
+end
+
+-- Keep the DynamicThumbstick tracker alive even when Fly is OFF.
+-- This is important for the transition where the player starts holding the
+-- joystick BEFORE pressing Fly ENABLE. If we only connect after Fly starts,
+-- TouchStarted for that finger has already happened and we lose the exact
+-- InputObject needed for the handoff back to the normal Humanoid controller.
+connectFlyJoystickTracking()
+
+local function getFlyMoveControls()
+    local controls = nil
+    pcall(function()
+        local playerScripts = player:FindFirstChildOfClass("PlayerScripts")
+        local playerModule = playerScripts and playerScripts:FindFirstChild("PlayerModule")
+        if not playerModule then return end
+        local module = require(playerModule)
+        if module and module.GetControls then
+            controls = module:GetControls()
+        end
+    end)
+    return controls
+end
+
+local function getFlyMoveVector(humanoid)
+    if not flyMoveControls then
+        flyMoveControls = getFlyMoveControls()
+    end
+
+    if flyMoveControls then
+        -- PlayerModule:GetMoveVector() is INPUT SPACE, not world space:
+        -- forward is -Z and right is +X. Keep that raw vector intact so the
+        -- render loop can convert it to the current Fly camera basis exactly
+        -- once. The previous v36 code fed this raw vector into the old
+        -- Humanoid.MoveDirection world-space dot-product conversion, which
+        -- inverted left/right and forward/backward.
+        pcall(function() flyMoveControls:Enable() end)
+        local ok, value = pcall(function()
+            return flyMoveControls:GetMoveVector()
+        end)
+        if ok and typeof(value) == "Vector3" then
+            if value.Magnitude > 0.001 then
+                flyJoystickVector = value
+                return value, true
+            end
+
+            -- ControlModule can report zero after PlatformStand. If the
+            -- independent thumbstick tracker still sees the finger held, use
+            -- that input instead of allowing the Fly to stop.
+            if flyJoystickVector.Magnitude > 0.001 then
+                return flyJoystickVector, true
+            end
+
+            return Vector3.zero, true
+        end
+    end
+
+    -- Fallback: Humanoid.MoveDirection IS already world-space.
+    if humanoid then
+        return humanoid.MoveDirection, false
+    end
+
+    return Vector3.zero, false
+end
 
 local FLY_CAMERA_TOUCH_ROTATION_SPEED = Vector2.new(0.82, 0.54) * math.rad(1)
 local FLY_CAMERA_MOUSE_ROTATION_SPEED = Vector2.new(1, 0.77) * math.rad(0.5)
@@ -964,8 +1234,11 @@ local function updateFly(deltaTime)
         CFrame.Angles(flyCameraPitch, 0, 0)
     local cameraLook = cameraLookCFrame.LookVector
     local cameraRight = cameraLookCFrame.RightVector
-    local moveDirection = humanoid.MoveDirection
-    local horizontalMove = Vector3.new(moveDirection.X, 0, moveDirection.Z)
+    -- Get the actual current joystick/controller vector directly.
+    -- PlatformStand can make Humanoid.MoveDirection drop to zero for the
+    -- transition frame when Fly is enabled while the player is already walking.
+    -- PlayerModule:GetMoveVector() preserves the held joystick state.
+    local moveDirection, isRawControlVector = getFlyMoveVector(humanoid)
 
     local horizontalLook = Vector3.new(cameraLook.X, 0, cameraLook.Z)
     local horizontalRight = Vector3.new(cameraRight.X, 0, cameraRight.Z)
@@ -982,8 +1255,20 @@ local function updateFly(deltaTime)
         horizontalRight = Vector3.new(1, 0, 0)
     end
 
-    local forwardInput = math.clamp(horizontalMove:Dot(horizontalLook), -1, 1)
-    local rightInput = math.clamp(horizontalMove:Dot(horizontalRight), -1, 1)
+    local forwardInput
+    local rightInput
+
+    if isRawControlVector then
+        -- PlayerModule input: X = right, Z = backward.
+        -- Convert it into camera-relative world movement once.
+        forwardInput = math.clamp(-moveDirection.Z, -1, 1)
+        rightInput = math.clamp(moveDirection.X, -1, 1)
+    else
+        -- Humanoid.MoveDirection fallback: already world-space.
+        local horizontalMove = Vector3.new(moveDirection.X, 0, moveDirection.Z)
+        forwardInput = math.clamp(horizontalMove:Dot(horizontalLook), -1, 1)
+        rightInput = math.clamp(horizontalMove:Dot(horizontalRight), -1, 1)
+    end
 
     local moveVector =
         (cameraLook * forwardInput) +
@@ -1281,6 +1566,34 @@ local function enableFly()
     if not humanoid or not root then return false end
 
     saveCharacterState(humanoid, root)
+
+    -- Resolve and enable Roblox's movement controller BEFORE PlatformStand is
+    -- applied. This preserves the currently-held mobile joystick instead of
+    -- allowing the transition into Fly to make the ControlModule go idle.
+    flyMoveControls = getFlyMoveControls()
+    if flyMoveControls then
+        pcall(function() flyMoveControls:Enable() end)
+    end
+
+    -- Start tracking BEFORE PlatformStand. This is important because the
+    -- joystick may already be held when Fly is enabled, so TouchStarted for
+    -- that finger may have happened earlier. We also sample the current raw
+    -- controller vector below so the transition does not lose momentum.
+    -- The joystick tracker is persistent. Do NOT reconnect it here because
+    -- reconnecting would lose a touch that began before Fly was enabled.
+    local preStandMove = Vector3.zero
+    if flyMoveControls then
+        pcall(function()
+            local value = flyMoveControls:GetMoveVector()
+            if typeof(value) == "Vector3" then
+                preStandMove = value
+            end
+        end)
+    end
+    if preStandMove.Magnitude > 0.001 then
+        flyJoystickVector = preStandMove
+    end
+
     flyEnabled = true
     flyShiftLockOn = true
     flyNoClipOn = true
@@ -1347,6 +1660,7 @@ local function enableFly()
     flyBodyYaw = flyCameraYaw
     flyFlightPreviousDesiredYaw = flyCameraYaw
     flyCameraResetInput()
+    flyMoveControls = getFlyMoveControls()
 
     flyPosition = root.Position
     loadFlyAnimations(humanoid)
@@ -1376,6 +1690,40 @@ end
 
 local function disableFly()
     if not flyEnabled then return false end
+
+    -- Capture the joystick state BEFORE disconnectFlyJoystickTracking() clears it.
+    -- If the thumb is still held, we hand that movement back to the normal
+    -- Humanoid controller after PlatformStand is restored. This fixes both
+    -- transition cases: a touch held before Fly was enabled, and a new touch
+    -- started while already flying. If no touch is held, no movement is handed
+    -- back, so disabling Fly still stops movement normally.
+    local handoffMoveVector = nil
+    if not flyJoystickReleasedSinceLastStart
+        and flyJoystickTouch
+        and (flyJoystickTouch.UserInputState == Enum.UserInputState.Begin
+            or flyJoystickTouch.UserInputState == Enum.UserInputState.Change)
+        and flyJoystickVector.Magnitude > 0.001 then
+        handoffMoveVector = flyJoystickVector
+    elseif not flyJoystickReleasedSinceLastStart and UserInputService.TouchEnabled then
+        -- Case 1 can reach here when the joystick finger was already down
+        -- before Fly started, so our TouchStarted listener never received
+        -- that InputObject. Roblox's DynamicThumbstick still exposes the
+        -- live Start/End visuals while the finger is held. Recover the exact
+        -- current joystick vector from those visuals before tearing Fly down.
+        local frame = getDynamicThumbstickFrame()
+        local startImage = frame and frame:FindFirstChild("ThumbstickStart")
+        local endImage = frame and frame:FindFirstChild("ThumbstickEnd")
+        if frame and startImage and endImage
+            and startImage.Visible and endImage.Visible then
+            local startCenter = startImage.AbsolutePosition + startImage.AbsoluteSize * 0.5
+            local endCenter = endImage.AbsolutePosition + endImage.AbsoluteSize * 0.5
+            local recovered = computeJoystickVector(startCenter, endCenter)
+            if recovered.Magnitude > 0.001 then
+                handoffMoveVector = recovered
+            end
+        end
+    end
+
     flyEnabled = false
     updateFlyShiftLockButton()
     unbindVerticalControls()
@@ -1384,6 +1732,10 @@ local function disableFly()
         flyRenderConnection = nil
     end
     disconnectFlyCameraInput()
+    -- Keep the joystick tracker connected after Fly is disabled so a touch
+    -- that started before Fly can remain available for the normal movement
+    -- controller and for the next Fly transition.
+    flyMoveControls = nil
     disconnectFlyNoClipWatcher()
 
     local camera = workspace.CurrentCamera
@@ -1404,6 +1756,224 @@ local function disableFly()
     setFlyNoClip(false)
     destroyFlyCollisionProxy()
     restoreCharacterState()
+
+    -- If the joystick was released WHILE Fly was enabled, there is no active
+    -- handoff vector to bridge back to Roblox. However, the normal ControlModule
+    -- can still have one render frame of its previous movement command queued
+    -- from before PlatformStand was enabled. Explicitly reset the movement
+    -- controller before returning full ownership, then issue a short zero-move
+    -- window. This specifically fixes: move joystick -> enable Fly -> release
+    -- joystick -> disable Fly, where the character could otherwise start walking
+    -- again even though the thumb was already released.
+    if not handoffMoveVector and UserInputService.TouchEnabled then
+        local stoppedHumanoid = select(1, getHumanoidAndRoot())
+        if stoppedHumanoid then
+            local resetControls = getFlyMoveControls()
+            if resetControls then
+                pcall(function() resetControls:Disable() end)
+                pcall(function() resetControls:Enable() end)
+            end
+
+            stoppedHumanoid:Move(Vector3.zero, false)
+
+            local stopUntil = os.clock() + 0.12
+            RunService:BindToRenderStep(
+                "VGD_FlyJoystickDisableStop",
+                Enum.RenderPriority.Character.Value + 2,
+                function()
+                    if os.clock() >= stopUntil then
+                        RunService:UnbindFromRenderStep("VGD_FlyJoystickDisableStop")
+                        return
+                    end
+                    if stoppedHumanoid.Parent then
+                        stoppedHumanoid:Move(Vector3.zero, false)
+                    else
+                        RunService:UnbindFromRenderStep("VGD_FlyJoystickDisableStop")
+                    end
+                end
+            )
+        end
+    end
+
+    -- Handoff v44: do NOT use InputObject.UserInputState as the only release
+    -- signal. Roblox owns the DynamicThumbstick InputObject and its state can
+    -- be cleared by the CoreScript before our render handoff sees the same
+    -- transition. UserInputService.TouchEnded is the explicit release event,
+    -- so the handoff installs its own release watcher for the exact touch.
+    if handoffMoveVector and handoffMoveVector.Magnitude > 0.001 then
+        local humanoid = select(1, getHumanoidAndRoot())
+        if humanoid then
+            local handoffControls = getFlyMoveControls()
+            if handoffControls then
+                pcall(function() handoffControls:Enable() end)
+            end
+
+            local handoffTouch = flyJoystickTouch
+            local handoffReleased = false
+            local handoffReleaseConnection = nil
+            local handoffNewTouchConnection = nil
+
+            -- If the joystick touch was already held before Fly was enabled,
+            -- flyJoystickTouch can be unavailable. In that case a TouchEnded
+            -- occurring inside the DynamicThumbstick area is the release of
+            -- the joystick that produced handoffMoveVector.
+            handoffReleaseConnection = UserInputService.TouchEnded:Connect(function(inputObject)
+                if handoffReleased then
+                    return
+                end
+
+                if handoffTouch then
+                    if inputObject == handoffTouch then
+                        handoffReleased = true
+                    end
+                    return
+                end
+
+                local frame = getDynamicThumbstickFrame()
+                if frame and pointInsideGui(frame, inputObject.Position) then
+                    handoffReleased = true
+                end
+            end)
+
+            -- If the player releases the old thumb and immediately starts a
+            -- fresh joystick touch, do not let the release hard-stop below
+            -- suppress the new walking input.
+            handoffNewTouchConnection = UserInputService.TouchStarted:Connect(function(inputObject)
+                if handoffReleased then
+                    return
+                end
+
+                local frame = getDynamicThumbstickFrame()
+                if frame and pointInsideGui(frame, inputObject.Position) then
+                    -- A new joystick touch is a new movement session. The old
+                    -- handoff must stop being responsible for movement.
+                    handoffReleased = true
+                end
+            end)
+
+            local function cleanupHandoffConnections()
+                if handoffReleaseConnection then
+                    pcall(function() handoffReleaseConnection:Disconnect() end)
+                    handoffReleaseConnection = nil
+                end
+                if handoffNewTouchConnection then
+                    pcall(function() handoffNewTouchConnection:Disconnect() end)
+                    handoffNewTouchConnection = nil
+                end
+            end
+
+            RunService:BindToRenderStep(
+                "VGD_FlyJoystickHandoff",
+                Enum.RenderPriority.Character.Value + 1,
+                function()
+                    if not humanoid.Parent then
+                        cleanupHandoffConnections()
+                        RunService:UnbindFromRenderStep("VGD_FlyJoystickHandoff")
+                        return
+                    end
+
+                    -- TouchEnded is the authoritative release signal for this
+                    -- handoff. Once it fires, stop feeding Humanoid:Move()
+                    -- immediately; do not wait for ThumbstickEnd visibility or
+                    -- InputObject.UserInputState to change.
+                    if handoffReleased then
+                        cleanupHandoffConnections()
+                        clearFlyJoystick()
+                        humanoid:Move(Vector3.zero, false)
+                        RunService:UnbindFromRenderStep("VGD_FlyJoystickHandoff")
+
+                        -- Humanoid:Move() is a per-frame command and Roblox's
+                        -- ControlModule can update movement on its own render
+                        -- pass. Give the zero command a tiny post-release
+                        -- window so the previous handoff vector cannot remain
+                        -- latched for another frame or two.
+                        local stopUntil = os.clock() + 0.12
+                        RunService:BindToRenderStep(
+                            "VGD_FlyJoystickHardStop",
+                            Enum.RenderPriority.Character.Value + 2,
+                            function()
+                                if os.clock() >= stopUntil then
+                                    RunService:UnbindFromRenderStep("VGD_FlyJoystickHardStop")
+                                    return
+                                end
+                                if humanoid.Parent then
+                                    humanoid:Move(Vector3.zero, false)
+                                else
+                                    RunService:UnbindFromRenderStep("VGD_FlyJoystickHardStop")
+                                end
+                            end
+                        )
+                        return
+                    end
+
+                    -- Keep using the exact tracked vector while the original
+                    -- touch remains held. For a pre-Fly touch, recover the
+                    -- current vector from DynamicThumbstick's live visuals.
+                    local vector = nil
+                    if handoffTouch and flyJoystickTouch == handoffTouch
+                        and flyJoystickVector.Magnitude > 0.001 then
+                        vector = flyJoystickVector
+                    else
+                        local frame = getDynamicThumbstickFrame()
+                        local startImage = frame and frame:FindFirstChild("ThumbstickStart")
+                        local endImage = frame and frame:FindFirstChild("ThumbstickEnd")
+                        if frame and startImage and endImage
+                            and startImage.Visible and endImage.Visible then
+                            local startCenter =
+                                startImage.AbsolutePosition
+                                + startImage.AbsoluteSize * 0.5
+                            local endCenter =
+                                endImage.AbsolutePosition
+                                + endImage.AbsoluteSize * 0.5
+                            vector = computeJoystickVector(startCenter, endCenter)
+                        end
+                    end
+
+                    if not vector or vector.Magnitude <= 0.001 then
+                        humanoid:Move(Vector3.zero, false)
+                        return
+                    end
+
+                    local camera = workspace.CurrentCamera
+                    local cameraCFrame = camera and camera.CFrame
+                    if not cameraCFrame then
+                        return
+                    end
+
+                    local look = cameraCFrame.LookVector
+                    local right = cameraCFrame.RightVector
+                    local horizontalLook = Vector3.new(look.X, 0, look.Z)
+                    local horizontalRight = Vector3.new(right.X, 0, right.Z)
+
+                    if horizontalLook.Magnitude > 0.001 then
+                        horizontalLook = horizontalLook.Unit
+                    else
+                        horizontalLook = Vector3.new(0, 0, -1)
+                    end
+
+                    if horizontalRight.Magnitude > 0.001 then
+                        horizontalRight = horizontalRight.Unit
+                    else
+                        horizontalRight = Vector3.new(1, 0, 0)
+                    end
+
+                    -- PlayerModule input space: X = right, Z = backward.
+                    -- Humanoid:Move() with relativeToCamera=false expects a
+                    -- world-space direction, so convert against the CURRENT
+                    -- normal camera every frame just like Roblox movement.
+                    local worldMove =
+                        (horizontalLook * (-vector.Z))
+                        + (horizontalRight * vector.X)
+                    if worldMove.Magnitude > 1 then
+                        worldMove = worldMove.Unit
+                    end
+
+                    humanoid:Move(worldMove, false)
+                end
+            )
+        end
+    end
+
     stateChangedEvent:Fire(false)
     return false
 end
@@ -1419,6 +1989,21 @@ player.CharacterAdded:Connect(function(character)
                     if humanoid and root then
                         flySaved = nil
                         saveCharacterState(humanoid, root)
+                        flyMoveControls = getFlyMoveControls()
+                        if flyMoveControls then
+                            pcall(function() flyMoveControls:Enable() end)
+                        end
+                        -- The joystick tracker is persistent across Fly state
+                        -- changes and character respawns. Do not reconnect it
+                        -- here or an already-held touch would be lost.
+                        if flyMoveControls then
+                            pcall(function()
+                                local value = flyMoveControls:GetMoveVector()
+                                if typeof(value) == "Vector3" and value.Magnitude > 0.001 then
+                                    flyJoystickVector = value
+                                end
+                            end)
+                        end
                         createFlyCollisionProxy()
                         setFlyNoClip(flyNoClipOn)
                         humanoid.PlatformStand = true
@@ -1429,6 +2014,20 @@ player.CharacterAdded:Connect(function(character)
                         flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
                         flyFlightPreviousDesiredYaw = flyBodyYaw
                         loadFlyAnimations(humanoid)
+
+                        -- A respawn replaces the old Humanoid/character.
+                        -- Fly can keep running through the respawn, but the
+                        -- camera state saved before the death must NEVER be
+                        -- restored after the new character exists. Otherwise
+                        -- disabling Fly later sends Roblox back to the exact
+                        -- camera CFrame/subject from the death position.
+                        -- Rebind the saved subject to the new Humanoid and
+                        -- let Roblox rebuild the normal camera from it.
+                        local camera = workspace.CurrentCamera
+                        if camera then
+                            flyCameraSavedSubject = humanoid
+                            flyCameraSavedCFrame = nil
+                        end
                     end
                 end
             end)
@@ -1450,12 +2049,18 @@ screenGui.Parent = player:WaitForChild("PlayerGui")
 
 local panel = Instance.new("Frame")
 panel.Size = UDim2.fromOffset(220, 197)
-panel.Position = UDim2.new(1, -232, 0, 92)
+-- Compact the entire mini GUI without changing the shortcut.
+-- Keep the same 12px right margin after scaling.
+panel.Position = UDim2.new(1, -188, 0, 92)
 panel.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 panel.BackgroundTransparency = 0.08
 panel.BorderSizePixel = 0
 panel.Parent = screenGui
 Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
+
+local miniGuiScale = Instance.new("UIScale")
+miniGuiScale.Scale = 0.80
+miniGuiScale.Parent = panel
 
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -20, 0, 24)
