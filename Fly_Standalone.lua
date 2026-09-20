@@ -1,4 +1,4 @@
--- VGD Fly Standalone v25
+-- VGD Fly Standalone v29
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -13,9 +13,9 @@ local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local flyEnabled = false
-local flySpeed = 55
+local flySpeed = 35
 local flyMinSpeed = 1
-local flyMaxSpeed = 500
+local flyMaxSpeed = 1000
 local flyVerticalInput = 0
 local flyRenderConnection = nil
 local flySaved = nil
@@ -53,6 +53,8 @@ local flyCameraZoomDistance = 8
 local flyCameraTargetZoomDistance = 8
 local flyCameraOffset = Vector3.zero
 local flyCameraTouchStates = {}
+local flyCameraZoomTouchPositions = {}
+local flyCameraPinchLastDiameter = nil
 local flyCameraTouchDelta = Vector2.new()
 local flyCameraMouseDelta = Vector2.new()
 local flyCameraMouseLooking = false
@@ -63,8 +65,8 @@ local FLY_CAMERA_MOUSE_ROTATION_SPEED = Vector2.new(1, 0.77) * math.rad(0.5)
 local FLY_CAMERA_LOOK_SMOOTHNESS = 34
 local FLY_CAMERA_MIN_PITCH = math.rad(-89)
 local FLY_CAMERA_MAX_PITCH = math.rad(89)
-local FLY_CAMERA_ZOOM_MIN = 2
-local FLY_CAMERA_ZOOM_MAX = 24
+local FLY_CAMERA_ZOOM_MIN = 0
+local FLY_CAMERA_ZOOM_MAX = 40
 
 -- The HumanoidRootPart is around the character's torso/pivot. Aim the
 -- camera slightly below that pivot so the visible body sits a little higher
@@ -629,6 +631,8 @@ end
 
 local function flyCameraResetInput()
     table.clear(flyCameraTouchStates)
+    table.clear(flyCameraZoomTouchPositions)
+    flyCameraPinchLastDiameter = nil
     flyCameraTouchDelta = Vector2.new()
     flyCameraMouseDelta = Vector2.new()
     flyCameraMouseLooking = false
@@ -677,14 +681,17 @@ local function disconnectFlyCameraInput()
 
     table.clear(flyCameraConnections)
     flyCameraResetInput()
+    flyCameraPinchLastDiameter = nil
+    table.clear(flyCameraZoomTouchPositions)
 end
 
 local function connectFlyCameraInput()
     disconnectFlyCameraInput()
 
-    -- Match Freecam's proven mobile touch architecture:
-    -- ContextActionService owns the world touch, while render-step code
-    -- consumes the accumulated delta. The joystick and VGD GUI are excluded.
+    -- Match Freecam's proven mobile touch architecture exactly.
+    -- ContextActionService owns world touches, and the same touch table is
+    -- used to detect a two-finger pinch because the touch action consumes
+    -- the touches before UserInputService.TouchPinch can be relied on.
     local touchAction = function(_, inputState, inputObject)
         if not flyEnabled
             or inputObject.UserInputType ~= Enum.UserInputType.Touch then
@@ -698,38 +705,104 @@ local function connectFlyCameraInput()
             end
 
             flyCameraTouchStates[inputObject] = true
+            flyCameraZoomTouchPositions[inputObject] = inputObject.Position
+
+            local zoomTouchCount = 0
+            local firstZoomPosition = nil
+            local secondZoomPosition = nil
+            for _, position in pairs(flyCameraZoomTouchPositions) do
+                zoomTouchCount += 1
+                if not firstZoomPosition then
+                    firstZoomPosition = position
+                elseif not secondZoomPosition then
+                    secondZoomPosition = position
+                end
+            end
+
+            if zoomTouchCount >= 2 then
+                flyCameraPinchLastDiameter =
+                    (firstZoomPosition - secondZoomPosition).Magnitude
+            end
+
             return Enum.ContextActionResult.Sink
         end
 
         if flyCameraTouchStates[inputObject] then
             if inputState == Enum.UserInputState.Change then
-                -- Match Freecam exactly: consume this touch delta immediately.
-                -- Do not accumulate it for another input layer to process.
+                flyCameraZoomTouchPositions[inputObject] = inputObject.Position
+
+                local zoomTouchCount = 0
+                local firstZoomPosition = nil
+                local secondZoomPosition = nil
+                for _, position in pairs(flyCameraZoomTouchPositions) do
+                    zoomTouchCount += 1
+                    if not firstZoomPosition then
+                        firstZoomPosition = position
+                    elseif not secondZoomPosition then
+                        secondZoomPosition = position
+                    end
+                end
+
+                if zoomTouchCount >= 2 then
+                    local diameter =
+                        (firstZoomPosition - secondZoomPosition).Magnitude
+
+                    if flyCameraPinchLastDiameter then
+                        local pinchDelta =
+                            diameter - flyCameraPinchLastDiameter
+                        local zoomDelta = -pinchDelta * 0.04
+                        local currentZoom = flyCameraTargetZoomDistance
+                        local newZoom
+
+                        if zoomDelta > 0 then
+                            newZoom = currentZoom
+                                + zoomDelta * (1 + currentZoom * 0.5)
+                        else
+                            newZoom = (currentZoom + zoomDelta)
+                                / (1 - zoomDelta * 0.5)
+                        end
+
+                        flyCameraTargetZoomDistance = math.clamp(
+                            newZoom,
+                            FLY_CAMERA_ZOOM_MIN,
+                            FLY_CAMERA_ZOOM_MAX
+                        )
+                    end
+
+                    flyCameraPinchLastDiameter = diameter
+                    return Enum.ContextActionResult.Sink
+                end
+
                 local delta = inputObject.Delta
                 if delta.Magnitude > 0 then
                     delta = flyCameraAdjustTouchPitchSensitivity(delta)
-
                     local rotation = Vector2.new(
                         delta.X * FLY_CAMERA_TOUCH_ROTATION_SPEED.X,
                         delta.Y * FLY_CAMERA_TOUCH_ROTATION_SPEED.Y
                     )
-
-                    flyCameraTargetYaw =
-                        flyCameraTargetYaw - rotation.X
-
+                    flyCameraTargetYaw = flyCameraTargetYaw - rotation.X
                     flyCameraTargetPitch = math.clamp(
                         flyCameraTargetPitch - rotation.Y,
                         FLY_CAMERA_MIN_PITCH,
                         FLY_CAMERA_MAX_PITCH
                     )
                 end
-
                 return Enum.ContextActionResult.Sink
             end
 
             if inputState == Enum.UserInputState.End
                 or inputState == Enum.UserInputState.Cancel then
                 flyCameraTouchStates[inputObject] = nil
+                flyCameraZoomTouchPositions[inputObject] = nil
+
+                local zoomTouchCount = 0
+                for _ in pairs(flyCameraZoomTouchPositions) do
+                    zoomTouchCount += 1
+                end
+                if zoomTouchCount < 2 then
+                    flyCameraPinchLastDiameter = nil
+                end
+
                 return Enum.ContextActionResult.Sink
             end
 
@@ -747,11 +820,18 @@ local function connectFlyCameraInput()
         Enum.UserInputType.Touch
     )
 
-    -- Cleanup only; TouchEnded never drives the camera.
-    flyCameraConnections.TouchEnded =
-        UserInputService.TouchEnded:Connect(function(input)
-            flyCameraTouchStates[input] = nil
-        end)
+    flyCameraConnections.TouchEnded = UserInputService.TouchEnded:Connect(function(input)
+        flyCameraTouchStates[input] = nil
+        flyCameraZoomTouchPositions[input] = nil
+
+        local zoomTouchCount = 0
+        for _ in pairs(flyCameraZoomTouchPositions) do
+            zoomTouchCount += 1
+        end
+        if zoomTouchCount < 2 then
+            flyCameraPinchLastDiameter = nil
+        end
+    end)
 
     -- Desktop: same right-mouse drag behavior as Freecam.
     flyCameraConnections.MouseBegan =
@@ -785,6 +865,38 @@ local function connectFlyCameraInput()
                 flyCameraMouseLooking = false
             end
         end)
+
+    -- Match Freecam's desktop zoom exactly.
+    flyCameraConnections.MouseWheel = UserInputService.InputChanged:Connect(function(input)
+        if not flyEnabled then
+            return
+        end
+
+        if input.UserInputType == Enum.UserInputType.MouseWheel then
+            local wheel = input.Position.Z
+
+            if wheel ~= 0 then
+                local zoomDelta = -wheel
+                local currentZoom = flyCameraTargetZoomDistance
+                local newZoom
+
+                if zoomDelta > 0 then
+                    newZoom = currentZoom
+                        + zoomDelta * (1 + currentZoom * 0.5)
+                else
+                    newZoom = (currentZoom + zoomDelta)
+                        / (1 - zoomDelta * 0.5)
+                end
+
+                flyCameraTargetZoomDistance = math.clamp(
+                    newZoom,
+                    FLY_CAMERA_ZOOM_MIN,
+                    FLY_CAMERA_ZOOM_MAX
+                )
+            end
+        end
+    end)
+
 end
 
 local function getFlyCameraCFrame(subjectPosition)
@@ -814,6 +926,14 @@ local function updateFly(deltaTime)
     local humanoid, root = getHumanoidAndRoot()
     local cam = workspace.CurrentCamera
     if not humanoid or not root or not cam then return end
+
+    -- Apply the same smooth target->current zoom interpolation used by
+    -- Freecam. v28 updated flyCameraTargetZoomDistance correctly, but it
+    -- never copied that target into flyCameraZoomDistance, so the camera
+    -- stayed at the original distance forever.
+    local zoomAlpha = 1 - math.exp(-14 * math.max(deltaTime, 0))
+    flyCameraZoomDistance = flyCameraZoomDistance
+        + (flyCameraTargetZoomDistance - flyCameraZoomDistance) * zoomAlpha
 
     -- No Clip is authoritative while enabled. Re-assert the state every
     -- render frame so a transient Roblox physics/avatar update cannot leave
@@ -1530,10 +1650,10 @@ speedBox.FocusLost:Connect(function()
 end)
 
 stateChangedEvent.Event:Connect(function(enabled)
+    -- Changing Fly state must never change GUI visibility.
+    -- ENABLE/DISABLE only controls the Fly feature itself.
+    -- The X button is the only thing that closes the panel.
     refreshUI()
-    if enabled then
-        showMiniGui(true)
-    end
 end)
 
 refreshUI()
