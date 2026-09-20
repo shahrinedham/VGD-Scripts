@@ -17,6 +17,7 @@ StandaloneGui.DisplayOrder = 2000
 StandaloneGui.Parent = game:GetService("CoreGui")
 
 local freecamEnabled = false
+local freecamSpectating = false
 local freecamControlMode = "Hologram"
 local freecamSwapButton = nil
 local stateChangedEvent = Instance.new("BindableEvent")
@@ -925,6 +926,7 @@ end
 local function disableFreecam()
     local wasFreecamActive = freecamEnabled
 
+    freecamSpectating = false
     freecamEnabled = false
     stateChangedEvent:Fire(false)
 
@@ -1116,6 +1118,26 @@ local function toggleFreecamControlMode()
     end
 end
 
+local function setFreecamSpectating(enabled)
+    freecamSpectating = enabled == true
+
+    if not freecamEnabled then
+        freecamSpectating = false
+        return false
+    end
+
+    local camera = workspace.CurrentCamera
+    if camera and freecamSpectating then
+        -- Give Roblox's normal camera system control for spectating.
+        camera.CameraType = Enum.CameraType.Custom
+    elseif camera and not freecamSpectating then
+        -- Freecam resumes ownership on the next render step.
+        camera.CameraType = Enum.CameraType.Scriptable
+    end
+
+    return true
+end
+
 local function enableFreecam()
     disableFreecam()
 
@@ -1256,6 +1278,13 @@ local function enableFreecam()
             end
 
             if not currentCamera then
+                return
+            end
+
+            -- Spectate temporarily owns the camera while Freecam remains
+            -- enabled. Do not overwrite CameraSubject/CameraType/CFrame
+            -- while the main VGD GUI is viewing another player.
+            if freecamSpectating then
                 return
             end
 
@@ -1846,6 +1875,10 @@ end
 
 function Controller.IsEnabled()
     return freecamEnabled == true
+end
+
+function Controller.SetSpectating(enabled)
+    return setFreecamSpectating(enabled == true)
 end
 
 Controller.Changed = stateChangedEvent.Event
