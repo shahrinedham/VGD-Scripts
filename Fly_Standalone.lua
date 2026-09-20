@@ -9,6 +9,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
+local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local flyEnabled = false
@@ -22,6 +23,47 @@ local flyPosition = nil
 local flyAnimateScript = nil
 local flyAnimateScriptDisabled = false
 local flyTracks = {}
+local screenGui
+
+-- Fly-owned camera state. This mirrors the Freecam camera architecture:
+-- the Fly owns camera input, look smoothing, camera CFrame, and flight in
+-- one render loop instead of reading Roblox CameraModule output and then
+-- trying to push the real body back through it.
+local flyCameraSavedType = nil
+local flyCameraSavedSubject = nil
+local flyCameraSavedCFrame = nil
+local flyCameraSavedFOV = nil
+local flyCameraYaw = 0
+local flyCameraPitch = 0
+local flyCameraTargetYaw = 0
+local flyCameraTargetPitch = 0
+local flyCameraZoomDistance = 8
+local flyCameraTargetZoomDistance = 8
+local flyCameraOffset = Vector3.zero
+local flyCameraTouchStates = {}
+local flyCameraTouchDelta = Vector2.new()
+local flyCameraMouseDelta = Vector2.new()
+local flyCameraMouseLooking = false
+local flyCameraConnections = {}
+
+local FLY_CAMERA_TOUCH_ROTATION_SPEED = Vector2.new(0.82, 0.54) * math.rad(1)
+local FLY_CAMERA_MOUSE_ROTATION_SPEED = Vector2.new(1, 0.77) * math.rad(0.5)
+local FLY_CAMERA_LOOK_SMOOTHNESS = 34
+local FLY_CAMERA_MIN_PITCH = math.rad(-89)
+local FLY_CAMERA_MAX_PITCH = math.rad(89)
+local FLY_CAMERA_ZOOM_MIN = 2
+local FLY_CAMERA_ZOOM_MAX = 24
+
+-- The HumanoidRootPart is around the character's torso/pivot. Aim the
+-- camera slightly below that pivot so the visible body sits a little higher
+-- in the viewport instead of appearing low.
+-- Raise the camera's subject point so the camera itself sits higher
+-- relative to the HumanoidRootPart. This brings the visible character
+-- DOWN toward the normal Roblox camera framing instead of leaving it high.
+-- Preserve the normal Roblox camera's vertical relationship to the real
+-- character instead of using an arbitrary fixed Y offset.
+local flyCameraVerticalOffset = 0
+
 local stateChangedEvent = Instance.new("BindableEvent")
 
 local GUI_CONTROLLED = _G.VGD_Fly_GUIControlled == true
@@ -92,20 +134,18 @@ local function loadFlyAnimations(humanoid)
     if flyTracks.idle then flyTracks.idle:Play(0.12, 1, 1) end
 end
 
-local function updateFlyAnimations(isMoving, moveDirection, deltaTime)
+local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardInput)
     local idle = flyTracks.idle
     local move = flyTracks.move
     local backward = flyTracks.backward
     if not idle then return end
 
-    local cam = workspace.CurrentCamera
-    local flatLook = cam and Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z) or Vector3.new(0, 0, -1)
-    if flatLook.Magnitude < 0.001 then flatLook = Vector3.new(0, 0, -1) else flatLook = flatLook.Unit end
-
+    -- Use the CURRENT frame's camera-relative forward input. Reading
+    -- CurrentCamera.CFrame here would be one frame behind because Fly rebuilds
+    -- the camera later in this same render step.
     local desiredState = "Idle"
     if isMoving and moveDirection.Magnitude > 0.001 then
-        local forwardDot = moveDirection.Unit:Dot(flatLook)
-        desiredState = forwardDot < -0.15 and "Backward" or "Forward"
+        desiredState = (forwardInput or 0) < -0.15 and "Backward" or "Forward"
     end
 
     if desiredState ~= flyAnimState then
@@ -192,18 +232,254 @@ local flyFlightPreviousDesiredYaw = nil
 local flyHologramMoveBlend = 0
 local flyAnimTime = 0
 
--- Match the Freecam camera feel: keep a smoothed camera orientation
--- separate from the real body orientation. This prevents the real body
--- turning from feeding back into the camera and makes camera-direction
--- changes use the same exponential look smoothing as Freecam.
-local flyCameraYaw = nil
-local flyCameraPitch = nil
-local FLY_CAMERA_LOOK_SMOOTHNESS = 34
-local FLY_CAMERA_MIN_PITCH = math.rad(-89)
-local FLY_CAMERA_MAX_PITCH = math.rad(89)
-
 local function shortestAngleDelta(fromAngle, toAngle)
     return math.atan2(math.sin(toAngle - fromAngle), math.cos(toAngle - fromAngle))
+end
+
+local function flyCameraIsInDynamicThumbstickArea(position)
+    local playerGui = player:FindFirstChildOfClass("PlayerGui")
+    local touchGui = playerGui and playerGui:FindFirstChild("TouchGui")
+    if not touchGui or not touchGui.Enabled then
+        return false
+    end
+
+    local touchFrame = touchGui:FindFirstChild("TouchControlFrame")
+    local thumbstickFrame =
+        touchFrame and touchFrame:FindFirstChild("DynamicThumbstickFrame")
+    if not thumbstickFrame then
+        return false
+    end
+
+    local topLeft = thumbstickFrame.AbsolutePosition
+    local bottomRight = topLeft + thumbstickFrame.AbsoluteSize
+
+    return position.X >= topLeft.X
+        and position.X <= bottomRight.X
+        and position.Y >= topLeft.Y
+        and position.Y <= bottomRight.Y
+end
+
+local function flyCameraIsOverGui(position)
+    if not position then
+        return false
+    end
+
+    local ok, objects = pcall(function()
+        return GuiService:GetGuiObjectsAtPosition(position.X, position.Y)
+    end)
+
+    if not ok or not objects then
+        return false
+    end
+
+    for _, object in ipairs(objects) do
+        if object:IsDescendantOf(screenGui) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function flyCameraAdjustTouchPitchSensitivity(delta)
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return delta
+    end
+
+    local pitch = camera.CFrame:ToEulerAnglesYXZ()
+
+    if delta.Y * pitch >= 0 then
+        return delta
+    end
+
+    local minimumFraction = 0.25
+    local curveY = 1 - (2 * math.abs(pitch) / math.pi) ^ 0.75
+    local sensitivity =
+        curveY * (1 - minimumFraction) + minimumFraction
+
+    return Vector2.new(delta.X, delta.Y * sensitivity)
+end
+
+local function flyCameraResetInput()
+    table.clear(flyCameraTouchStates)
+    flyCameraTouchDelta = Vector2.new()
+    flyCameraMouseDelta = Vector2.new()
+    flyCameraMouseLooking = false
+end
+
+local function flyCameraSmoothLook(dt)
+    local alpha =
+        1 - math.exp(-FLY_CAMERA_LOOK_SMOOTHNESS * math.max(dt, 0))
+
+    flyCameraYaw =
+        flyCameraYaw + (flyCameraTargetYaw - flyCameraYaw) * alpha
+
+    flyCameraPitch =
+        flyCameraPitch + (flyCameraTargetPitch - flyCameraPitch) * alpha
+end
+
+local function flyCameraApplyLookInput()
+    local mouseDelta = flyCameraMouseDelta
+    flyCameraMouseDelta = Vector2.new()
+
+    if mouseDelta.Magnitude > 0 then
+        local rotation = Vector2.new(
+            mouseDelta.X * FLY_CAMERA_MOUSE_ROTATION_SPEED.X,
+            mouseDelta.Y * FLY_CAMERA_MOUSE_ROTATION_SPEED.Y
+        )
+
+        flyCameraTargetYaw =
+            flyCameraTargetYaw - rotation.X
+
+        flyCameraTargetPitch = math.clamp(
+            flyCameraTargetPitch - rotation.Y,
+            FLY_CAMERA_MIN_PITCH,
+            FLY_CAMERA_MAX_PITCH
+        )
+    end
+end
+
+local function disconnectFlyCameraInput()
+    ContextActionService:UnbindAction("VGD_FlyCameraTouch")
+
+    for _, connection in pairs(flyCameraConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+
+    table.clear(flyCameraConnections)
+    flyCameraResetInput()
+end
+
+local function connectFlyCameraInput()
+    disconnectFlyCameraInput()
+
+    -- Match Freecam's proven mobile touch architecture:
+    -- ContextActionService owns the world touch, while render-step code
+    -- consumes the accumulated delta. The joystick and VGD GUI are excluded.
+    local touchAction = function(_, inputState, inputObject)
+        if not flyEnabled
+            or inputObject.UserInputType ~= Enum.UserInputType.Touch then
+            return Enum.ContextActionResult.Pass
+        end
+
+        if inputState == Enum.UserInputState.Begin then
+            if flyCameraIsInDynamicThumbstickArea(inputObject.Position)
+                or flyCameraIsOverGui(inputObject.Position) then
+                return Enum.ContextActionResult.Pass
+            end
+
+            flyCameraTouchStates[inputObject] = true
+            return Enum.ContextActionResult.Sink
+        end
+
+        if flyCameraTouchStates[inputObject] then
+            if inputState == Enum.UserInputState.Change then
+                -- Match Freecam exactly: consume this touch delta immediately.
+                -- Do not accumulate it for another input layer to process.
+                local delta = inputObject.Delta
+                if delta.Magnitude > 0 then
+                    delta = flyCameraAdjustTouchPitchSensitivity(delta)
+
+                    local rotation = Vector2.new(
+                        delta.X * FLY_CAMERA_TOUCH_ROTATION_SPEED.X,
+                        delta.Y * FLY_CAMERA_TOUCH_ROTATION_SPEED.Y
+                    )
+
+                    flyCameraTargetYaw =
+                        flyCameraTargetYaw - rotation.X
+
+                    flyCameraTargetPitch = math.clamp(
+                        flyCameraTargetPitch - rotation.Y,
+                        FLY_CAMERA_MIN_PITCH,
+                        FLY_CAMERA_MAX_PITCH
+                    )
+                end
+
+                return Enum.ContextActionResult.Sink
+            end
+
+            if inputState == Enum.UserInputState.End
+                or inputState == Enum.UserInputState.Cancel then
+                flyCameraTouchStates[inputObject] = nil
+                return Enum.ContextActionResult.Sink
+            end
+
+            return Enum.ContextActionResult.Sink
+        end
+
+        return Enum.ContextActionResult.Pass
+    end
+
+    ContextActionService:BindActionAtPriority(
+        "VGD_FlyCameraTouch",
+        touchAction,
+        false,
+        Enum.ContextActionPriority.High.Value,
+        Enum.UserInputType.Touch
+    )
+
+    -- Cleanup only; TouchEnded never drives the camera.
+    flyCameraConnections.TouchEnded =
+        UserInputService.TouchEnded:Connect(function(input)
+            flyCameraTouchStates[input] = nil
+        end)
+
+    -- Desktop: same right-mouse drag behavior as Freecam.
+    flyCameraConnections.MouseBegan =
+        UserInputService.InputBegan:Connect(function(
+            input,
+            gameProcessedEvent
+        )
+            if not flyEnabled or gameProcessedEvent then
+                return
+            end
+
+            if input.UserInputType == Enum.UserInputType.MouseButton2 then
+                flyCameraMouseLooking = true
+            end
+        end)
+
+    flyCameraConnections.MouseChanged =
+        UserInputService.InputChanged:Connect(function(input)
+            if not flyEnabled or not flyCameraMouseLooking then
+                return
+            end
+
+            if input.UserInputType == Enum.UserInputType.MouseMovement then
+                flyCameraMouseDelta += input.Delta
+            end
+        end)
+
+    flyCameraConnections.MouseEnded =
+        UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton2 then
+                flyCameraMouseLooking = false
+            end
+        end)
+end
+
+local function getFlyCameraCFrame(subjectPosition)
+    local cameraLookCFrame =
+        CFrame.new(subjectPosition) *
+        CFrame.Angles(0, flyCameraYaw, 0) *
+        CFrame.Angles(flyCameraPitch, 0, 0)
+
+    local cameraLook = cameraLookCFrame.LookVector
+    local cameraUp = cameraLookCFrame.UpVector
+
+    -- The lateral/shoulder offset is intentionally zero. Preserve only the
+    -- normal camera's vertical framing, expressed along the camera's own
+    -- UpVector so rotating the camera cannot introduce a world-space offset
+    -- that makes the body drift or twitch.
+    local cameraPosition =
+        subjectPosition
+        - cameraLook * flyCameraZoomDistance
+        + cameraUp * flyCameraVerticalOffset
+
+    return CFrame.lookAt(cameraPosition, cameraPosition + cameraLook, cameraUp)
 end
 
 local function updateFly(deltaTime)
@@ -224,37 +500,20 @@ local function updateFly(deltaTime)
     -- No velocity flight, no physics smoothing, no separate body steering.
     -- ================================================================
 
-    -- ================================================================
-    -- FREECAM-MATCHED CAMERA FEEL
-    -- ================================================================
-    -- Roblox's normal camera has already processed this frame's input. Keep
-    -- that orientation as the target, then apply the exact same exponential
-    -- smoothing model used by Freecam (34). The smoothed orientation becomes
-    -- the camera direction used for flight AND the orientation shown to the
-    -- player. The body's rotation therefore cannot instantly jerk the view.
-    local targetPitch, targetYaw = cam.CFrame:ToEulerAnglesYXZ()
-    targetPitch = math.clamp(targetPitch, FLY_CAMERA_MIN_PITCH, FLY_CAMERA_MAX_PITCH)
+    -- The Fly now owns the camera exactly like Freecam. Look input has
+    -- already been consumed/smoothed for this render frame, so movement is
+    -- derived from Fly's own camera orientation instead of Roblox CameraModule.
+    flyCameraApplyLookInput()
+    flyCameraSmoothLook(dt)
 
-    if flyCameraYaw == nil or flyCameraPitch == nil then
-        flyCameraYaw = targetYaw
-        flyCameraPitch = targetPitch
-    else
-        local yawDelta = shortestAngleDelta(flyCameraYaw, targetYaw)
-        local lookAlpha = 1 - math.exp(-FLY_CAMERA_LOOK_SMOOTHNESS * dt)
-        flyCameraYaw = flyCameraYaw + yawDelta * lookAlpha
-        flyCameraPitch = flyCameraPitch
-            + (targetPitch - flyCameraPitch) * lookAlpha
-    end
-
-    local smoothedCameraCFrame =
-        CFrame.new(cam.CFrame.Position)
-        * CFrame.Angles(0, flyCameraYaw, 0)
-        * CFrame.Angles(flyCameraPitch, 0, 0)
-
+    local cameraLookCFrame =
+        CFrame.new(flyPosition) *
+        CFrame.Angles(0, flyCameraYaw, 0) *
+        CFrame.Angles(flyCameraPitch, 0, 0)
+    local cameraLook = cameraLookCFrame.LookVector
+    local cameraRight = cameraLookCFrame.RightVector
     local moveDirection = humanoid.MoveDirection
     local horizontalMove = Vector3.new(moveDirection.X, 0, moveDirection.Z)
-    local cameraLook = smoothedCameraCFrame.LookVector
-    local cameraRight = smoothedCameraCFrame.RightVector
 
     local horizontalLook = Vector3.new(cameraLook.X, 0, cameraLook.Z)
     local horizontalRight = Vector3.new(cameraRight.X, 0, cameraRight.Z)
@@ -312,13 +571,9 @@ local function updateFly(deltaTime)
     -- ================================================================
     -- EXACT HOLOGRAM HEADING / TURN BANK
     -- ================================================================
-    local desiredFlightYaw = flyBodyYaw or 0
-    -- Freecam v150 has Shift Lock ON by default, so the hologram's desired
-    -- heading is the Freecam camera yaw. For the real body, the camera's flat
-    -- look is the equivalent heading.
-    if isMoving then
-        desiredFlightYaw = math.atan2(-horizontalLook.X, -horizontalLook.Z)
-    end
+    -- Match Freecam's default Shift Lock ON behavior exactly: the hologram
+    -- faces the camera yaw, whether moving or idle.
+    local desiredFlightYaw = flyCameraYaw
 
     local yawDelta = shortestAngleDelta(flyBodyYaw or 0, desiredFlightYaw)
     local yawDuration = 0.06
@@ -365,7 +620,7 @@ local function updateFly(deltaTime)
     local b = rawMoveBlend * rawMoveBlend * (3 - 2 * rawMoveBlend)
 
     -- Same animation state test/crossfade as the hologram.
-    updateFlyAnimations(isMoving, moveVector, dt)
+    updateFlyAnimations(isMoving, moveVector, dt, forwardInput)
 
     local forwardTarget = 0
     local rightTarget = 0
@@ -470,30 +725,18 @@ local function updateFly(deltaTime)
             -flyLeanRoll - flightBankBlend + hoverRoll
         )
 
-    -- The ONLY output difference from the hologram version:
-    -- PivotTo(animatedCFrame) -> real HumanoidRootPart.CFrame.
-    --
-    -- Fly runs AFTER Roblox's CameraModule, so `cam.CFrame` above contains
-    -- the camera direction from the current frame. Move the camera by the
-    -- exact body displacement after committing the new root CFrame. This
-    -- removes the one-frame camera/body separation that made turning the
-    -- camera feel delayed or made the body appear not to follow the new
-    -- direction immediately. The camera's orientation is untouched.
-    local previousRootPosition = root.Position
+    -- Same output as the hologram, except the real HumanoidRootPart is the
+    -- subject. There is no camera-follow delta and no Roblox CameraModule
+    -- feedback here: Fly owns both the camera and the body in this render pass.
     root.CFrame = animatedCFrame
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
 
-    -- Keep the camera's smoothed orientation independent from the body's new
-    -- rotation, then translate it by exactly the same body displacement.
-    local bodyDelta = root.Position - previousRootPosition
-    local cameraPosition = cam.CFrame.Position + bodyDelta
-    local finalCameraCFrame =
-        CFrame.new(cameraPosition)
-        * CFrame.Angles(0, flyCameraYaw, 0)
-        * CFrame.Angles(flyCameraPitch, 0, 0)
-    cam.CFrame = finalCameraCFrame
-    cam.Focus = CFrame.new(cam.Focus.Position + bodyDelta)
+    -- Aim above the HumanoidRootPart so the camera is raised relative to
+    -- the body. The body itself is never moved for framing.
+    cam.CFrame = getFlyCameraCFrame(flyPosition)
+    cam.FieldOfView = flyCameraSavedFOV or cam.FieldOfView
+    cam.Focus = CFrame.new(flyPosition)
 end
 
 local function verticalAction(_, inputState, inputObject)
@@ -531,15 +774,66 @@ local function enableFly()
     flyFlightPreviousDesiredYaw = flyBodyYaw
     flyHologramMoveBlend = 0
     flyAnimTime = 0
-    flyCameraYaw = nil
-    flyCameraPitch = nil
     humanoid.PlatformStand = true
     humanoid.AutoRotate = false
-    root.Anchored = true
+    root.Anchored = false
     currentMoveVector = Vector3.zero
+
+    -- Take ownership of the camera, using the same starting viewpoint model
+    -- as Freecam. The camera is then reconstructed from yaw/pitch every render
+    -- frame, so body rotation can never feed back into camera rotation.
+    flyCameraSavedType = workspace.CurrentCamera.CameraType
+    flyCameraSavedSubject = workspace.CurrentCamera.CameraSubject
+    flyCameraSavedCFrame = workspace.CurrentCamera.CFrame
+    flyCameraSavedFOV = workspace.CurrentCamera.FieldOfView
+
+    local startCamera = workspace.CurrentCamera
+    local startLook = startCamera.CFrame.LookVector
+    local startPosition = startCamera.CFrame.Position
+
+    -- Match the actual normal Roblox camera relationship used by Freecam:
+    -- project the camera position onto the look axis from the character, then
+    -- preserve the normal camera's vertical component only. We deliberately
+    -- discard lateral/shoulder offset so the real body remains centered.
+    local startDistanceAlongLook =
+        (startPosition - root.Position):Dot(-startLook)
+
+    if startDistanceAlongLook <= 0.01 then
+        startDistanceAlongLook =
+            (startPosition - root.Position).Magnitude
+    end
+
+    flyCameraZoomDistance = math.clamp(
+        startDistanceAlongLook,
+        FLY_CAMERA_ZOOM_MIN,
+        FLY_CAMERA_ZOOM_MAX
+    )
+    flyCameraTargetZoomDistance = flyCameraZoomDistance
+
+    local normalCameraLinePosition =
+        root.Position - startLook * startDistanceAlongLook
+    local normalCameraOffset =
+        startPosition - normalCameraLinePosition
+
+    -- Keep only the vertical component of the normal camera offset. Express it
+    -- in the starting camera's UpVector so it can rotate naturally with the
+    -- camera without creating lateral drift.
+    flyCameraVerticalOffset =
+        normalCameraOffset:Dot(startCamera.CFrame.UpVector)
+
+    flyCameraOffset = Vector3.zero
+    flyCameraPitch, flyCameraYaw = startCamera.CFrame:ToOrientation()
+    flyCameraTargetPitch = flyCameraPitch
+    flyCameraTargetYaw = flyCameraYaw
+    flyBodyYaw = flyCameraYaw
+    flyFlightPreviousDesiredYaw = flyCameraYaw
+    flyCameraResetInput()
+
     flyPosition = root.Position
     loadFlyAnimations(humanoid)
     bindVerticalControls()
+    connectFlyCameraInput()
+    -- Fly owns the camera while enabled, just like Freecam.\n    startCamera.CameraType = Enum.CameraType.Scriptable
 
     if flyRenderConnection then
         RunService:UnbindFromRenderStep("VGD_FlySmooth")
@@ -569,6 +863,23 @@ local function disableFly()
         RunService:UnbindFromRenderStep("VGD_FlySmooth")
         flyRenderConnection = nil
     end
+    disconnectFlyCameraInput()
+
+    local camera = workspace.CurrentCamera
+    if camera then
+        camera.CameraType = flyCameraSavedType or Enum.CameraType.Custom
+        camera.CameraSubject = flyCameraSavedSubject
+        if flyCameraSavedCFrame then
+            camera.CFrame = flyCameraSavedCFrame
+        end
+        if flyCameraSavedFOV then
+            camera.FieldOfView = flyCameraSavedFOV
+        end
+    end
+    flyCameraSavedType = nil
+    flyCameraSavedSubject = nil
+    flyCameraSavedCFrame = nil
+    flyCameraSavedFOV = nil
     restoreCharacterState()
     stateChangedEvent:Fire(false)
     return false
@@ -587,13 +898,11 @@ player.CharacterAdded:Connect(function(character)
                         saveCharacterState(humanoid, root)
                         humanoid.PlatformStand = true
                         humanoid.AutoRotate = false
-                        root.Anchored = true
+                        root.Anchored = false
                         currentMoveVector = Vector3.zero
                         flyPosition = root.Position
                         flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
                         flyFlightPreviousDesiredYaw = flyBodyYaw
-                        flyCameraYaw = nil
-                        flyCameraPitch = nil
                         loadFlyAnimations(humanoid)
                     end
                 end
@@ -606,7 +915,7 @@ end)
 -- MINI GUI
 -- =========================================================
 
-local screenGui = Instance.new("ScreenGui")
+screenGui = Instance.new("ScreenGui")
 screenGui.Name = "VGD_Fly_Standalone"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
