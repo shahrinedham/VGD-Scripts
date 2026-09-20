@@ -1118,26 +1118,6 @@ local function toggleFreecamControlMode()
     end
 end
 
-local function setFreecamSpectating(enabled)
-    freecamSpectating = enabled == true
-
-    if not freecamEnabled then
-        freecamSpectating = false
-        return false
-    end
-
-    local camera = workspace.CurrentCamera
-    if camera and freecamSpectating then
-        -- Give Roblox's normal camera system control for spectating.
-        camera.CameraType = Enum.CameraType.Custom
-    elseif camera and not freecamSpectating then
-        -- Freecam resumes ownership on the next render step.
-        camera.CameraType = Enum.CameraType.Scriptable
-    end
-
-    return true
-end
-
 local function enableFreecam()
     disableFreecam()
 
@@ -1260,6 +1240,12 @@ local function enableFreecam()
                 return
             end
 
+            -- Spectate temporarily hands camera ownership back to Roblox.
+            -- Keep Freecam enabled, but do not overwrite CameraType/CFrame.
+            if freecamSpectating then
+                return
+            end
+
             local currentCharacter = player.Character
             local currentRoot = currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
             local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
@@ -1278,13 +1264,6 @@ local function enableFreecam()
             end
 
             if not currentCamera then
-                return
-            end
-
-            -- Spectate temporarily owns the camera while Freecam remains
-            -- enabled. Do not overwrite CameraSubject/CameraType/CFrame
-            -- while the main VGD GUI is viewing another player.
-            if freecamSpectating then
                 return
             end
 
@@ -1432,7 +1411,7 @@ local function enableFreecam()
     contextActionService:UnbindAction(freecamTouchActionName)
 
     local freecamTouchAction = function(actionName, inputState, inputObject)
-        if not freecamEnabled then
+        if not freecamEnabled or freecamSpectating then
             return Enum.ContextActionResult.Pass
         end
 
@@ -1877,8 +1856,23 @@ function Controller.IsEnabled()
     return freecamEnabled == true
 end
 
+-- Temporarily release camera ownership to the main VGD GUI's Spectate system.
+-- This does NOT disable Freecam or destroy the hologram/body state.
 function Controller.SetSpectating(enabled)
-    return setFreecamSpectating(enabled == true)
+    freecamSpectating = (enabled == true) and (freecamEnabled == true)
+
+    if freecamSpectating then
+        local camera = workspace.CurrentCamera
+        if camera then
+            camera.CameraType = Enum.CameraType.Custom
+        end
+    end
+
+    return freecamSpectating
+end
+
+function Controller.IsSpectating()
+    return freecamSpectating == true
 end
 
 Controller.Changed = stateChangedEvent.Event
