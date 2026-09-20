@@ -1659,26 +1659,34 @@ end)
 refreshUI()
 
 local Controller = {}
-function Controller.Enable()
-    -- VGD's main Fly toggle is only the feature/UI switch.
-    -- It must NOT activate flight itself. Enabling from VGD only makes the
-    -- related Fly shortcut available; the actual flight is started by the
-    -- ENABLE button inside the Fly mini GUI.
+function Controller.EnableUI()
+    -- VGD Self-page Toggle ON: expose the Fly feature without starting flight.
     screenGui.Enabled = true
     panel.Visible = false
     shortcut.Visible = true
     refreshUI()
     return true
 end
-function Controller.Disable()
-    -- VGD's main Fly toggle OFF disables actual flight (if it was active)
-    -- and removes the entire Fly UI. Shortcut + mini GUI are one feature.
+function Controller.DisableUI()
+    -- VGD Self-page Toggle OFF: stop flight if necessary and remove the whole
+    -- Fly UI (shortcut + mini GUI).
     disableFly()
     refreshUI()
     panel.Visible = false
     shortcut.Visible = false
     screenGui.Enabled = false
     return true
+end
+-- Keep Enable/Disable for the standalone mini GUI/API: these control actual flight.
+function Controller.Enable()
+    local ok = enableFly() == true
+    showMiniGui(true)
+    return ok
+end
+function Controller.Disable()
+    local result = disableFly()
+    refreshUI()
+    return result == false
 end
 function Controller.IsEnabled() return flyEnabled == true end
 function Controller.SetSpeed(value)
