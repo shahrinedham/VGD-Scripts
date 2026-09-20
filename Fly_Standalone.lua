@@ -33,6 +33,7 @@ local flightPitchBlend = 0
 local flightBankBlend = 0
 local speedBlend = 0
 local previousDesiredYaw = nil
+local currentMoveVector = Vector3.zero
 local hoverBlend = 0
 local flyAnimState = "Idle"
 
@@ -137,6 +138,7 @@ local function saveCharacterState(humanoid, root)
         root = root,
         platformStand = humanoid.PlatformStand,
         autoRotate = humanoid.AutoRotate,
+        anchored = root.Anchored,
         rootVelocity = root.AssemblyLinearVelocity,
         rootAngularVelocity = root.AssemblyAngularVelocity,
     }
@@ -156,9 +158,11 @@ local function restoreCharacterState()
         humanoid.AutoRotate = saved and saved.autoRotate or true
     end
     if root then
+        root.Anchored = saved and saved.anchored or false
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
     end
+    currentMoveVector = Vector3.zero
 end
 
 local function updateFly(deltaTime)
@@ -167,65 +171,169 @@ local function updateFly(deltaTime)
     local cam = workspace.CurrentCamera
     if not humanoid or not root or not cam then return end
 
-    local move = humanoid.MoveDirection
-    local moveMagnitude = math.clamp(move.Magnitude, 0, 1)
-    local horizontal = Vector3.new(move.X, 0, move.Z)
-    if horizontal.Magnitude > 1 then horizontal = horizontal.Unit end
+    -- Match Freecam's movement model instead of fighting Roblox physics.
+    -- The real body is anchored while flying, then moved directly by CFrame.
+    -- This removes the tiny physics corrections that made full-body flight
+    -- feel heavier/jitterier than the hologram.
+    local moveInput = humanoid.MoveDirection
+    local horizontalMove = Vector3.new(moveInput.X, 0, moveInput.Z)
 
-    local cameraPitch = moveMagnitude > 0.05 and cam.CFrame.LookVector.Y * moveMagnitude or 0
-    local vertical = math.clamp(cameraPitch + flyVerticalInput, -1, 1)
-    local desiredVelocity = horizontal * flySpeed + Vector3.new(0, vertical * flySpeed, 0)
-    root.AssemblyLinearVelocity = desiredVelocity
-    root.AssemblyAngularVelocity = Vector3.zero
+    local cameraLook = cam.CFrame.LookVector
+    local cameraRight = cam.CFrame.RightVector
+    local horizontalLook = Vector3.new(cameraLook.X, 0, cameraLook.Z)
+    local horizontalRight = Vector3.new(cameraRight.X, 0, cameraRight.Z)
 
-    local flatLook = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
-    if flatLook.Magnitude < 0.001 then flatLook = Vector3.new(0, 0, -1) else flatLook = flatLook.Unit end
+    if horizontalLook.Magnitude > 0.001 then
+        horizontalLook = horizontalLook.Unit
+    else
+        horizontalLook = Vector3.new(0, 0, -1)
+    end
 
-    local isMoving = desiredVelocity.Magnitude > 1.5
-    local travelHorizontal = Vector3.new(desiredVelocity.X, 0, desiredVelocity.Z)
+    if horizontalRight.Magnitude > 0.001 then
+        horizontalRight = horizontalRight.Unit
+    else
+        horizontalRight = Vector3.new(1, 0, 0)
+    end
+
+    local forwardInput = math.clamp(horizontalMove:Dot(horizontalLook), -1, 1)
+    local rightInput = math.clamp(horizontalMove:Dot(horizontalRight), -1, 1)
+
+    -- This is intentionally the same directional construction used by the
+    -- Freecam hologram. Looking up/down naturally adds a vertical component.
+    local moveVector = (cameraLook * forwardInput) + (horizontalRight * rightInput)
+    if moveVector.Magnitude > 1 then
+        moveVector = moveVector.Unit
+    end
+
+    -- Preserve the Fly-specific Space/C vertical controls on top of camera
+    -- pitch. They affect the travel vector rather than applying a physics force.
+    local horizontalMoveMagnitude = Vector3.new(moveVector.X, 0, moveVector.Z).Magnitude
+    local cameraVertical = forwardInput * cameraLook.Y
+    local vertical = math.clamp(cameraVertical + flyVerticalInput, -1, 1)
+    moveVector = Vector3.new(moveVector.X, vertical, moveVector.Z)
+    if moveVector.Magnitude > 1 then
+        moveVector = moveVector.Unit
+    end
+
+    local isMoving = moveVector.Magnitude > 0.001
+
+    -- Very light directional smoothing keeps the real character from looking
+    -- mechanically snapped while still preserving Freecam's responsive input.
+    local moveAlpha = 1 - math.exp(-deltaTime / 0.055)
+    currentMoveVector = currentMoveVector:Lerp(moveVector, moveAlpha)
+    if not isMoving and currentMoveVector.Magnitude < 0.01 then
+        currentMoveVector = Vector3.zero
+    end
+
+    local travel = currentMoveVector
+    local travelMagnitude = travel.Magnitude
+    local travelHorizontal = Vector3.new(travel.X, 0, travel.Z)
     local travelHorizontalMagnitude = travelHorizontal.Magnitude
 
+    -- Move the anchored real body exactly like Freecam moves its hologram.
+    if travelMagnitude > 0.001 then
+        root.CFrame = root.CFrame + travel.Unit * flySpeed * deltaTime
+    end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+
+    local flatLook = horizontalLook
+
+    -- Direction/heading smoothing copied from Freecam.
     local desiredYaw = math.atan2(flatLook.X, -flatLook.Z)
-    if travelHorizontalMagnitude > 0.5 then
+    if travelHorizontalMagnitude > 0.001 then
         desiredYaw = math.atan2(travelHorizontal.X, -travelHorizontal.Z)
     end
 
-    local yawDuration = isMoving and 0.14 or 0.06
-    local yawAlpha = 1 - math.exp(-deltaTime / yawDuration)
     local currentYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
     local yawDelta = math.atan2(math.sin(desiredYaw - currentYaw), math.cos(desiredYaw - currentYaw))
-    local turnRate = yawDelta / math.max(deltaTime, 1 / 240)
-    local targetBank = isMoving and math.clamp(-turnRate * 0.11, math.rad(-18), math.rad(18)) or 0
-    flightBankBlend += (targetBank - flightBankBlend) * (1 - math.exp(-deltaTime / (isMoving and 0.10 or 0.24)))
+    local yawDuration = isMoving and 0.14 or 0.06
+    local yawAlpha = 1 - math.exp(-deltaTime / yawDuration)
+    local smoothedYaw = currentYaw + yawDelta * yawAlpha
 
+    -- Turning bank uses the change in desired heading, exactly like Freecam.
+    local previousYaw = previousDesiredYaw
+    local desiredYawDelta = previousYaw and math.atan2(
+        math.sin(desiredYaw - previousYaw),
+        math.cos(desiredYaw - previousYaw)
+    ) or 0
+    previousDesiredYaw = desiredYaw
+
+    local turnRate = desiredYawDelta / math.max(deltaTime, 1 / 240)
+    local targetBank = isMoving and math.clamp(-turnRate * 0.11, math.rad(-18), math.rad(18)) or 0
+    local bankDuration = isMoving and 0.10 or 0.24
+    flightBankBlend += (targetBank - flightBankBlend) * (1 - math.exp(-deltaTime / bankDuration))
+
+    -- Travel-direction pitch, matching the hologram's ±75° flight pitch.
     local targetPitch = 0
-    if isMoving and desiredVelocity.Magnitude > 0.001 then
-        targetPitch = math.atan2(desiredVelocity.Y, math.max(travelHorizontalMagnitude, 0.01))
+    if isMoving and travelMagnitude > 0.001 then
+        targetPitch = math.atan2(travel.Y, math.max(travelHorizontalMagnitude, 0.01))
         targetPitch = math.clamp(targetPitch, math.rad(-75), math.rad(75))
     end
-    flightPitchBlend += (targetPitch - flightPitchBlend) * (1 - math.exp(-deltaTime / (isMoving and 0.10 or 0.22)))
+    flightPitchBlend += (targetPitch - flightPitchBlend)
+        * (1 - math.exp(-deltaTime / (isMoving and 0.10 or 0.22)))
 
-    local moveDirForPose = desiredVelocity.Magnitude > 0.001 and desiredVelocity.Unit or Vector3.zero
-    updateFlyAnimations(isMoving, moveDirForPose, deltaTime)
+    -- Animation state is based on actual travel direction, not the raw input.
+    updateFlyAnimations(isMoving, travel, deltaTime)
 
-    local b = math.clamp(moveMagnitude, 0, 1)
-    local flyLeanPitch = math.rad(16) * forwardBlend * b
-    local flyLeanRoll = math.rad(14) * rightBlend * b
-    local horizontalRatio = travelHorizontalMagnitude / math.max(desiredVelocity.Magnitude, 0.001)
-    local speedPosePitch = math.rad(10) * speedBlend * horizontalRatio * b
+    -- Directional pose blending copied from Freecam. The old Fly version never
+    -- updated forwardBlend/rightBlend, so the body could not lean with travel.
+    local forwardTarget = 0
+    local rightTarget = 0
+    if isMoving and travelMagnitude > 0.001 then
+        local moveUnit = travel.Unit
+        forwardTarget = math.clamp(moveUnit:Dot(flatLook), -1, 1)
+        local flatRight = flatLook:Cross(Vector3.new(0, 1, 0))
+        if flatRight.Magnitude > 0.001 then
+            rightTarget = math.clamp(moveUnit:Dot(flatRight.Unit), -1, 1)
+        end
+    end
 
+    local directionDuration = isMoving and 0.08 or 0.48
+    local directionAlpha = 1 - math.exp(-deltaTime / directionDuration)
+    forwardBlend += (forwardTarget - forwardBlend) * directionAlpha
+    rightBlend += (rightTarget - rightBlend) * directionAlpha
+
+    local poseBlend = math.clamp(travelMagnitude, 0, 1)
+    local flyLeanPitch = math.rad(16) * forwardBlend * poseBlend
+    local flyLeanRoll = math.rad(14) * rightBlend * poseBlend
+
+    local verticalTravelRatio = travelMagnitude > 0.001
+        and math.clamp(math.abs(travel.Unit.Y), 0, 1)
+        or 0
+    local horizontalSpeedPose = 1 - verticalTravelRatio
+    local speedTarget = isMoving and math.clamp(travelMagnitude, 0, 1) or 0
+    speedBlend += (speedTarget - speedBlend)
+        * (1 - math.exp(-deltaTime / (isMoving and 0.16 or 0.30)))
+    local speedPosePitch = math.rad(10) * speedBlend * horizontalSpeedPose * poseBlend
+
+    -- Hover motion and smooth idle transition match the Freecam hologram.
     local hoverTarget = isMoving and 0 or 1
-    hoverBlend += (hoverTarget - hoverBlend) * (1 - math.exp(-deltaTime / (hoverTarget > 0.5 and 0.20 or 0.16)))
+    hoverBlend += (hoverTarget - hoverBlend)
+        * (1 - math.exp(-deltaTime / (hoverTarget > 0.5 and 0.20 or 0.16)))
     local t = os.clock()
     local hoverBob = math.sin(t * 1.55) * 0.10 * hoverBlend
     local hoverRoll = math.sin(t * 1.10 + 0.7) * math.rad(1.2) * hoverBlend
     local hoverYaw = math.sin(t * 0.82 + 1.4) * math.rad(0.8) * hoverBlend
 
-    -- Keep the body facing travel direction while adding the same style of
-    -- pitch, directional lean and turning bank used by Freecam's hologram.
-    local baseLook = travelHorizontalMagnitude > 0.5 and travelHorizontal.Unit or flatLook
+    -- Always build the pose from a clean positional/yaw frame. Never multiply
+    -- the previous animated CFrame, which would accumulate rotation errors.
+    local baseLook = travelHorizontalMagnitude > 0.001
+        and travelHorizontal.Unit
+        or flatLook
     local baseCFrame = CFrame.lookAt(root.Position, root.Position + baseLook, Vector3.yAxis)
-    local animatedCFrame = baseCFrame
+    local yawOnly = CFrame.new(root.Position) * CFrame.Angles(0, smoothedYaw, 0)
+    local animatedCFrame = yawOnly
+        * CFrame.new(0, hoverBob, 0)
+        * CFrame.Angles(
+            flightPitchBlend - flyLeanPitch - speedPosePitch,
+            hoverYaw,
+            -flyLeanRoll - flightBankBlend + hoverRoll
+        )
+
+    -- Keep the clean base orientation's position while using the smoothed yaw.
+    -- This is the same separation Freecam uses between movement and pose.
+    animatedCFrame = CFrame.new(root.Position) * CFrame.Angles(0, smoothedYaw, 0)
         * CFrame.new(0, hoverBob, 0)
         * CFrame.Angles(
             flightPitchBlend - flyLeanPitch - speedPosePitch,
@@ -269,6 +377,8 @@ local function enableFly()
     forwardBlend, rightBlend, flightPitchBlend, flightBankBlend, speedBlend, hoverBlend = 0, 0, 0, 0, 0, 0
     humanoid.PlatformStand = true
     humanoid.AutoRotate = false
+    root.Anchored = true
+    currentMoveVector = Vector3.zero
     loadFlyAnimations(humanoid)
     bindVerticalControls()
 
@@ -301,6 +411,8 @@ player.CharacterAdded:Connect(function(character)
                         saveCharacterState(humanoid, root)
                         humanoid.PlatformStand = true
                         humanoid.AutoRotate = false
+                        root.Anchored = true
+                        currentMoveVector = Vector3.zero
                         loadFlyAnimations(humanoid)
                     end
                 end
