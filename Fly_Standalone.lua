@@ -435,9 +435,23 @@ local function updateFly(deltaTime)
 
     -- The ONLY output difference from the hologram version:
     -- PivotTo(animatedCFrame) -> real HumanoidRootPart.CFrame.
+    --
+    -- Fly runs AFTER Roblox's CameraModule, so `cam.CFrame` above contains
+    -- the camera direction from the current frame. Move the camera by the
+    -- exact body displacement after committing the new root CFrame. This
+    -- removes the one-frame camera/body separation that made turning the
+    -- camera feel delayed or made the body appear not to follow the new
+    -- direction immediately. The camera's orientation is untouched.
+    local previousRootPosition = root.Position
     root.CFrame = animatedCFrame
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
+
+    local bodyDelta = root.Position - previousRootPosition
+    if bodyDelta.Magnitude > 0.000001 then
+        cam.CFrame = cam.CFrame + bodyDelta
+        cam.Focus = cam.Focus + bodyDelta
+    end
 end
 
 local function verticalAction(_, inputState, inputObject)
@@ -488,12 +502,14 @@ local function enableFly()
         flyRenderConnection = nil
     end
 
-    -- Run immediately before Roblox's camera update. The hologram's camera and
-    -- flight pose are calculated in one render pass; the real body needs its
-    -- CFrame committed before the default CameraModule samples the character.
+    -- Run immediately AFTER Roblox's CameraModule. This is the critical
+    -- difference from v3: the flight controller now reads the freshly updated
+    -- camera direction in the same render frame, exactly like Freecam's own
+    -- Camera.Value + 1 render pass. We then translate the camera by the body's
+    -- exact displacement so there is no visible one-frame follow lag.
     RunService:BindToRenderStep(
         "VGD_FlySmooth",
-        Enum.RenderPriority.Camera.Value - 1,
+        Enum.RenderPriority.Camera.Value + 1,
         updateFly
     )
     flyRenderConnection = true
