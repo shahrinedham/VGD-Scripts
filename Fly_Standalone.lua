@@ -1,4 +1,4 @@
--- VGD Fly Standalone v2
+-- VGD Fly Standalone v25
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -24,6 +24,18 @@ local flyAnimateScript = nil
 local flyAnimateScriptDisabled = false
 local flyTracks = {}
 local screenGui
+local flyShiftLockButton
+local flyShiftLockOn = true
+local flyNoClipOn = true
+local flySavedCanCollide = {}
+local flyNoClipDescendantConnection = nil
+local flyCollisionProxy = nil
+local flyCollisionProxyParts = {}
+local flyCollisionDebugOn = false
+local flyCollisionDebugFolder = nil
+local flyCollisionDebugParts = {}
+local updateFlyCollisionDebug
+local flyGravityForce = nil
 
 -- Fly-owned camera state. This mirrors the Freecam camera architecture:
 -- the Fly owns camera input, look smoothing, camera CFrame, and flight in
@@ -172,6 +184,320 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
     end
     if backward and backward.IsPlaying then
         backward:AdjustSpeed(math.clamp(0.80 + speedBlend * 0.60, 0.80, 1.4))
+    end
+end
+
+local function destroyFlyCollisionDebugShapes()
+    for _, debugPart in ipairs(flyCollisionDebugParts) do
+        pcall(function()
+            debugPart:Destroy()
+        end)
+    end
+    table.clear(flyCollisionDebugParts)
+
+    if flyCollisionDebugFolder then
+        pcall(function()
+            flyCollisionDebugFolder:Destroy()
+        end)
+        flyCollisionDebugFolder = nil
+    end
+end
+
+local function destroyFlyCollisionProxy()
+    destroyFlyCollisionDebugShapes()
+
+    if flyGravityForce then
+        pcall(function()
+            flyGravityForce:Destroy()
+        end)
+        flyGravityForce = nil
+    end
+
+    for _, proxyPart in ipairs(flyCollisionProxyParts) do
+        pcall(function()
+            proxyPart:Destroy()
+        end)
+    end
+    table.clear(flyCollisionProxyParts)
+
+    if flyCollisionProxy then
+        pcall(function()
+            flyCollisionProxy:Destroy()
+        end)
+        flyCollisionProxy = nil
+    end
+end
+
+local function isBodyCollisionPart(instance)
+    if not instance:IsA("BasePart") then
+        return false
+    end
+
+    if instance.Name == "VGD_FlyCollisionProxy"
+        or instance.Name == "VGD_FlyCollisionProxyWeld" then
+        return false
+    end
+
+    -- Match the avatar's actual body geometry, not accessories/tools.
+    -- This covers both R6 and R15 body parts, including custom body-part
+    -- packages represented by BaseParts/MeshParts.
+    local ancestor = instance.Parent
+    while ancestor and ancestor ~= getCharacter() do
+        if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
+            return false
+        end
+        ancestor = ancestor.Parent
+    end
+
+    return ancestor == getCharacter()
+end
+
+local function createFlyCollisionProxy()
+    destroyFlyCollisionProxy()
+
+    local character = getCharacter()
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not character or not root then
+        return nil
+    end
+
+    -- Create one invisible physical clone for EVERY body BasePart.
+    -- Unlike the previous single bounding box, each proxy preserves the
+    -- source part's exact geometry, size, orientation, MeshPart mesh and
+    -- collision fidelity. Each proxy is welded directly to its source part,
+    -- so the complete collision assembly follows animations and avatar scale.
+    local proxyFolder = Instance.new("Folder")
+    proxyFolder.Name = "VGD_FlyCollisionProxy"
+    proxyFolder.Parent = character
+    flyCollisionProxy = proxyFolder
+
+    local sourceParts = {}
+    for _, instance in ipairs(character:GetDescendants()) do
+        if isBodyCollisionPart(instance) then
+            table.insert(sourceParts, instance)
+        end
+    end
+
+    for _, sourcePart in ipairs(sourceParts) do
+        local ok, proxyPart = pcall(function()
+            return sourcePart:Clone()
+        end)
+
+        if ok and proxyPart and proxyPart:IsA("BasePart") then
+            -- Keep the physical geometry from the source part. Remove scripts,
+            -- attachments, decals and other non-geometry children so the proxy
+            -- remains lightweight while retaining Part/MeshPart collision data.
+            for _, child in ipairs(proxyPart:GetChildren()) do
+                child:Destroy()
+            end
+
+            proxyPart.Name = "VGD_FlyCollision_" .. sourcePart.Name
+            proxyPart.Transparency = 1
+            proxyPart.CanCollide = not flyNoClipOn
+            proxyPart.CanTouch = false
+            proxyPart.CanQuery = false
+            proxyPart.CastShadow = false
+            proxyPart.Massless = true
+            proxyPart.Anchored = false
+            proxyPart.CFrame = sourcePart.CFrame
+            proxyPart.Parent = proxyFolder
+
+            pcall(function()
+                proxyPart.CollisionGroup = sourcePart.CollisionGroup
+            end)
+
+            local weld = Instance.new("WeldConstraint")
+            weld.Name = "VGD_FlyCollisionWeld"
+            weld.Part0 = sourcePart
+            weld.Part1 = proxyPart
+            weld.Parent = proxyPart
+
+            table.insert(flyCollisionProxyParts, proxyPart)
+        end
+    end
+
+    updateFlyCollisionDebug()
+
+    -- Counteract gravity with a real force instead of repeatedly teleporting
+    -- the root or relying on a tiny per-frame velocity correction. This keeps
+    -- the flight height stable in BOTH No Clip states while still allowing
+    -- camera-driven vertical flight and controlled descent.
+    local attachment = Instance.new("Attachment")
+    attachment.Name = "VGD_FlyGravityAttachment"
+    attachment.Parent = root
+
+    local vectorForce = Instance.new("VectorForce")
+    vectorForce.Name = "VGD_FlyGravityForce"
+    vectorForce.Attachment0 = attachment
+    vectorForce.RelativeTo = Enum.ActuatorRelativeTo.World
+    vectorForce.ApplyAtCenterOfMass = true
+    vectorForce.Force = Vector3.new(0, root.AssemblyMass * workspace.Gravity, 0)
+    vectorForce.Parent = root
+    flyGravityForce = vectorForce
+
+    return proxyFolder
+end
+
+local function createFlyCollisionDebugShape(proxyPart)
+    if not proxyPart or not proxyPart.Parent then
+        return nil
+    end
+
+    if not flyCollisionDebugFolder then
+        flyCollisionDebugFolder = Instance.new("Folder")
+        flyCollisionDebugFolder.Name = "VGD_FlyCollisionShapeDebug"
+        flyCollisionDebugFolder.Parent = getCharacter() or proxyPart.Parent
+    end
+
+    local debugPart
+    local isApproximation = false
+
+    -- Show the collision primitive, NOT the avatar's rendered body geometry.
+    -- Primitive Parts can be represented directly. MeshParts/other complex
+    -- BaseParts do not expose Roblox's internal collision hull, so use their
+    -- conservative bounding-box representation instead of displaying the mesh.
+    if proxyPart:IsA("Part") then
+        debugPart = Instance.new("Part")
+        debugPart.Shape = proxyPart.Shape
+        debugPart.Size = proxyPart.Size
+    elseif proxyPart:IsA("WedgePart") then
+        debugPart = Instance.new("WedgePart")
+        debugPart.Size = proxyPart.Size
+    elseif proxyPart:IsA("CornerWedgePart") then
+        debugPart = Instance.new("CornerWedgePart")
+        debugPart.Size = proxyPart.Size
+    else
+        debugPart = Instance.new("Part")
+        debugPart.Shape = Enum.PartType.Block
+        debugPart.Size = proxyPart.Size
+        isApproximation = true
+    end
+
+    debugPart.Name = "VGD_CollisionShape_" .. proxyPart.Name
+    debugPart.CFrame = proxyPart.CFrame
+    debugPart.Anchored = false
+    debugPart.CanCollide = false
+    debugPart.CanTouch = false
+    debugPart.CanQuery = false
+    debugPart.Massless = true
+    debugPart.CastShadow = false
+    debugPart.Material = Enum.Material.Neon
+    debugPart.Color = isApproximation
+        and Color3.fromRGB(255, 170, 0)
+        or Color3.fromRGB(0, 200, 255)
+    debugPart.Transparency = 1
+    debugPart.Parent = flyCollisionDebugFolder
+
+    local weld = Instance.new("WeldConstraint")
+    weld.Name = "VGD_CollisionShapeDebugWeld"
+    weld.Part0 = proxyPart
+    weld.Part1 = debugPart
+    weld.Parent = debugPart
+
+    table.insert(flyCollisionDebugParts, debugPart)
+    return debugPart
+end
+
+updateFlyCollisionDebug = function()
+    if not flyCollisionDebugOn then
+        for _, debugPart in ipairs(flyCollisionDebugParts) do
+            if debugPart and debugPart.Parent then
+                debugPart.Transparency = 1
+            end
+        end
+        return
+    end
+
+    -- Rebuild only the visualization. The actual collision proxies remain
+    -- completely untouched, so enabling this debug mode cannot alter physics.
+    destroyFlyCollisionDebugShapes()
+
+    if not flyCollisionProxy then
+        return
+    end
+
+    for _, proxyPart in ipairs(flyCollisionProxyParts) do
+        if proxyPart and proxyPart.Parent then
+            local debugPart = createFlyCollisionDebugShape(proxyPart)
+            if debugPart then
+                debugPart.Transparency = 0.55
+            end
+        end
+    end
+end
+
+local function disconnectFlyNoClipWatcher()
+    if flyNoClipDescendantConnection then
+        flyNoClipDescendantConnection:Disconnect()
+        flyNoClipDescendantConnection = nil
+    end
+end
+
+local function enforceFlyNoClip()
+    if not flyNoClipOn then
+        return
+    end
+
+    local character = getCharacter()
+    if character then
+        for _, instance in ipairs(character:GetDescendants()) do
+            if instance:IsA("BasePart") and not instance:IsDescendantOf(flyCollisionProxy) then
+                if instance.CanCollide then
+                    instance.CanCollide = false
+                end
+            end
+        end
+    end
+
+    for _, proxyPart in ipairs(flyCollisionProxyParts) do
+        if proxyPart and proxyPart.Parent and proxyPart.CanCollide then
+            proxyPart.CanCollide = false
+        end
+    end
+end
+
+local function setFlyNoClip(enabled)
+    local character = getCharacter()
+    if not character then return end
+
+    disconnectFlyNoClipWatcher()
+
+    if enabled then
+        table.clear(flySavedCanCollide)
+        for _, instance in ipairs(character:GetDescendants()) do
+            if instance:IsA("BasePart") and not instance:IsDescendantOf(flyCollisionProxy) then
+                flySavedCanCollide[instance] = instance.CanCollide
+                instance.CanCollide = false
+            end
+        end
+
+        -- Roblox can create/replace character parts after Fly is already active
+        -- (avatar loading, package parts, accessories, tools, etc.). If that
+        -- happens, immediately apply No Clip to the new part and remember its
+        -- original collision state so disabling No Clip can restore it.
+        flyNoClipDescendantConnection = character.DescendantAdded:Connect(function(instance)
+            if not flyNoClipOn then
+                return
+            end
+
+            if instance:IsA("BasePart") and not instance:IsDescendantOf(flyCollisionProxy) then
+                flySavedCanCollide[instance] = instance.CanCollide
+                instance.CanCollide = false
+            end
+        end)
+    else
+        for part, canCollide in pairs(flySavedCanCollide) do
+            if part and part.Parent then
+                part.CanCollide = canCollide
+            end
+        end
+        table.clear(flySavedCanCollide)
+    end
+
+    for _, proxyPart in ipairs(flyCollisionProxyParts) do
+        if proxyPart and proxyPart.Parent then
+            proxyPart.CanCollide = not enabled
+        end
     end
 end
 
@@ -489,6 +815,12 @@ local function updateFly(deltaTime)
     local cam = workspace.CurrentCamera
     if not humanoid or not root or not cam then return end
 
+    -- No Clip is authoritative while enabled. Re-assert the state every
+    -- render frame so a transient Roblox physics/avatar update cannot leave
+    -- one body part or collision proxy collidable for a frame. The actual
+    -- v21 physics collision system is untouched when No Clip is OFF.
+    enforceFlyNoClip()
+
     local dt = math.max(deltaTime or 0, 0)
     if not flyPosition then
         flyPosition = root.Position
@@ -554,31 +886,86 @@ local function updateFly(deltaTime)
     local isMoving = moveVector.Magnitude > 0.05
 
     -- ================================================================
-    -- EXACT HOLOGRAM POSITION MODEL
+    -- PHYSICS-DRIVEN POSITION / REAL COLLISION
     -- ================================================================
-    flyPosition = flyPosition + moveVector * flySpeed * dt
+    -- No Clip OFF uses the exact v21 individual body-part collision proxies
+    -- and real assembly velocity. The physics solver owns translation here.
+    --
+    -- No Clip ON is intentionally different: it becomes a TRUE ghost mode.
+    -- We do not let the physics solver translate the character at all. The
+    -- desired position is advanced directly and the body is re-applied from
+    -- that position later in this render step. This prevents a touching
+    -- object OR another player's character from getting one physics frame to
+    -- push the Fly before the CanCollide state catches up.
+    if flyNoClipOn then
+        if flyGravityForce and flyGravityForce.Parent then
+            flyGravityForce.Force = Vector3.zero
+        end
+
+        flyPosition = flyPosition + moveVector * flySpeed * dt
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    else
+        if flyGravityForce and flyGravityForce.Parent then
+            flyGravityForce.Force = Vector3.new(
+                0,
+                root.AssemblyMass * workspace.Gravity,
+                0
+            )
+        end
+
+        root.AssemblyLinearVelocity = moveVector * flySpeed
+
+        -- The physics solver owns the position in No Clip OFF mode.
+        flyPosition = root.Position
+    end
 
     -- ================================================================
     -- EXACT HOLOGRAM BASE CFRAME
     -- ================================================================
-    local flatLook = horizontalLook
-    local baseCFrame = CFrame.lookAt(
-        flyPosition,
-        flyPosition + flatLook,
-        Vector3.new(0, 1, 0)
-    )
-
     -- ================================================================
     -- EXACT HOLOGRAM HEADING / TURN BANK
     -- ================================================================
-    -- Match Freecam's default Shift Lock ON behavior exactly: the hologram
-    -- faces the camera yaw, whether moving or idle.
-    local desiredFlightYaw = flyCameraYaw
+    -- Shift Lock ON  = body follows camera yaw.
+    -- Shift Lock OFF = body follows the horizontal movement direction.
+    --
+    -- IMPORTANT: build the actual body base CFrame from flyBodyYaw. The old
+    -- v11 code built it directly from camera look, so the body continued to
+    -- face the camera even after the button was switched OFF.
+    -- Match Freecam exactly:
+    -- Shift Lock ON  -> body follows the camera yaw.
+    -- Shift Lock OFF -> camera yaw is completely ignored unless the player
+    -- is actually moving; while stationary, keep the current body heading.
+    local desiredFlightYaw = flyBodyYaw or 0
+    if flyShiftLockOn then
+        desiredFlightYaw = flyCameraYaw
+    elseif horizontalMove.Magnitude > 0.001 and isMoving then
+        local movementUnit = horizontalMove.Unit
+        desiredFlightYaw = math.atan2(-movementUnit.X, -movementUnit.Z)
+    end
 
     local yawDelta = shortestAngleDelta(flyBodyYaw or 0, desiredFlightYaw)
-    local yawDuration = 0.06
+    local yawDuration = (isMoving and not flyShiftLockOn) and 0.14 or 0.06
     local yawAlpha = 1 - math.exp(-dt / yawDuration)
     flyBodyYaw = (flyBodyYaw or 0) + yawDelta * yawAlpha
+
+    -- Now that flyBodyYaw has been smoothed, use it as the character's actual
+    -- horizontal facing. Camera yaw remains independent from body yaw when
+    -- Shift Lock is OFF.
+    local bodyLook = Vector3.new(
+        -math.sin(flyBodyYaw),
+        0,
+        -math.cos(flyBodyYaw)
+    )
+    local baseCFrame = CFrame.lookAt(
+        flyPosition,
+        flyPosition + bodyLook,
+        Vector3.new(0, 1, 0)
+    )
+
+    -- Pose/lean directions still use the CAMERA's horizontal look, exactly
+    -- like Freecam. Only the body's YAW is decoupled when Shift Lock is off.
+    local flatLook = horizontalLook
 
     local previousDesiredYaw = flyFlightPreviousDesiredYaw
     local desiredYawDelta = previousDesiredYaw
@@ -725,11 +1112,16 @@ local function updateFly(deltaTime)
             -flyLeanRoll - flightBankBlend + hoverRoll
         )
 
-    -- Same output as the hologram, except the real HumanoidRootPart is the
-    -- subject. There is no camera-follow delta and no Roblox CameraModule
-    -- feedback here: Fly owns both the camera and the body in this render pass.
-    root.CFrame = animatedCFrame
-    root.AssemblyLinearVelocity = Vector3.zero
+    -- No Clip ON owns the position directly so the character cannot be
+    -- physically pushed back by another player or an object. No Clip OFF keeps
+    -- the v21 physics-resolved position completely untouched.
+    if flyNoClipOn then
+        root.CFrame = CFrame.new(flyPosition) * animatedCFrame.Rotation
+        root.AssemblyLinearVelocity = Vector3.zero
+    else
+        root.CFrame = CFrame.new(root.Position) * animatedCFrame.Rotation
+        flyPosition = root.Position
+    end
     root.AssemblyAngularVelocity = Vector3.zero
 
     -- Aim above the HumanoidRootPart so the camera is raised relative to
@@ -761,6 +1153,8 @@ local function unbindVerticalControls()
     flyVerticalInput = 0
 end
 
+local updateFlyShiftLockButton
+
 local function enableFly()
     if flyEnabled then return true end
     local humanoid, root = getHumanoidAndRoot()
@@ -768,6 +1162,10 @@ local function enableFly()
 
     saveCharacterState(humanoid, root)
     flyEnabled = true
+    flyShiftLockOn = true
+    flyNoClipOn = true
+    updateFlyShiftLockButton()
+    setFlyNoClip(true)
     flyVerticalInput = 0
     forwardBlend, rightBlend, flightPitchBlend, flightBankBlend, speedBlend, hoverBlend = 0, 0, 0, 0, 0, 0
     flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
@@ -777,6 +1175,7 @@ local function enableFly()
     humanoid.PlatformStand = true
     humanoid.AutoRotate = false
     root.Anchored = false
+    createFlyCollisionProxy()
     currentMoveVector = Vector3.zero
 
     -- Take ownership of the camera, using the same starting viewpoint model
@@ -858,12 +1257,14 @@ end
 local function disableFly()
     if not flyEnabled then return false end
     flyEnabled = false
+    updateFlyShiftLockButton()
     unbindVerticalControls()
     if flyRenderConnection then
         RunService:UnbindFromRenderStep("VGD_FlySmooth")
         flyRenderConnection = nil
     end
     disconnectFlyCameraInput()
+    disconnectFlyNoClipWatcher()
 
     local camera = workspace.CurrentCamera
     if camera then
@@ -880,6 +1281,8 @@ local function disableFly()
     flyCameraSavedSubject = nil
     flyCameraSavedCFrame = nil
     flyCameraSavedFOV = nil
+    setFlyNoClip(false)
+    destroyFlyCollisionProxy()
     restoreCharacterState()
     stateChangedEvent:Fire(false)
     return false
@@ -896,6 +1299,8 @@ player.CharacterAdded:Connect(function(character)
                     if humanoid and root then
                         flySaved = nil
                         saveCharacterState(humanoid, root)
+                        createFlyCollisionProxy()
+                        setFlyNoClip(flyNoClipOn)
                         humanoid.PlatformStand = true
                         humanoid.AutoRotate = false
                         root.Anchored = false
@@ -924,7 +1329,7 @@ screenGui.Enabled = not GUI_CONTROLLED
 screenGui.Parent = player:WaitForChild("PlayerGui")
 
 local panel = Instance.new("Frame")
-panel.Size = UDim2.fromOffset(220, 128)
+panel.Size = UDim2.fromOffset(220, 197)
 panel.Position = UDim2.new(1, -232, 0, 92)
 panel.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 panel.BackgroundTransparency = 0.08
@@ -990,9 +1395,31 @@ toggle.TextSize = 11
 toggle.Parent = panel
 Instance.new("UICorner", toggle).CornerRadius = UDim.new(0, 8)
 
+local noClipToggle = Instance.new("TextButton")
+noClipToggle.Size = UDim2.fromOffset(200, 30)
+noClipToggle.Position = UDim2.fromOffset(10, 91)
+noClipToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+noClipToggle.BorderSizePixel = 0
+noClipToggle.TextColor3 = Color3.new(1, 1, 1)
+noClipToggle.Font = Enum.Font.GothamBold
+noClipToggle.TextSize = 11
+noClipToggle.Parent = panel
+Instance.new("UICorner", noClipToggle).CornerRadius = UDim.new(0, 8)
+
+local collisionDebugToggle = Instance.new("TextButton")
+collisionDebugToggle.Size = UDim2.fromOffset(200, 30)
+collisionDebugToggle.Position = UDim2.fromOffset(10, 126)
+collisionDebugToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+collisionDebugToggle.BorderSizePixel = 0
+collisionDebugToggle.TextColor3 = Color3.new(1, 1, 1)
+collisionDebugToggle.Font = Enum.Font.GothamBold
+collisionDebugToggle.TextSize = 11
+collisionDebugToggle.Parent = panel
+Instance.new("UICorner", collisionDebugToggle).CornerRadius = UDim.new(0, 8)
+
 local hint = Instance.new("TextLabel")
 hint.Size = UDim2.new(1, -20, 0, 28)
-hint.Position = UDim2.fromOffset(10, 91)
+hint.Position = UDim2.fromOffset(10, 163)
 hint.BackgroundTransparency = 1
 hint.Text = "Move + look to climb/dive   •   Space/Ctrl optional"
 hint.TextColor3 = Color3.fromRGB(145, 145, 145)
@@ -1016,10 +1443,45 @@ shortcut.Visible = false
 shortcut.Parent = screenGui
 Instance.new("UICorner", shortcut).CornerRadius = UDim.new(0, 10)
 
+-- Freecam-style Shift Lock button.
+-- EXACT FreeCam_Standalone.lua dimensions/placement:
+--   Size = 30x30
+--   AnchorPoint = (0, 0.5)
+--   Position = (0, 18, 0.5, 0)
+--   ZIndex = 2001
+flyShiftLockButton = Instance.new("ImageButton")
+flyShiftLockButton.Name = "VGD_FlyShiftLock"
+flyShiftLockButton.Size = UDim2.fromOffset(30,30)
+flyShiftLockButton.AnchorPoint = Vector2.new(0,0.5)
+flyShiftLockButton.Position = UDim2.new(0,18,0.5,0)
+flyShiftLockButton.BackgroundTransparency = 1
+flyShiftLockButton.BorderSizePixel = 0
+flyShiftLockButton.AutoButtonColor = false
+flyShiftLockButton.ScaleType = Enum.ScaleType.Fit
+flyShiftLockButton.Visible = false
+flyShiftLockButton.ZIndex = 2001
+flyShiftLockButton.Parent = screenGui
+
+updateFlyShiftLockButton = function()
+    if not flyShiftLockButton then return end
+    flyShiftLockButton.Visible = flyEnabled
+    flyShiftLockButton.Image = flyShiftLockOn
+        and "rbxasset://textures/ui/mouseLock_on@2x.png"
+        or "rbxasset://textures/ui/mouseLock_off@2x.png"
+end
+
+flyShiftLockButton.Activated:Connect(function()
+    if not flyEnabled then return end
+    flyShiftLockOn = not flyShiftLockOn
+    updateFlyShiftLockButton()
+end)
+
 local function refreshUI()
     status.Text = flyEnabled and ("ON  •  Speed " .. tostring(math.floor(flySpeed + 0.5))) or "OFF"
     toggle.Text = flyEnabled and "DISABLE" or "ENABLE"
     shortcut.Text = flyEnabled and "✈  ON" or "✈  FLY"
+    noClipToggle.Text = "NO CLIP  •  " .. (flyNoClipOn and "ON" or "OFF")
+    collisionDebugToggle.Text = "COLLISION SHAPE  •  " .. (flyCollisionDebugOn and "ON" or "OFF")
 end
 
 local function showMiniGui(show)
@@ -1044,6 +1506,20 @@ end)
 shortcut.Activated:Connect(function()
     panel.Visible = true
     shortcut.Visible = false
+end)
+
+noClipToggle.Activated:Connect(function()
+    if not flyEnabled then return end
+    flyNoClipOn = not flyNoClipOn
+    setFlyNoClip(flyNoClipOn)
+    refreshUI()
+end)
+
+collisionDebugToggle.Activated:Connect(function()
+    if not flyEnabled then return end
+    flyCollisionDebugOn = not flyCollisionDebugOn
+    updateFlyCollisionDebug()
+    refreshUI()
 end)
 
 speedBox.FocusLost:Connect(function()
