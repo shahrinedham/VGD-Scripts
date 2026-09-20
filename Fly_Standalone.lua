@@ -165,18 +165,32 @@ local function restoreCharacterState()
     currentMoveVector = Vector3.zero
 end
 
+local flyBodyYaw = 0
+local flyFlightPreviousDesiredYaw = nil
+local flyHologramMoveBlend = 0
+local flyAnimTime = 0
+
+local function shortestAngleDelta(fromAngle, toAngle)
+    return math.atan2(math.sin(toAngle - fromAngle), math.cos(toAngle - fromAngle))
+end
+
 local function updateFly(deltaTime)
     if not flyEnabled then return end
+
     local humanoid, root = getHumanoidAndRoot()
     local cam = workspace.CurrentCamera
     if not humanoid or not root or not cam then return end
 
-    -- Match Freecam's movement model instead of fighting Roblox physics.
-    -- The real body is anchored while flying, then moved directly by CFrame.
-    -- This removes the tiny physics corrections that made full-body flight
-    -- feel heavier/jitterier than the hologram.
-    local moveInput = humanoid.MoveDirection
-    local horizontalMove = Vector3.new(moveInput.X, 0, moveInput.Z)
+    -- ================================================================
+    -- REAL-BODY VERSION OF THE FREECAM HOLOGRAM MOVEMENT
+    --
+    -- Do not use AssemblyLinearVelocity for flight. The hologram is moved
+    -- directly by position every frame, so the real body must use the same
+    -- movement model. The only difference is that the target CFrame is
+    -- applied to the player's actual HumanoidRootPart instead of a clone.
+    -- ================================================================
+
+    local moveDirection = humanoid.MoveDirection
 
     local cameraLook = cam.CFrame.LookVector
     local cameraRight = cam.CFrame.RightVector
@@ -195,152 +209,213 @@ local function updateFly(deltaTime)
         horizontalRight = Vector3.new(1, 0, 0)
     end
 
+    -- EXACT SAME MOVEMENT VECTOR CONSTRUCTION AS FREECAM.
+    local horizontalMove = Vector3.new(moveDirection.X, 0, moveDirection.Z)
     local forwardInput = math.clamp(horizontalMove:Dot(horizontalLook), -1, 1)
     local rightInput = math.clamp(horizontalMove:Dot(horizontalRight), -1, 1)
 
-    -- This is intentionally the same directional construction used by the
-    -- Freecam hologram. Looking up/down naturally adds a vertical component.
-    local moveVector = (cameraLook * forwardInput) + (horizontalRight * rightInput)
+    local moveVector =
+        (cameraLook * forwardInput) +
+        (horizontalRight * rightInput)
+
     if moveVector.Magnitude > 1 then
         moveVector = moveVector.Unit
     end
 
-    -- Preserve the Fly-specific Space/C vertical controls on top of camera
-    -- pitch. They affect the travel vector rather than applying a physics force.
-    local horizontalMoveMagnitude = Vector3.new(moveVector.X, 0, moveVector.Z).Magnitude
-    local cameraVertical = forwardInput * cameraLook.Y
-    local vertical = math.clamp(cameraVertical + flyVerticalInput, -1, 1)
-    moveVector = Vector3.new(moveVector.X, vertical, moveVector.Z)
-    if moveVector.Magnitude > 1 then
-        moveVector = moveVector.Unit
+    -- Keep Fly's Space/C vertical control, but otherwise leave the Freecam
+    -- movement vector untouched.
+    if math.abs(flyVerticalInput) > 0.001 then
+        moveVector = moveVector + Vector3.new(0, flyVerticalInput, 0)
+        if moveVector.Magnitude > 1 then
+            moveVector = moveVector.Unit
+        end
     end
 
-    local isMoving = moveVector.Magnitude > 0.001
+    local isMoving = moveVector.Magnitude > 0.05
+    local delta = math.max(deltaTime, 0)
 
-    -- Very light directional smoothing keeps the real character from looking
-    -- mechanically snapped while still preserving Freecam's responsive input.
-    local moveAlpha = 1 - math.exp(-deltaTime / 0.055)
-    currentMoveVector = currentMoveVector:Lerp(moveVector, moveAlpha)
-    if not isMoving and currentMoveVector.Magnitude < 0.01 then
-        currentMoveVector = Vector3.zero
+    -- ================================================================
+    -- EXACT FREECAM-STYLE POSITIONING
+    -- ================================================================
+    -- Freecam does:
+    --     freecamPosition += moveVector * FREECAM_SPEED * dt
+    --
+    -- Do the same to the real root. No physics velocity. No movement lerp.
+    -- ================================================================
+    if moveVector.Magnitude > 0.001 then
+        root.CFrame = root.CFrame + moveVector * flySpeed * delta
     end
 
-    local travel = currentMoveVector
-    local travelMagnitude = travel.Magnitude
-    local travelHorizontal = Vector3.new(travel.X, 0, travel.Z)
-    local travelHorizontalMagnitude = travelHorizontal.Magnitude
-
-    -- Move the anchored real body exactly like Freecam moves its hologram.
-    if travelMagnitude > 0.001 then
-        root.CFrame = root.CFrame + travel.Unit * flySpeed * deltaTime
-    end
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
 
-    local flatLook = horizontalLook
+    -- ================================================================
+    -- EXACT FREECAM FLIGHT HEADING / BANKING MODEL
+    -- ================================================================
+    local desiredFlightYaw = flyBodyYaw
 
-    -- Direction/heading smoothing copied from Freecam.
-    local desiredYaw = math.atan2(flatLook.X, -flatLook.Z)
-    if travelHorizontalMagnitude > 0.001 then
-        desiredYaw = math.atan2(travelHorizontal.X, -travelHorizontal.Z)
+    -- Freecam's normal default is Shift Lock ON: the hologram faces the
+    -- camera. Keep that behavior for the real body.
+    desiredFlightYaw = math.atan2(-horizontalLook.X, -horizontalLook.Z)
+
+    if not isMoving then
+        desiredFlightYaw = flyBodyYaw
     end
 
-    local currentYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
-    local yawDelta = math.atan2(math.sin(desiredYaw - currentYaw), math.cos(desiredYaw - currentYaw))
+    local yawDelta = shortestAngleDelta(flyBodyYaw, desiredFlightYaw)
     local yawDuration = isMoving and 0.14 or 0.06
-    local yawAlpha = 1 - math.exp(-deltaTime / yawDuration)
-    local smoothedYaw = currentYaw + yawDelta * yawAlpha
+    local yawAlpha = 1 - math.exp(-delta / yawDuration)
+    flyBodyYaw = flyBodyYaw + yawDelta * yawAlpha
 
-    -- Turning bank uses the change in desired heading, exactly like Freecam.
-    local previousYaw = previousDesiredYaw
-    local desiredYawDelta = previousYaw and math.atan2(
-        math.sin(desiredYaw - previousYaw),
-        math.cos(desiredYaw - previousYaw)
-    ) or 0
-    previousDesiredYaw = desiredYaw
+    local previousDesiredYaw = flyFlightPreviousDesiredYaw
+    local desiredYawDelta = previousDesiredYaw
+        and shortestAngleDelta(previousDesiredYaw, desiredFlightYaw)
+        or 0
+    flyFlightPreviousDesiredYaw = desiredFlightYaw
 
-    local turnRate = desiredYawDelta / math.max(deltaTime, 1 / 240)
-    local targetBank = isMoving and math.clamp(-turnRate * 0.11, math.rad(-18), math.rad(18)) or 0
-    local bankDuration = isMoving and 0.10 or 0.24
-    flightBankBlend += (targetBank - flightBankBlend) * (1 - math.exp(-deltaTime / bankDuration))
-
-    -- Travel-direction pitch, matching the hologram's ±75° flight pitch.
-    local targetPitch = 0
-    if isMoving and travelMagnitude > 0.001 then
-        targetPitch = math.atan2(travel.Y, math.max(travelHorizontalMagnitude, 0.01))
-        targetPitch = math.clamp(targetPitch, math.rad(-75), math.rad(75))
+    local turnRate = desiredYawDelta / math.max(delta, 1 / 240)
+    local targetBank = 0
+    if isMoving and math.abs(turnRate) > 0.001 then
+        targetBank = math.clamp(-turnRate * 0.11, math.rad(-18), math.rad(18))
     end
-    flightPitchBlend += (targetPitch - flightPitchBlend)
-        * (1 - math.exp(-deltaTime / (isMoving and 0.10 or 0.22)))
 
-    -- Animation state is based on actual travel direction, not the raw input.
-    updateFlyAnimations(isMoving, travel, deltaTime)
+    local bankDuration = isMoving and 0.10 or 0.24
+    flightBankBlend = flightBankBlend
+        + (targetBank - flightBankBlend)
+        * (1 - math.exp(-delta / bankDuration))
 
-    -- Directional pose blending copied from Freecam. The old Fly version never
-    -- updated forwardBlend/rightBlend, so the body could not lean with travel.
+    -- ================================================================
+    -- EXACT FREECAM POSE BLENDING
+    -- ================================================================
+    flyAnimTime = flyAnimTime + delta
+
+    local targetMove = isMoving and 1 or 0
+    local transitionDuration = targetMove > flyHologramMoveBlend and 0.18 or 0.30
+    local transitionDirection = targetMove > flyHologramMoveBlend and 1 or -1
+
+    if math.abs(targetMove - flyHologramMoveBlend) > 0.0001 then
+        flyHologramMoveBlend = flyHologramMoveBlend
+            + transitionDirection * (delta / transitionDuration)
+    end
+    flyHologramMoveBlend = math.clamp(flyHologramMoveBlend, 0, 1)
+
+    -- This is the exact Smoothstep used by the hologram.
+    local rawMoveBlend = flyHologramMoveBlend
+    local b = rawMoveBlend * rawMoveBlend * (3 - 2 * rawMoveBlend)
+
+    -- Animation state uses the exact hologram direction test.
+    updateFlyAnimations(isMoving, moveVector, delta)
+
+    -- Keep the last direction while the flying pose eases out.
     local forwardTarget = 0
     local rightTarget = 0
-    if isMoving and travelMagnitude > 0.001 then
-        local moveUnit = travel.Unit
-        forwardTarget = math.clamp(moveUnit:Dot(flatLook), -1, 1)
-        local flatRight = flatLook:Cross(Vector3.new(0, 1, 0))
+
+    if moveVector.Magnitude > 0.001 and isMoving then
+        local moveUnit = moveVector.Unit
+        forwardTarget = math.clamp(moveUnit:Dot(horizontalLook), -1, 1)
+
+        local flatRight = horizontalLook:Cross(Vector3.new(0, 1, 0))
         if flatRight.Magnitude > 0.001 then
-            rightTarget = math.clamp(moveUnit:Dot(flatRight.Unit), -1, 1)
+            flatRight = flatRight.Unit
+            rightTarget = math.clamp(moveUnit:Dot(flatRight), -1, 1)
         end
     end
 
     local directionDuration = isMoving and 0.08 or 0.48
-    local directionAlpha = 1 - math.exp(-deltaTime / directionDuration)
-    forwardBlend += (forwardTarget - forwardBlend) * directionAlpha
-    rightBlend += (rightTarget - rightBlend) * directionAlpha
+    local directionAlpha = 1 - math.exp(-delta / directionDuration)
 
-    local poseBlend = math.clamp(travelMagnitude, 0, 1)
-    local flyLeanPitch = math.rad(16) * forwardBlend * poseBlend
-    local flyLeanRoll = math.rad(14) * rightBlend * poseBlend
+    forwardBlend = forwardBlend
+        + (forwardTarget - forwardBlend) * directionAlpha
+    rightBlend = rightBlend
+        + (rightTarget - rightBlend) * directionAlpha
 
-    local verticalTravelRatio = travelMagnitude > 0.001
-        and math.clamp(math.abs(travel.Unit.Y), 0, 1)
-        or 0
+    local movementForward = forwardBlend
+    local movementRight = rightBlend
+
+    local flyLeanPitch = math.rad(16) * movementForward * b
+    local flyLeanRoll = math.rad(14) * movementRight * b
+
+    -- Exact hologram speed-pose calculation.
+    local verticalTravelRatio = 0
+    if moveVector.Magnitude > 0.001 then
+        verticalTravelRatio = math.clamp(math.abs(moveVector.Unit.Y), 0, 1)
+    end
     local horizontalSpeedPose = 1 - verticalTravelRatio
-    local speedTarget = isMoving and math.clamp(travelMagnitude, 0, 1) or 0
-    speedBlend += (speedTarget - speedBlend)
-        * (1 - math.exp(-deltaTime / (isMoving and 0.16 or 0.30)))
-    local speedPosePitch = math.rad(10) * speedBlend * horizontalSpeedPose * poseBlend
 
-    -- Hover motion and smooth idle transition match the Freecam hologram.
-    local hoverTarget = isMoving and 0 or 1
-    hoverBlend += (hoverTarget - hoverBlend)
-        * (1 - math.exp(-deltaTime / (hoverTarget > 0.5 and 0.20 or 0.16)))
-    local t = os.clock()
+    local speedTarget = isMoving
+        and math.clamp(moveVector.Magnitude, 0, 1)
+        or 0
+    speedBlend = speedBlend
+        + (speedTarget - speedBlend)
+        * (1 - math.exp(-delta / (isMoving and 0.16 or 0.30)))
+
+    local speedPosePitch = math.rad(10)
+        * speedBlend
+        * horizontalSpeedPose
+        * b
+
+    -- Exact hologram flight pitch.
+    local travelHorizontalMagnitude = Vector3.new(
+        moveVector.X,
+        0,
+        moveVector.Z
+    ).Magnitude
+
+    local flightPitchTarget = 0
+    if isMoving then
+        if travelHorizontalMagnitude > 0.001 then
+            flightPitchTarget = math.atan2(
+                moveVector.Y,
+                travelHorizontalMagnitude
+            )
+        elseif math.abs(moveVector.Y) > 0.001 then
+            flightPitchTarget = moveVector.Y > 0
+                and math.rad(90)
+                or math.rad(-90)
+        end
+    end
+
+    flightPitchTarget = math.clamp(
+        flightPitchTarget,
+        math.rad(-75),
+        math.rad(75)
+    )
+
+    local flightPitchDuration = isMoving and 0.10 or 0.22
+    flightPitchBlend = flightPitchBlend
+        + (flightPitchTarget - flightPitchBlend)
+        * (1 - math.exp(-delta / flightPitchDuration))
+
+    local flightPitch = flightPitchBlend * b
+
+    -- Exact hologram hover behavior.
+    local hoverTarget = (not isMoving) and 1 or 0
+    hoverBlend = hoverBlend
+        + (hoverTarget - hoverBlend)
+        * (1 - math.exp(
+            -delta / ((hoverTarget > 0.5) and 0.20 or 0.16)
+        ))
+
+    local t = flyAnimTime
     local hoverBob = math.sin(t * 1.55) * 0.10 * hoverBlend
-    local hoverRoll = math.sin(t * 1.10 + 0.7) * math.rad(1.2) * hoverBlend
-    local hoverYaw = math.sin(t * 0.82 + 1.4) * math.rad(0.8) * hoverBlend
+    local hoverRoll = math.sin(t * 1.10 + 0.7)
+        * math.rad(1.2) * hoverBlend
+    local hoverYaw = math.sin(t * 0.82 + 1.4)
+        * math.rad(0.8) * hoverBlend
 
-    -- Always build the pose from a clean positional/yaw frame. Never multiply
-    -- the previous animated CFrame, which would accumulate rotation errors.
-    local baseLook = travelHorizontalMagnitude > 0.001
-        and travelHorizontal.Unit
-        or flatLook
-    local baseCFrame = CFrame.lookAt(root.Position, root.Position + baseLook, Vector3.yAxis)
-    local yawOnly = CFrame.new(root.Position) * CFrame.Angles(0, smoothedYaw, 0)
-    local animatedCFrame = yawOnly
-        * CFrame.new(0, hoverBob, 0)
-        * CFrame.Angles(
-            flightPitchBlend - flyLeanPitch - speedPosePitch,
+    -- EXACT same final pose equation as the hologram.
+    local animatedCFrame =
+        CFrame.new(root.Position) *
+        CFrame.Angles(0, flyBodyYaw, 0) *
+        CFrame.new(0, hoverBob, 0) *
+        CFrame.Angles(
+            flightPitch - flyLeanPitch - speedPosePitch,
             hoverYaw,
             -flyLeanRoll - flightBankBlend + hoverRoll
         )
 
-    -- Keep the clean base orientation's position while using the smoothed yaw.
-    -- This is the same separation Freecam uses between movement and pose.
-    animatedCFrame = CFrame.new(root.Position) * CFrame.Angles(0, smoothedYaw, 0)
-        * CFrame.new(0, hoverBob, 0)
-        * CFrame.Angles(
-            flightPitchBlend - flyLeanPitch - speedPosePitch,
-            hoverYaw,
-            -flyLeanRoll - flightBankBlend + hoverRoll
-        )
-
+    -- The one intentional difference: PivotTo(hologram) becomes CFrame(real
+    -- body). Everything above is the hologram flight algorithm itself.
     root.CFrame = animatedCFrame
 end
 
@@ -375,6 +450,10 @@ local function enableFly()
     flyEnabled = true
     flyVerticalInput = 0
     forwardBlend, rightBlend, flightPitchBlend, flightBankBlend, speedBlend, hoverBlend = 0, 0, 0, 0, 0, 0
+    flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
+    flyFlightPreviousDesiredYaw = flyBodyYaw
+    flyHologramMoveBlend = 0
+    flyAnimTime = 0
     humanoid.PlatformStand = true
     humanoid.AutoRotate = false
     root.Anchored = true
