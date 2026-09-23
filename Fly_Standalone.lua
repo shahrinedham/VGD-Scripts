@@ -1,4 +1,4 @@
--- VGD Fly Standalone v48
+-- VGD Fly Standalone v60
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -27,6 +27,7 @@ local screenGui
 local flyShiftLockButton
 local flyShiftLockOn = true
 local flyNoClipOn = true
+local flyCameraFeelOn = false
 local flySavedCanCollide = {}
 local flyNoClipDescendantConnection = nil
 local flyCollisionProxy = nil
@@ -59,6 +60,20 @@ local flyCameraTouchDelta = Vector2.new()
 local flyCameraMouseDelta = Vector2.new()
 local flyCameraMouseLooking = false
 local flyCameraConnections = {}
+
+-- v57 camera/flight-feel state. These are visual-only layers; they do not
+-- replace the proven v56 movement/camera ownership architecture.
+local flyCameraVelocityBlend = Vector3.zero
+local flyCameraTurnLag = 0
+local flyCameraFOVBlend = 0
+local flyCameraLastYaw = nil
+local flyCameraLastMoveVector = Vector3.zero
+
+local flyAccelerationBlend = 0
+local flyDecelerationBlend = 0
+local flyDirectionChangeBlend = 0
+local flyPreviousMoveDirection = Vector3.zero
+local flyPreviousSpeed = 0
 
 -- Read the same PlayerModule movement vector that Roblox mobile/keyboard
 -- controls use. This keeps the joystick alive when Fly switches Humanoid
@@ -333,6 +348,14 @@ end
 local FLY_CAMERA_TOUCH_ROTATION_SPEED = Vector2.new(0.82, 0.54) * math.rad(1)
 local FLY_CAMERA_MOUSE_ROTATION_SPEED = Vector2.new(1, 0.77) * math.rad(0.5)
 local FLY_CAMERA_LOOK_SMOOTHNESS = 34
+
+-- v57 subtle cinematic camera response. Kept deliberately restrained so
+-- camera control remains as responsive as v56.
+local FLY_CAMERA_MOMENTUM_SMOOTHNESS = 8
+local FLY_CAMERA_MAX_LAG = 0.22
+local FLY_CAMERA_FOV_BASE = 70
+local FLY_CAMERA_FOV_MAX_BOOST = 7
+
 local FLY_CAMERA_MIN_PITCH = math.rad(-89)
 local FLY_CAMERA_MAX_PITCH = math.rad(89)
 local FLY_CAMERA_ZOOM_MIN = 0
@@ -360,11 +383,17 @@ local forwardBlend = 0
 local rightBlend = 0
 local flightPitchBlend = 0
 local flightBankBlend = 0
+local flightTurnRateBlend = 0
 local speedBlend = 0
 local previousDesiredYaw = nil
 local currentMoveVector = Vector3.zero
 local hoverBlend = 0
 local flyAnimState = "Idle"
+
+-- v56: explicit per-track blend weights owned by Fly.
+local flyIdleWeight = 1
+local flyMoveWeight = 0
+local flyBackwardWeight = 0
 
 local function getCharacter()
     return player.Character
@@ -395,6 +424,16 @@ local function loadFlyAnimations(humanoid)
         animator.Parent = humanoid
     end
 
+    -- v54: Fly takes explicit ownership of the Animator while active.
+    -- The Animate script may be disabled while its already-playing tracks
+    -- remain alive, so stop those pre-existing tracks before loading the
+    -- custom Fly tracks. This is intentionally limited to Fly enable time.
+    for _, existingTrack in ipairs(animator:GetPlayingAnimationTracks()) do
+        pcall(function()
+            existingTrack:Stop(0)
+        end)
+    end
+
     local function load(id, priority)
         local animation = Instance.new("Animation")
         animation.AnimationId = id
@@ -411,11 +450,33 @@ local function loadFlyAnimations(humanoid)
         return nil
     end
 
-    flyTracks.idle = load(IDLE_ANIMATION_ID, Enum.AnimationPriority.Movement)
-    flyTracks.move = load(MOVE_ANIMATION_ID, Enum.AnimationPriority.Movement)
+    -- v54: all custom Fly tracks use Action priority so they can
+    -- reliably override any existing avatar animation tracks while
+    -- the Animate controller is disabled.
+    flyTracks.idle = load(IDLE_ANIMATION_ID, Enum.AnimationPriority.Action)
+    flyTracks.move = load(MOVE_ANIMATION_ID, Enum.AnimationPriority.Action)
     flyTracks.backward = load(BACKWARD_ANIMATION_ID, Enum.AnimationPriority.Action)
 
-    if flyTracks.idle then flyTracks.idle:Play(0.12, 1, 1) end
+    -- v52: keep every custom Fly track actively playing while using
+    -- explicit weights for state blending. Use the normal Play() weight
+    -- parameter so the custom tracks are actually registered as active;
+    -- then immediately set their intended blend weights.
+    if flyTracks.idle then
+        flyTracks.idle:Play(0.12, 1, 1)
+        flyTracks.idle:AdjustWeight(1, 0)
+    end
+    if flyTracks.move then
+        flyTracks.move:Play(0.12, 1, 1)
+        flyTracks.move:AdjustWeight(0, 0)
+    end
+    flyIdleWeight = 1
+    flyMoveWeight = 0
+    flyBackwardWeight = 0
+
+    if flyTracks.backward then
+        flyTracks.backward:Play(0.12, 1, 1)
+        flyTracks.backward:AdjustWeight(0, 0)
+    end
 end
 
 local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardInput)
@@ -424,38 +485,59 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
     local backward = flyTracks.backward
     if not idle then return end
 
-    -- Use the CURRENT frame's camera-relative forward input. Reading
-    -- CurrentCamera.CFrame here would be one frame behind because Fly rebuilds
-    -- the camera later in this same render step.
     local desiredState = "Idle"
     if isMoving and moveDirection.Magnitude > 0.001 then
         desiredState = (forwardInput or 0) < -0.15 and "Backward" or "Forward"
     end
 
-    if desiredState ~= flyAnimState then
-        local fadeOut = 0.16
-        local fadeIn = 0.18
-        if flyAnimState == "Idle" and idle then idle:Stop(fadeOut) end
-        if flyAnimState == "Forward" and move then move:Stop(fadeOut) end
-        if flyAnimState == "Backward" and backward then backward:Stop(fadeOut) end
+    flyAnimState = desiredState
 
-        if desiredState == "Idle" and idle then
-            idle:Play(fadeIn, 1, 1)
-        elseif desiredState == "Forward" and move then
-            move:Play(fadeIn, 1, 1)
-        elseif desiredState == "Backward" and backward then
-            backward:Play(fadeIn, 1, 1)
-        end
-        flyAnimState = desiredState
+    -- v56: manually blend the three continuously-playing tracks. This avoids
+    -- Stop()/Play() snaps and avoids leaving Roblox's internal weight target
+    -- stuck after a state transition.
+    local idleTarget = desiredState == "Idle" and 1 or 0
+    local moveTarget = desiredState == "Forward" and 1 or 0
+    local backwardTarget = desiredState == "Backward" and 1 or 0
+
+    local blendAlpha = 1 - math.exp(-deltaTime / 0.18)
+
+    flyIdleWeight = flyIdleWeight
+        + (idleTarget - flyIdleWeight) * blendAlpha
+    flyMoveWeight = flyMoveWeight
+        + (moveTarget - flyMoveWeight) * blendAlpha
+    flyBackwardWeight = flyBackwardWeight
+        + (backwardTarget - flyBackwardWeight) * blendAlpha
+
+    if idle and not idle.IsPlaying then
+        idle:Play(0, 1, 1)
+    end
+    if move and not move.IsPlaying then
+        move:Play(0, 1, 1)
+    end
+    if backward and not backward.IsPlaying then
+        backward:Play(0, 1, 1)
     end
 
-    local speedTarget = isMoving and math.clamp(moveDirection.Magnitude, 0, 1) or 0
-    speedBlend += (speedTarget - speedBlend) * (1 - math.exp(-deltaTime / 0.16))
+    if idle then idle:AdjustWeight(flyIdleWeight, 0) end
+    if move then move:AdjustWeight(flyMoveWeight, 0) end
+    if backward then backward:AdjustWeight(flyBackwardWeight, 0) end
+
+    local speedTarget = isMoving
+        and math.clamp(moveDirection.Magnitude, 0, 1)
+        or 0
+
+    speedBlend += (speedTarget - speedBlend)
+        * (1 - math.exp(-deltaTime / 0.16))
+
     if move and move.IsPlaying then
-        move:AdjustSpeed(math.clamp(0.75 + speedBlend * 0.75, 0.75, 1.5))
+        move:AdjustSpeed(
+            math.clamp(0.75 + speedBlend * 0.75, 0.75, 1.5)
+        )
     end
     if backward and backward.IsPlaying then
-        backward:AdjustSpeed(math.clamp(0.80 + speedBlend * 0.60, 0.80, 1.4))
+        backward:AdjustSpeed(
+            math.clamp(0.80 + speedBlend * 0.60, 0.80, 1.4)
+        )
     end
 end
 
@@ -710,14 +792,15 @@ local function enforceFlyNoClip()
         return
     end
 
-    local character = getCharacter()
-    if character then
-        for _, instance in ipairs(character:GetDescendants()) do
-            if instance:IsA("BasePart") and not instance:IsDescendantOf(flyCollisionProxy) then
-                if instance.CanCollide then
-                    instance.CanCollide = false
-                end
-            end
+    -- v57 performance: setFlyNoClip() already caches every character
+    -- BasePart in flySavedCanCollide and DescendantAdded keeps that cache
+    -- current. Iterate the cache instead of scanning the entire character
+    -- hierarchy every render frame.
+    for instance, _ in pairs(flySavedCanCollide) do
+        if instance and instance.Parent
+            and not instance:IsDescendantOf(flyCollisionProxy)
+            and instance.CanCollide then
+            instance.CanCollide = false
         end
     end
 
@@ -1298,6 +1381,40 @@ local function updateFly(deltaTime)
     local isMoving = moveVector.Magnitude > 0.05
 
     -- ================================================================
+    -- v57 FLIGHT DYNAMICS / MOMENTUM VISUALS
+    -- ================================================================
+    -- These values are visual response layers. The actual movement vector and
+    -- position integration remain exactly v56.
+    local currentSpeed = moveVector.Magnitude
+    local speedDelta = currentSpeed - flyPreviousSpeed
+    local speedDeltaAlpha = 1 - math.exp(-dt / 0.09)
+
+    local accelerationTarget = math.clamp(math.max(speedDelta, 0) * 5, 0, 1)
+    local decelerationTarget = math.clamp(math.max(-speedDelta, 0) * 5, 0, 1)
+
+    flyAccelerationBlend = flyAccelerationBlend
+        + (accelerationTarget - flyAccelerationBlend) * speedDeltaAlpha
+    flyDecelerationBlend = flyDecelerationBlend
+        + (decelerationTarget - flyDecelerationBlend) * speedDeltaAlpha
+
+    local directionChangeTarget = 0
+    if isMoving and flyPreviousMoveDirection.Magnitude > 0.05 then
+        local previousUnit = flyPreviousMoveDirection.Unit
+        local currentUnit = moveVector.Unit
+        local directionDot = math.clamp(previousUnit:Dot(currentUnit), -1, 1)
+        directionChangeTarget = math.clamp((1 - directionDot) * 0.85, 0, 1)
+    end
+
+    local directionChangeAlpha = 1 - math.exp(-dt / 0.075)
+    flyDirectionChangeBlend = flyDirectionChangeBlend
+        + (directionChangeTarget - flyDirectionChangeBlend) * directionChangeAlpha
+
+    -- Keep the previous movement vector alive until the procedural pose has
+    -- consumed it below. This is what makes v57's direction-change reaction
+    -- compare the actual previous frame against the current frame.
+    flyPreviousSpeed = currentSpeed
+
+    -- ================================================================
     -- PHYSICS-DRIVEN POSITION / REAL COLLISION
     -- ================================================================
     -- No Clip OFF uses the exact v21 individual body-part collision proxies
@@ -1385,17 +1502,34 @@ local function updateFly(deltaTime)
         or 0
     flyFlightPreviousDesiredYaw = desiredFlightYaw
 
-    local turnRate = desiredYawDelta / math.max(dt, 1 / 240)
+    -- Turn bank: filter the actual heading change before converting it into
+    -- roll. This keeps the real body from snapping into a bank when the camera
+    -- turns quickly, while still letting the bank build naturally during a
+    -- sustained turn and recover smoothly when the turn stops.
+    local rawTurnRate = desiredYawDelta / math.max(dt, 1 / 240)
+    local turnRateDuration = isMoving and 0.075 or 0.16
+    local turnRateAlpha = 1 - math.exp(-dt / turnRateDuration)
+    flightTurnRateBlend = flightTurnRateBlend
+        + (rawTurnRate - flightTurnRateBlend) * turnRateAlpha
+
     local targetBank = 0
-    if isMoving and math.abs(turnRate) > 0.001 then
+    if isMoving and math.abs(flightTurnRateBlend) > 0.001 then
         targetBank = math.clamp(
-            -turnRate * 0.11,
-            math.rad(-18),
-            math.rad(18)
+            -flightTurnRateBlend * 0.10,
+            math.rad(-20),
+            math.rad(20)
         )
     end
 
-    local bankDuration = isMoving and 0.10 or 0.24
+    -- Enter a turn quickly, but let the body recover a little more lazily.
+    -- That small asymmetry makes the real character feel like it has weight
+    -- instead of mechanically matching the camera every frame.
+    local bankDuration
+    if math.abs(targetBank) > math.abs(flightBankBlend) then
+        bankDuration = isMoving and 0.085 or 0.20
+    else
+        bankDuration = isMoving and 0.15 or 0.30
+    end
     local bankAlpha = 1 - math.exp(-dt / bankDuration)
     flightBankBlend = flightBankBlend
         + (targetBank - flightBankBlend) * bankAlpha
@@ -1406,7 +1540,16 @@ local function updateFly(deltaTime)
     flyAnimTime = flyAnimTime + dt
 
     local targetMove = isMoving and 1 or 0
-    local transitionDuration = targetMove > flyHologramMoveBlend and 0.18 or 0.30
+
+    -- v57: slightly more deliberate visual settle on stopping. The manual
+    -- animation blender remains responsible for animation; this value only
+    -- controls the procedural flight pose/hover envelope.
+    local transitionDuration
+    if targetMove > flyHologramMoveBlend then
+        transitionDuration = 0.18
+    else
+        transitionDuration = 0.34
+    end
     local direction = targetMove > flyHologramMoveBlend and 1 or -1
 
     if math.abs(targetMove - flyHologramMoveBlend) > 0.0001 then
@@ -1444,8 +1587,29 @@ local function updateFly(deltaTime)
     local movementForward = forwardBlend
     local movementRight = rightBlend
 
+    -- v57 acceleration/deceleration body response. This supplements the
+    -- existing v56 directional lean rather than replacing it.
+    local accelerationPitch = math.rad(7)
+        * flyAccelerationBlend * b
+    local brakingPitch = math.rad(5)
+        * flyDecelerationBlend * b
+
     local flyLeanPitch = math.rad(16) * movementForward * b
+        + accelerationPitch
+        - brakingPitch
     local flyLeanRoll = math.rad(14) * movementRight * b
+
+    -- Direction-change reaction: briefly counter-roll into a sharp change,
+    -- then let the existing turn-bank system take over.
+    local directionSign = 0
+    if moveVector.Magnitude > 0.001 and flyPreviousMoveDirection.Magnitude > 0.05 then
+        local crossY = flyPreviousMoveDirection.Unit:Cross(moveVector.Unit).Y
+        directionSign = math.clamp(crossY, -1, 1)
+    end
+    local directionChangeRoll = math.rad(4)
+        * directionSign
+        * flyDirectionChangeBlend
+        * b
 
     local verticalTravelRatio = 0
     if moveVector.Magnitude > 0.001 then
@@ -1490,7 +1654,16 @@ local function updateFly(deltaTime)
         math.rad(75)
     )
 
-    local flightPitchDuration = isMoving and 0.10 or 0.22
+    -- v57 vertical-flight inertia: quick enough to follow the joystick, but
+    -- with a slightly heavier settle so upward/downward changes do not snap.
+    local verticalAcceleration = math.clamp(math.abs(moveVector.Y), 0, 1)
+    local flightPitchDuration
+    if isMoving and verticalAcceleration > 0.25 then
+        flightPitchDuration = 0.13
+    else
+        flightPitchDuration = isMoving and 0.10 or 0.24
+    end
+
     flightPitchBlend = flightPitchBlend
         + (flightPitchTarget - flightPitchBlend)
         * (1 - math.exp(-dt / flightPitchDuration))
@@ -1521,7 +1694,9 @@ local function updateFly(deltaTime)
         CFrame.Angles(
             flightPitch - flyLeanPitch - speedPosePitch,
             hoverYaw,
-            -flyLeanRoll - flightBankBlend + hoverRoll
+            -flyLeanRoll - flightBankBlend
+                + directionChangeRoll
+                + hoverRoll
         )
 
     -- No Clip ON owns the position directly so the character cannot be
@@ -1536,10 +1711,96 @@ local function updateFly(deltaTime)
     end
     root.AssemblyAngularVelocity = Vector3.zero
 
-    -- Aim above the HumanoidRootPart so the camera is raised relative to
-    -- the body. The body itself is never moved for framing.
-    cam.CFrame = getFlyCameraCFrame(flyPosition)
-    cam.FieldOfView = flyCameraSavedFOV or cam.FieldOfView
+    -- Commit the movement direction after all visual direction-change
+    -- calculations have consumed the previous frame's value.
+    flyPreviousMoveDirection = moveVector
+
+    -- ================================================================
+    -- v58 OPTIONAL CAMERA FLIGHT FEEL
+    -- ================================================================
+    -- The camera-feel layer is fully optional because the translation lag,
+    -- turn follow-through and speed FOV can be uncomfortable for players
+    -- who are sensitive to motion. Turning it OFF restores the direct v56/v57
+    -- camera position, rotation and saved FOV without changing flight movement.
+    local cameraPosition = nil
+    local cameraRotation = nil
+
+    if flyCameraFeelOn then
+        local horizontalVelocity = Vector3.new(moveVector.X, 0, moveVector.Z)
+        local cameraLagTarget = Vector3.zero
+
+        if horizontalVelocity.Magnitude > 0.001 then
+            local speedRatio = math.clamp(currentSpeed, 0, 1)
+            local travelDirection = horizontalVelocity.Unit
+            cameraLagTarget = -travelDirection
+                * (FLY_CAMERA_MAX_LAG * speedRatio)
+
+            -- Acceleration/deceleration briefly changes how much the camera lags,
+            -- creating a restrained sense of mass without making aiming sluggish.
+            cameraLagTarget *= 1
+                + flyAccelerationBlend * 0.18
+                + flyDecelerationBlend * 0.08
+        end
+
+        local cameraLagAlpha = 1 - math.exp(-FLY_CAMERA_MOMENTUM_SMOOTHNESS * dt)
+        flyCameraVelocityBlend = flyCameraVelocityBlend
+            + (cameraLagTarget - flyCameraVelocityBlend) * cameraLagAlpha
+
+        -- Camera turn inertia: tiny rotational follow-through, while the actual
+        -- camera yaw remains fully responsive.
+        local cameraYawDelta = flyCameraLastYaw
+            and shortestAngleDelta(flyCameraLastYaw, flyCameraYaw)
+            or 0
+        flyCameraLastYaw = flyCameraYaw
+
+        local turnLagTarget = math.clamp(
+            -cameraYawDelta / math.max(dt, 1 / 240) * 0.006,
+            math.rad(-1.8),
+            math.rad(1.8)
+        )
+        flyCameraTurnLag = flyCameraTurnLag
+            + (turnLagTarget - flyCameraTurnLag)
+            * (1 - math.exp(-dt / 0.09))
+
+        local baseCameraCFrame = getFlyCameraCFrame(flyPosition)
+        cameraPosition = baseCameraCFrame.Position
+            + flyCameraVelocityBlend
+
+        local cameraLookVector = baseCameraCFrame.LookVector
+        local cameraUpVector = baseCameraCFrame.UpVector
+
+        cameraRotation =
+            CFrame.lookAt(
+                Vector3.zero,
+                cameraLookVector,
+                cameraUpVector
+            ).Rotation
+            * CFrame.Angles(0, 0, flyCameraTurnLag)
+
+        -- Speed FOV is intentionally subtle. The baseline FOV is restored when
+        -- stopped, while faster flight opens the view smoothly.
+        local speedFOVTarget = math.clamp(currentSpeed, 0, 1)
+            * FLY_CAMERA_FOV_MAX_BOOST
+        flyCameraFOVBlend = flyCameraFOVBlend
+            + (speedFOVTarget - flyCameraFOVBlend)
+            * (1 - math.exp(-dt / 0.20))
+    else
+        -- Hard-disable all optional camera-feel offsets. This makes the toggle
+        -- immediately useful for motion-sensitive players instead of waiting
+        -- for the old inertia layers to decay.
+        flyCameraVelocityBlend = Vector3.zero
+        flyCameraTurnLag = 0
+        flyCameraFOVBlend = 0
+        flyCameraLastYaw = flyCameraYaw
+
+        local baseCameraCFrame = getFlyCameraCFrame(flyPosition)
+        cameraPosition = baseCameraCFrame.Position
+        cameraRotation = baseCameraCFrame.Rotation
+    end
+
+    cam.CFrame = CFrame.new(cameraPosition) * cameraRotation
+    cam.FieldOfView = (flyCameraSavedFOV or FLY_CAMERA_FOV_BASE)
+        + (flyCameraFeelOn and flyCameraFOVBlend or 0)
     cam.Focus = CFrame.new(flyPosition)
 end
 
@@ -1609,11 +1870,24 @@ local function enableFly()
     updateFlyShiftLockButton()
     setFlyNoClip(flyNoClipOn)
     flyVerticalInput = 0
-    forwardBlend, rightBlend, flightPitchBlend, flightBankBlend, speedBlend, hoverBlend = 0, 0, 0, 0, 0, 0
+    forwardBlend, rightBlend, flightPitchBlend, flightBankBlend, flightTurnRateBlend, speedBlend, hoverBlend = 0, 0, 0, 0, 0, 0, 0
+    flyCameraVelocityBlend = Vector3.zero
+    flyCameraTurnLag = 0
+    flyCameraFOVBlend = 0
+    flyCameraLastYaw = nil
+    flyCameraLastMoveVector = Vector3.zero
+    flyAccelerationBlend = 0
+    flyDecelerationBlend = 0
+    flyDirectionChangeBlend = 0
+    flyPreviousMoveDirection = Vector3.zero
+    flyPreviousSpeed = 0
     flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
     flyFlightPreviousDesiredYaw = flyBodyYaw
     flyHologramMoveBlend = 0
     flyAnimTime = 0
+    flyIdleWeight = 1
+    flyMoveWeight = 0
+    flyBackwardWeight = 0
     humanoid.PlatformStand = true
     humanoid.AutoRotate = false
     root.Anchored = false
@@ -1748,12 +2022,19 @@ local function disableFly()
     disconnectFlyNoClipWatcher()
 
     local camera = workspace.CurrentCamera
+    local exitCameraCFrame = camera and camera.CFrame or nil
     if camera then
         camera.CameraType = flyCameraSavedType or Enum.CameraType.Custom
         camera.CameraSubject = flyCameraSavedSubject
-        if flyCameraSavedCFrame then
-            camera.CFrame = flyCameraSavedCFrame
+
+        -- Keep the direction the player was actually looking at when Fly
+        -- was disabled. The old v59 behavior restored flyCameraSavedCFrame,
+        -- which was captured BEFORE Fly started and caused the camera to snap
+        -- back to the pre-Fly direction.
+        if exitCameraCFrame then
+            camera.CFrame = exitCameraCFrame
         end
+
         if flyCameraSavedFOV then
             camera.FieldOfView = flyCameraSavedFOV
         end
@@ -2082,6 +2363,17 @@ title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = panel
 
+local versionLabel = Instance.new("TextLabel")
+versionLabel.Size = UDim2.fromOffset(34, 18)
+versionLabel.Position = UDim2.new(1, -67, 0, 10)
+versionLabel.BackgroundTransparency = 1
+versionLabel.Text = "V60"
+versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
+versionLabel.Font = Enum.Font.Gotham
+versionLabel.TextSize = 9
+versionLabel.TextXAlignment = Enum.TextXAlignment.Right
+versionLabel.Parent = panel
+
 local closeButton = Instance.new("TextButton")
 closeButton.Size = UDim2.fromOffset(22, 22)
 closeButton.Position = UDim2.new(1, -29, 0, 5)
@@ -2141,15 +2433,26 @@ noClipToggle.Parent = panel
 Instance.new("UICorner", noClipToggle).CornerRadius = UDim.new(0, 8)
 
 local collisionDebugToggle = Instance.new("TextButton")
-collisionDebugToggle.Size = UDim2.fromOffset(200, 30)
+collisionDebugToggle.Size = UDim2.fromOffset(97, 30)
 collisionDebugToggle.Position = UDim2.fromOffset(10, 126)
 collisionDebugToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
 collisionDebugToggle.BorderSizePixel = 0
 collisionDebugToggle.TextColor3 = Color3.new(1, 1, 1)
 collisionDebugToggle.Font = Enum.Font.GothamBold
-collisionDebugToggle.TextSize = 11
+collisionDebugToggle.TextSize = 10
 collisionDebugToggle.Parent = panel
 Instance.new("UICorner", collisionDebugToggle).CornerRadius = UDim.new(0, 8)
+
+local cameraFeelToggle = Instance.new("TextButton")
+cameraFeelToggle.Size = UDim2.fromOffset(97, 30)
+cameraFeelToggle.Position = UDim2.fromOffset(113, 126)
+cameraFeelToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+cameraFeelToggle.BorderSizePixel = 0
+cameraFeelToggle.TextColor3 = Color3.new(1, 1, 1)
+cameraFeelToggle.Font = Enum.Font.GothamBold
+cameraFeelToggle.TextSize = 10
+cameraFeelToggle.Parent = panel
+Instance.new("UICorner", cameraFeelToggle).CornerRadius = UDim.new(0, 8)
 
 local hint = Instance.new("TextLabel")
 hint.Size = UDim2.new(1, -20, 0, 28)
@@ -2215,7 +2518,8 @@ local function refreshUI()
     toggle.Text = flyEnabled and "DISABLE" or "ENABLE"
     shortcut.Text = flyEnabled and "✈  ON" or "✈  FLY"
     noClipToggle.Text = "NO CLIP  •  " .. (flyNoClipOn and "ON" or "OFF")
-    collisionDebugToggle.Text = "COLLISION SHAPE  •  " .. (flyCollisionDebugOn and "ON" or "OFF")
+    collisionDebugToggle.Text = "COLLISION  •  " .. (flyCollisionDebugOn and "ON" or "OFF")
+    cameraFeelToggle.Text = "CAMERA FEEL  •  " .. (flyCameraFeelOn and "ON" or "OFF")
 end
 
 local function showMiniGui(show)
@@ -2253,6 +2557,18 @@ collisionDebugToggle.Activated:Connect(function()
     if not flyEnabled then return end
     flyCollisionDebugOn = not flyCollisionDebugOn
     updateFlyCollisionDebug()
+    refreshUI()
+end)
+
+cameraFeelToggle.Activated:Connect(function()
+    if not flyEnabled then return end
+    flyCameraFeelOn = not flyCameraFeelOn
+    if not flyCameraFeelOn then
+        flyCameraVelocityBlend = Vector3.zero
+        flyCameraTurnLag = 0
+        flyCameraFOVBlend = 0
+        flyCameraLastYaw = flyCameraYaw
+    end
     refreshUI()
 end)
 
