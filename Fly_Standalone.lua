@@ -1,4 +1,4 @@
--- VGD Fly Standalone v61
+-- VGD Fly Standalone v62
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -46,6 +46,8 @@ local flyCameraSavedType = nil
 local flyCameraSavedSubject = nil
 local flyCameraSavedCFrame = nil
 local flyCameraSavedFOV = nil
+local flyCameraSavedMinZoom = nil
+local flyCameraSavedMaxZoom = nil
 local flySpectatingOtherPlayer = false
 local flyCameraYaw = 0
 local flyCameraPitch = 0
@@ -1052,6 +1054,10 @@ local function connectFlyCameraInput()
             return Enum.ContextActionResult.Pass
         end
 
+        if flySpectatingOtherPlayer then
+            return Enum.ContextActionResult.Pass
+        end
+
         if inputState == Enum.UserInputState.Begin then
             if flyCameraIsInDynamicThumbstickArea(inputObject.Position)
                 or flyCameraIsOverGui(inputObject.Position) then
@@ -1193,7 +1199,7 @@ local function connectFlyCameraInput()
             input,
             gameProcessedEvent
         )
-            if not flyEnabled or gameProcessedEvent then
+            if not flyEnabled or flySpectatingOtherPlayer or gameProcessedEvent then
                 return
             end
 
@@ -1204,7 +1210,7 @@ local function connectFlyCameraInput()
 
     flyCameraConnections.MouseChanged =
         UserInputService.InputChanged:Connect(function(input)
-            if not flyEnabled or not flyCameraMouseLooking then
+            if not flyEnabled or flySpectatingOtherPlayer or not flyCameraMouseLooking then
                 return
             end
 
@@ -1222,7 +1228,7 @@ local function connectFlyCameraInput()
 
     -- Match Freecam's desktop zoom exactly.
     flyCameraConnections.MouseWheel = UserInputService.InputChanged:Connect(function(input)
-        if not flyEnabled then
+        if not flyEnabled or flySpectatingOtherPlayer then
             return
         end
 
@@ -1293,6 +1299,12 @@ local function updateFly(deltaTime)
     local spectatingOtherPlayer = subjectPlayer ~= nil and subjectPlayer ~= player
 
     if spectatingOtherPlayer then
+        if not flySpectatingOtherPlayer then
+            flyCameraResetInput()
+            table.clear(flyCameraTouchStates)
+            table.clear(flyCameraZoomTouchPositions)
+            flyCameraPinchLastDiameter = nil
+        end
         flySpectatingOtherPlayer = true
     elseif flySpectatingOtherPlayer then
         -- The spectate target has been released. The CameraModule has now
@@ -1946,6 +1958,8 @@ local function enableFly()
     flyCameraSavedCFrame = workspace.CurrentCamera.CFrame
     flySpectatingOtherPlayer = false
     flyCameraSavedFOV = workspace.CurrentCamera.FieldOfView
+    flyCameraSavedMinZoom = player.CameraMinZoomDistance
+    flyCameraSavedMaxZoom = player.CameraMaxZoomDistance
 
     local startCamera = workspace.CurrentCamera
     local startLook = startCamera.CFrame.LookVector
@@ -2068,6 +2082,21 @@ local function disableFly()
 
     local camera = workspace.CurrentCamera
     local exitCameraCFrame = camera and camera.CFrame or nil
+    local wasSpectatingOtherPlayer = flySpectatingOtherPlayer
+    local exitZoomDistance = nil
+    if camera and exitCameraCFrame and not wasSpectatingOtherPlayer then
+        local _, exitRoot = getHumanoidAndRoot()
+        if exitRoot then
+            local exitLook = exitCameraCFrame.LookVector
+            local projectedZoom =
+                (exitCameraCFrame.Position - exitRoot.Position):Dot(-exitLook)
+            exitZoomDistance = math.clamp(
+                projectedZoom,
+                FLY_CAMERA_ZOOM_MIN,
+                FLY_CAMERA_ZOOM_MAX
+            )
+        end
+    end
     if camera then
         camera.CameraType = flyCameraSavedType or Enum.CameraType.Custom
         camera.CameraSubject = flyCameraSavedSubject
@@ -2083,12 +2112,31 @@ local function disableFly()
         if flyCameraSavedFOV then
             camera.FieldOfView = flyCameraSavedFOV
         end
+
+        if exitZoomDistance then
+            local savedMinZoom = flyCameraSavedMinZoom
+            local savedMaxZoom = flyCameraSavedMaxZoom
+            player.CameraMinZoomDistance = exitZoomDistance
+            player.CameraMaxZoomDistance = exitZoomDistance
+            task.delay(0.12, function()
+                if player and player.Parent then
+                    if savedMinZoom ~= nil then
+                        player.CameraMinZoomDistance = savedMinZoom
+                    end
+                    if savedMaxZoom ~= nil then
+                        player.CameraMaxZoomDistance = savedMaxZoom
+                    end
+                end
+            end)
+        end
     end
     flyCameraSavedType = nil
     flyCameraSavedSubject = nil
     flyCameraSavedCFrame = nil
     flySpectatingOtherPlayer = false
     flyCameraSavedFOV = nil
+    flyCameraSavedMinZoom = nil
+    flyCameraSavedMaxZoom = nil
     setFlyNoClip(false)
     destroyFlyCollisionProxy()
     restoreCharacterState()
@@ -2413,7 +2461,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.fromOffset(34, 18)
 versionLabel.Position = UDim2.new(1, -67, 0, 10)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "V61"
+versionLabel.Text = "V62"
 versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
 versionLabel.Font = Enum.Font.Gotham
 versionLabel.TextSize = 9
