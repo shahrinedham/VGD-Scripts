@@ -1,4 +1,4 @@
--- VGD Fly Standalone v60
+-- VGD Fly Standalone v61
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -46,6 +46,7 @@ local flyCameraSavedType = nil
 local flyCameraSavedSubject = nil
 local flyCameraSavedCFrame = nil
 local flyCameraSavedFOV = nil
+local flySpectatingOtherPlayer = false
 local flyCameraYaw = 0
 local flyCameraPitch = 0
 local flyCameraTargetYaw = 0
@@ -1280,6 +1281,44 @@ local function updateFly(deltaTime)
     local cam = workspace.CurrentCamera
     if not humanoid or not root or not cam then return end
 
+    -- v61: allow external spectate systems to own the camera while Fly stays
+    -- enabled. Roblox's normal/spectate camera uses CameraSubject, so Fly must
+    -- not overwrite Camera.CFrame when the subject is another player's
+    -- character. When spectating ends, resume Fly from the camera orientation
+    -- the player is actually looking at instead of the pre-Fly orientation.
+    local cameraSubject = cam.CameraSubject
+    local subjectCharacter = cameraSubject and cameraSubject.Parent
+    local subjectPlayer = subjectCharacter
+        and Players:GetPlayerFromCharacter(subjectCharacter)
+    local spectatingOtherPlayer = subjectPlayer ~= nil and subjectPlayer ~= player
+
+    if spectatingOtherPlayer then
+        flySpectatingOtherPlayer = true
+    elseif flySpectatingOtherPlayer then
+        -- The spectate target has been released. The CameraModule has now
+        -- returned the camera to our character; adopt its current orientation
+        -- before Fly takes Scriptable ownership back.
+        flySpectatingOtherPlayer = false
+        local resumePitch, resumeYaw = cam.CFrame:ToOrientation()
+        flyCameraPitch = resumePitch
+        flyCameraYaw = resumeYaw
+        flyCameraTargetPitch = resumePitch
+        flyCameraTargetYaw = resumeYaw
+
+        local resumeDistance = (cam.CFrame.Position - root.Position).Magnitude
+        flyCameraZoomDistance = math.clamp(
+            resumeDistance,
+            FLY_CAMERA_ZOOM_MIN,
+            FLY_CAMERA_ZOOM_MAX
+        )
+        flyCameraTargetZoomDistance = flyCameraZoomDistance
+        flyCameraLastYaw = nil
+        flyCameraVelocityBlend = Vector3.zero
+        flyCameraTurnLag = 0
+        flyCameraFOVBlend = 0
+        cam.CameraType = Enum.CameraType.Scriptable
+    end
+
     -- Apply the same smooth target->current zoom interpolation used by
     -- Freecam. v28 updated flyCameraTargetZoomDistance correctly, but it
     -- never copied that target into flyCameraZoomDistance, so the camera
@@ -1798,10 +1837,15 @@ local function updateFly(deltaTime)
         cameraRotation = baseCameraCFrame.Rotation
     end
 
-    cam.CFrame = CFrame.new(cameraPosition) * cameraRotation
-    cam.FieldOfView = (flyCameraSavedFOV or FLY_CAMERA_FOV_BASE)
-        + (flyCameraFeelOn and flyCameraFOVBlend or 0)
-    cam.Focus = CFrame.new(flyPosition)
+    if not flySpectatingOtherPlayer then
+        -- Fly owns the camera only when no external spectate target is active.
+        -- This leaves another player's CameraSubject/CFrame completely alone.
+        cam.CameraType = Enum.CameraType.Scriptable
+        cam.CFrame = CFrame.new(cameraPosition) * cameraRotation
+        cam.FieldOfView = (flyCameraSavedFOV or FLY_CAMERA_FOV_BASE)
+            + (flyCameraFeelOn and flyCameraFOVBlend or 0)
+        cam.Focus = CFrame.new(flyPosition)
+    end
 end
 
 local function verticalAction(_, inputState, inputObject)
@@ -1900,6 +1944,7 @@ local function enableFly()
     flyCameraSavedType = workspace.CurrentCamera.CameraType
     flyCameraSavedSubject = workspace.CurrentCamera.CameraSubject
     flyCameraSavedCFrame = workspace.CurrentCamera.CFrame
+    flySpectatingOtherPlayer = false
     flyCameraSavedFOV = workspace.CurrentCamera.FieldOfView
 
     local startCamera = workspace.CurrentCamera
@@ -2042,6 +2087,7 @@ local function disableFly()
     flyCameraSavedType = nil
     flyCameraSavedSubject = nil
     flyCameraSavedCFrame = nil
+    flySpectatingOtherPlayer = false
     flyCameraSavedFOV = nil
     setFlyNoClip(false)
     destroyFlyCollisionProxy()
@@ -2367,7 +2413,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.fromOffset(34, 18)
 versionLabel.Position = UDim2.new(1, -67, 0, 10)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "V60"
+versionLabel.Text = "V61"
 versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
 versionLabel.Font = Enum.Font.Gotham
 versionLabel.TextSize = 9
