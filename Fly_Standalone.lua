@@ -1,4 +1,4 @@
--- VGD Fly Standalone v62
+-- VGD Fly Standalone v103
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -305,6 +305,77 @@ local function getFlyMoveControls()
         end
     end)
     return controls
+end
+
+-- Best-effort access to Roblox's live CameraModule controller.
+-- Current Roblox builds intentionally hide GetCameras() behind an API flag,
+-- so this may return nil. When it is available, setting the controller's
+-- nominal subject distance directly is the only way to seed the same internal
+-- value that Custom camera uses without relying on the visible zoom-limit hack.
+local function getRobloxCameraController()
+    local controller = nil
+    pcall(function()
+        local playerScripts = player:FindFirstChildOfClass("PlayerScripts")
+        local playerModule = playerScripts and playerScripts:FindFirstChild("PlayerModule")
+        if not playerModule then return end
+        local module = require(playerModule)
+        if not module or not module.GetCameras then return end
+        local cameras = module:GetCameras()
+        if type(cameras) == "table" then
+            controller = cameras.activeCameraController
+                or cameras.ActiveCameraController
+        end
+    end)
+    return controller
+end
+
+local function seedRobloxCameraZoom(distance)
+    if not distance then return false end
+    local controller = getRobloxCameraController()
+    if not controller then return false end
+
+    local ok = pcall(function()
+        controller:SetCameraToSubjectDistance(distance)
+    end)
+    return ok
+end
+
+-- v97: seed Roblox CameraModule's live orientation state with the
+-- FINAL Fly camera before returning CameraType=Custom. Simply assigning
+-- Camera.CFrame is not enough because CameraModule keeps its own previous
+-- transform/subject state between render updates.
+local function syncRobloxCameraOrientation(finalCFrame, humanoid)
+    if not finalCFrame then return false end
+
+    local controller = getRobloxCameraController()
+    if not controller then return false end
+
+    local subjectPosition = nil
+    local root = humanoid and humanoid.RootPart
+    if humanoid and root then
+        subjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
+    end
+
+    local ok = pcall(function()
+        controller.lastCameraTransform = finalCFrame
+        controller.lastCameraFocus = subjectPosition
+            and CFrame.new(subjectPosition)
+            or finalCFrame
+        controller.lastSubject = humanoid
+
+        if subjectPosition then
+            controller.lastSubjectPosition = subjectPosition
+            controller.lastSubjectCFrame = root
+                and root.CFrame
+                or CFrame.new(subjectPosition)
+        end
+
+        if controller.rotateInput ~= nil then
+            controller.rotateInput = Vector2.zero
+        end
+    end)
+
+    return ok
 end
 
 local function getFlyMoveVector(humanoid)
@@ -1026,6 +1097,80 @@ local function flyCameraApplyLookInput()
     end
 end
 
+-- During the Fly -> normal-camera handoff, the joystick finger is still physically
+-- held. Roblox's CameraModule can see that same TouchInput and interpret its movement
+-- as camera-look/pinch input for one or more frames. Block ONLY that already-held
+-- joystick InputObject until TouchEnded. Other fingers remain completely available
+-- to the normal Roblox camera.
+local flyJoystickHandoffBlockTouch = nil
+local flyJoystickHandoffBlockConnection = nil
+
+-- v90 camera bridge: while the DynamicThumbstick finger is still held, keep
+-- the camera on Fly's proven touch interpreter while normal ControlModule owns
+-- movement. This avoids forcing Roblox CameraInput to reinterpret an already-held
+-- joystick as a camera/pinch gesture.
+local flyCameraHandoffActive = false
+local flyCameraHandoffRenderConnection = false
+local flyCameraHandoffQuietFrames = 0
+
+-- v93: hard session ownership. Old exit/death callbacks are never allowed
+-- to write camera state into a later Fly session or a respawned character.
+local flySessionId = 0
+local flyDiedConnection = nil
+
+local function clearFlyJoystickHandoffBlock()
+    ContextActionService:UnbindAction("VGD_FlyJoystickHandoffBlock")
+
+    if flyJoystickHandoffBlockConnection then
+        pcall(function()
+            flyJoystickHandoffBlockConnection:Disconnect()
+        end)
+        flyJoystickHandoffBlockConnection = nil
+    end
+
+    flyJoystickHandoffBlockTouch = nil
+end
+
+local function blockFlyJoystickDuringCameraHandoff(touch)
+    clearFlyJoystickHandoffBlock()
+
+    if not touch or touch.UserInputType ~= Enum.UserInputType.Touch then
+        return
+    end
+
+    flyJoystickHandoffBlockTouch = touch
+
+    local function handoffTouchAction(_, inputState, inputObject)
+        if inputObject ~= flyJoystickHandoffBlockTouch then
+            return Enum.ContextActionResult.Pass
+        end
+
+        if inputState == Enum.UserInputState.End
+            or inputState == Enum.UserInputState.Cancel then
+            clearFlyJoystickHandoffBlock()
+            return Enum.ContextActionResult.Sink
+        end
+
+        -- Sink Begin/Change for the joystick touch so CameraModule cannot
+        -- reinterpret the movement as camera rotation or pinch zoom.
+        return Enum.ContextActionResult.Sink
+    end
+
+    ContextActionService:BindActionAtPriority(
+        "VGD_FlyJoystickHandoffBlock",
+        handoffTouchAction,
+        false,
+        Enum.ContextActionPriority.High.Value + 1,
+        Enum.UserInputType.Touch
+    )
+
+    flyJoystickHandoffBlockConnection = UserInputService.TouchEnded:Connect(function(inputObject)
+        if inputObject == flyJoystickHandoffBlockTouch then
+            clearFlyJoystickHandoffBlock()
+        end
+    end)
+end
+
 local function disconnectFlyCameraInput()
     ContextActionService:UnbindAction("VGD_FlyCameraTouch")
 
@@ -1049,7 +1194,7 @@ local function connectFlyCameraInput()
     -- used to detect a two-finger pinch because the touch action consumes
     -- the touches before UserInputService.TouchPinch can be relied on.
     local touchAction = function(_, inputState, inputObject)
-        if not flyEnabled
+        if (not flyEnabled and not flyCameraHandoffActive)
             or inputObject.UserInputType ~= Enum.UserInputType.Touch then
             return Enum.ContextActionResult.Pass
         end
@@ -1059,8 +1204,15 @@ local function connectFlyCameraInput()
         end
 
         if inputState == Enum.UserInputState.Begin then
-            if flyCameraIsInDynamicThumbstickArea(inputObject.Position)
-                or flyCameraIsOverGui(inputObject.Position) then
+            -- The mobile joystick is a separate input stream. If the player
+            -- keeps the joystick held while using a second finger to look
+            -- around, NEVER let that joystick touch enter the camera's pinch
+            -- table. Otherwise the camera sees the joystick + look finger as
+            -- a two-finger pinch and changes zoom instead of yaw/pitch.
+            local isJoystickTouch = inputObject == flyJoystickTouch
+                or flyCameraIsInDynamicThumbstickArea(inputObject.Position)
+
+            if isJoystickTouch or flyCameraIsOverGui(inputObject.Position) then
                 return Enum.ContextActionResult.Pass
             end
 
@@ -1088,6 +1240,23 @@ local function connectFlyCameraInput()
         end
 
         if flyCameraTouchStates[inputObject] then
+            -- Defensive cleanup for the rare case where Roblox reuses an
+            -- InputObject/state during a joystick transition. The joystick
+            -- must never participate in camera pinch detection.
+            if inputObject == flyJoystickTouch
+                or flyCameraIsInDynamicThumbstickArea(inputObject.Position) then
+                flyCameraTouchStates[inputObject] = nil
+                flyCameraZoomTouchPositions[inputObject] = nil
+                local remaining = 0
+                for _ in pairs(flyCameraZoomTouchPositions) do
+                    remaining += 1
+                end
+                if remaining < 2 then
+                    flyCameraPinchLastDiameter = nil
+                end
+                return Enum.ContextActionResult.Pass
+            end
+
             if inputState == Enum.UserInputState.Change then
                 flyCameraZoomTouchPositions[inputObject] = inputObject.Position
 
@@ -1199,7 +1368,7 @@ local function connectFlyCameraInput()
             input,
             gameProcessedEvent
         )
-            if not flyEnabled or flySpectatingOtherPlayer or gameProcessedEvent then
+            if (not flyEnabled and not flyCameraHandoffActive) or flySpectatingOtherPlayer or gameProcessedEvent then
                 return
             end
 
@@ -1210,7 +1379,7 @@ local function connectFlyCameraInput()
 
     flyCameraConnections.MouseChanged =
         UserInputService.InputChanged:Connect(function(input)
-            if not flyEnabled or flySpectatingOtherPlayer or not flyCameraMouseLooking then
+            if (not flyEnabled and not flyCameraHandoffActive) or flySpectatingOtherPlayer or not flyCameraMouseLooking then
                 return
             end
 
@@ -1228,7 +1397,7 @@ local function connectFlyCameraInput()
 
     -- Match Freecam's desktop zoom exactly.
     flyCameraConnections.MouseWheel = UserInputService.InputChanged:Connect(function(input)
-        if not flyEnabled or flySpectatingOtherPlayer then
+        if (not flyEnabled and not flyCameraHandoffActive) or flySpectatingOtherPlayer then
             return
         end
 
@@ -1259,6 +1428,37 @@ local function connectFlyCameraInput()
 
 end
 
+-- Mirror Roblox CameraModule's living-Humanoid subject point instead of
+-- using HumanoidRootPart.Position directly. CameraModule follows a point
+-- above the root (plus Humanoid.CameraOffset), and that vertical offset is
+-- exactly what makes the apparent exit distance depend on camera pitch.
+local function getRobloxCameraSubjectPosition(humanoid, root)
+    if not humanoid or not root or not root:IsA("BasePart") then
+        return root and root.Position or Vector3.zero
+    end
+
+    local heightOffset
+
+    if humanoid.RigType == Enum.HumanoidRigType.R15 then
+        if humanoid.AutomaticScalingEnabled then
+            heightOffset = Vector3.new(0, 1.5, 0)
+
+            -- Current Roblox CameraModule adds this root-size correction when
+            -- the root is the body part being followed. Mirror that behavior
+            -- so scaled R15 avatars use the same camera subject height.
+            local rootPartSizeOffset = (root.Size.Y - 2) / 2
+            heightOffset += Vector3.new(0, rootPartSizeOffset, 0)
+        else
+            heightOffset = Vector3.new(0, 2, 0)
+        end
+    else
+        -- R6 CameraModule subject height.
+        heightOffset = Vector3.new(0, 1.5, 0)
+    end
+
+    return root.CFrame:PointToWorldSpace(heightOffset + humanoid.CameraOffset)
+end
+
 local function getFlyCameraCFrame(subjectPosition)
     local cameraLookCFrame =
         CFrame.new(subjectPosition) *
@@ -1280,12 +1480,44 @@ local function getFlyCameraCFrame(subjectPosition)
     return CFrame.lookAt(cameraPosition, cameraPosition + cameraLook, cameraUp)
 end
 
+local function syncRobloxCameraZoomState(distance)
+    if not distance or flySpectatingOtherPlayer then return end
+
+    -- Keep Roblox CameraModule's own nominal zoom distance synchronized
+    -- while Fly is active. CameraModule stores currentSubjectDistance
+    -- separately from Camera.CFrame, so merely moving the Scriptable camera
+    -- cannot teach the normal camera about Fly's zoom. Using matching limits
+    -- forces CameraModule to clamp its internal distance to the live Fly
+    -- distance. The limits are restored on Fly exit.
+    local clamped = math.clamp(
+        distance,
+        0.5,
+        40
+    )
+
+    if not flyCameraSavedMinZoom or not flyCameraSavedMaxZoom then
+        return
+    end
+
+    if math.abs(player.CameraMinZoomDistance - clamped) > 0.02
+        or math.abs(player.CameraMaxZoomDistance - clamped) > 0.02 then
+        player.CameraMinZoomDistance = clamped
+        player.CameraMaxZoomDistance = clamped
+    end
+end
+
 local function updateFly(deltaTime)
     if not flyEnabled then return end
 
     local humanoid, root = getHumanoidAndRoot()
     local cam = workspace.CurrentCamera
     if not humanoid or not root or not cam then return end
+
+    -- This is the same subject point that Roblox CameraModule uses for the
+    -- local living Humanoid. Fly camera geometry and Camera.Focus must use
+    -- this point, not the root pivot, so pitch cannot create an artificial
+    -- zoom change when CameraModule resumes control.
+    local cameraSubjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
 
     -- v61: allow external spectate systems to own the camera while Fly stays
     -- enabled. Roblox's normal/spectate camera uses CameraSubject, so Fly must
@@ -1317,7 +1549,11 @@ local function updateFly(deltaTime)
         flyCameraTargetPitch = resumePitch
         flyCameraTargetYaw = resumeYaw
 
-        local resumeDistance = (cam.CFrame.Position - root.Position).Magnitude
+        local resumeSubjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
+        local resumeDistance = (cam.CFrame.Position - resumeSubjectPosition):Dot(-cam.CFrame.LookVector)
+        if resumeDistance <= 0.01 then
+            resumeDistance = (cam.CFrame.Position - resumeSubjectPosition).Magnitude
+        end
         flyCameraZoomDistance = math.clamp(
             resumeDistance,
             FLY_CAMERA_ZOOM_MIN,
@@ -1328,7 +1564,7 @@ local function updateFly(deltaTime)
         flyCameraVelocityBlend = Vector3.zero
         flyCameraTurnLag = 0
         flyCameraFOVBlend = 0
-        cam.CameraType = Enum.CameraType.Scriptable
+        cam.CameraType = Enum.CameraType.Custom
     end
 
     -- Apply the same smooth target->current zoom interpolation used by
@@ -1338,6 +1574,7 @@ local function updateFly(deltaTime)
     local zoomAlpha = 1 - math.exp(-14 * math.max(deltaTime, 0))
     flyCameraZoomDistance = flyCameraZoomDistance
         + (flyCameraTargetZoomDistance - flyCameraZoomDistance) * zoomAlpha
+
 
     -- No Clip is authoritative while enabled. Re-assert the state every
     -- render frame so a transient Roblox physics/avatar update cannot leave
@@ -1356,11 +1593,14 @@ local function updateFly(deltaTime)
     -- No velocity flight, no physics smoothing, no separate body steering.
     -- ================================================================
 
-    -- The Fly now owns the camera exactly like Freecam. Look input has
-    -- already been consumed/smoothed for this render frame, so movement is
-    -- derived from Fly's own camera orientation instead of Roblox CameraModule.
-    flyCameraApplyLookInput()
-    flyCameraSmoothLook(dt)
+    -- v103: CameraModule has just rendered at Camera priority. Read its live
+    -- orientation BEFORE calculating movement. Do not use a saved/pre-Fly
+    -- orientation and do not write a replacement CFrame.
+    local liveCameraPitch, liveCameraYaw = cam.CFrame:ToOrientation()
+    flyCameraPitch = liveCameraPitch
+    flyCameraYaw = liveCameraYaw
+    flyCameraTargetPitch = liveCameraPitch
+    flyCameraTargetYaw = liveCameraYaw
 
     local cameraLookCFrame =
         CFrame.new(flyPosition) *
@@ -1762,102 +2002,65 @@ local function updateFly(deltaTime)
     end
     root.AssemblyAngularVelocity = Vector3.zero
 
+    -- The root may have moved during this render step. Re-evaluate the
+    -- CameraModule-style subject point from the final character position so
+    -- the Fly camera remains attached to the same point Roblox will follow
+    -- when normal camera control resumes.
+    cameraSubjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
+
     -- Commit the movement direction after all visual direction-change
     -- calculations have consumed the previous frame's value.
     flyPreviousMoveDirection = moveVector
 
     -- ================================================================
-    -- v58 OPTIONAL CAMERA FLIGHT FEEL
+    -- v103: ROBLOX CAMERA MODULE REMAINS THE CAMERA OWNER
     -- ================================================================
-    -- The camera-feel layer is fully optional because the translation lag,
-    -- turn follow-through and speed FOV can be uncomfortable for players
-    -- who are sensitive to motion. Turning it OFF restores the direct v56/v57
-    -- camera position, rotation and saved FOV without changing flight movement.
-    local cameraPosition = nil
-    local cameraRotation = nil
+    -- Do NOT reconstruct or write CurrentCamera.CFrame here. Roblox's normal
+    -- CameraModule is intentionally left fully active during Fly, exactly like
+    -- the zoom behavior: it owns camera position, zoom, touch look, mouse look,
+    -- collision, and its internal rotation state. Fly only READS the camera
+    -- direction that CameraModule produced this frame and uses it for flight.
+    --
+    -- This removes the intermittent pre-Fly-direction race completely: there
+    -- is no Fly -> normal camera CFrame handoff because the normal camera never
+    -- stopped running in the first place.
+    local currentCameraCFrame = cam.CFrame
+    local currentPitch, currentYaw = currentCameraCFrame:ToOrientation()
+
+    flyCameraYaw = currentYaw
+    flyCameraPitch = currentPitch
+    flyCameraTargetYaw = currentYaw
+    flyCameraTargetPitch = currentPitch
+
+    -- Keep the internal zoom value in sync for compatibility with the existing
+    -- state, but NEVER write CameraMinZoomDistance/CameraMaxZoomDistance here.
+    -- Roblox's CameraModule now handles normal zoom itself while Fly is active.
+    local currentSubjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
+    local currentCameraDistance =
+        (currentCameraCFrame.Position - currentSubjectPosition).Magnitude
+    if currentCameraDistance > 0.01 then
+        flyCameraZoomDistance = math.clamp(
+            currentCameraDistance,
+            FLY_CAMERA_ZOOM_MIN,
+            FLY_CAMERA_ZOOM_MAX
+        )
+        flyCameraTargetZoomDistance = flyCameraZoomDistance
+    end
+
+    -- Keep the optional speed-FOV effect only. It does not take ownership of
+    -- camera position or direction and is restored when Fly is disabled.
+    flyCameraFOVBlend = flyCameraFOVBlend
+        + (math.clamp(currentSpeed, 0, 1) * FLY_CAMERA_FOV_MAX_BOOST
+            - flyCameraFOVBlend)
+        * (1 - math.exp(-dt / 0.20))
 
     if flyCameraFeelOn then
-        local horizontalVelocity = Vector3.new(moveVector.X, 0, moveVector.Z)
-        local cameraLagTarget = Vector3.zero
-
-        if horizontalVelocity.Magnitude > 0.001 then
-            local speedRatio = math.clamp(currentSpeed, 0, 1)
-            local travelDirection = horizontalVelocity.Unit
-            cameraLagTarget = -travelDirection
-                * (FLY_CAMERA_MAX_LAG * speedRatio)
-
-            -- Acceleration/deceleration briefly changes how much the camera lags,
-            -- creating a restrained sense of mass without making aiming sluggish.
-            cameraLagTarget *= 1
-                + flyAccelerationBlend * 0.18
-                + flyDecelerationBlend * 0.08
-        end
-
-        local cameraLagAlpha = 1 - math.exp(-FLY_CAMERA_MOMENTUM_SMOOTHNESS * dt)
-        flyCameraVelocityBlend = flyCameraVelocityBlend
-            + (cameraLagTarget - flyCameraVelocityBlend) * cameraLagAlpha
-
-        -- Camera turn inertia: tiny rotational follow-through, while the actual
-        -- camera yaw remains fully responsive.
-        local cameraYawDelta = flyCameraLastYaw
-            and shortestAngleDelta(flyCameraLastYaw, flyCameraYaw)
-            or 0
-        flyCameraLastYaw = flyCameraYaw
-
-        local turnLagTarget = math.clamp(
-            -cameraYawDelta / math.max(dt, 1 / 240) * 0.006,
-            math.rad(-1.8),
-            math.rad(1.8)
-        )
-        flyCameraTurnLag = flyCameraTurnLag
-            + (turnLagTarget - flyCameraTurnLag)
-            * (1 - math.exp(-dt / 0.09))
-
-        local baseCameraCFrame = getFlyCameraCFrame(flyPosition)
-        cameraPosition = baseCameraCFrame.Position
-            + flyCameraVelocityBlend
-
-        local cameraLookVector = baseCameraCFrame.LookVector
-        local cameraUpVector = baseCameraCFrame.UpVector
-
-        cameraRotation =
-            CFrame.lookAt(
-                Vector3.zero,
-                cameraLookVector,
-                cameraUpVector
-            ).Rotation
-            * CFrame.Angles(0, 0, flyCameraTurnLag)
-
-        -- Speed FOV is intentionally subtle. The baseline FOV is restored when
-        -- stopped, while faster flight opens the view smoothly.
-        local speedFOVTarget = math.clamp(currentSpeed, 0, 1)
-            * FLY_CAMERA_FOV_MAX_BOOST
-        flyCameraFOVBlend = flyCameraFOVBlend
-            + (speedFOVTarget - flyCameraFOVBlend)
-            * (1 - math.exp(-dt / 0.20))
-    else
-        -- Hard-disable all optional camera-feel offsets. This makes the toggle
-        -- immediately useful for motion-sensitive players instead of waiting
-        -- for the old inertia layers to decay.
-        flyCameraVelocityBlend = Vector3.zero
-        flyCameraTurnLag = 0
-        flyCameraFOVBlend = 0
-        flyCameraLastYaw = flyCameraYaw
-
-        local baseCameraCFrame = getFlyCameraCFrame(flyPosition)
-        cameraPosition = baseCameraCFrame.Position
-        cameraRotation = baseCameraCFrame.Rotation
-    end
-
-    if not flySpectatingOtherPlayer then
-        -- Fly owns the camera only when no external spectate target is active.
-        -- This leaves another player's CameraSubject/CFrame completely alone.
-        cam.CameraType = Enum.CameraType.Scriptable
-        cam.CFrame = CFrame.new(cameraPosition) * cameraRotation
         cam.FieldOfView = (flyCameraSavedFOV or FLY_CAMERA_FOV_BASE)
-            + (flyCameraFeelOn and flyCameraFOVBlend or 0)
-        cam.Focus = CFrame.new(flyPosition)
+            + flyCameraFOVBlend
+    elseif flyCameraSavedFOV then
+        cam.FieldOfView = flyCameraSavedFOV
     end
+
 end
 
 local function verticalAction(_, inputState, inputObject)
@@ -1884,12 +2087,137 @@ end
 
 local updateFlyShiftLockButton
 
+local function cancelPendingFlyExitHandoffForReenable()
+    -- A held-joystick disable intentionally keeps a temporary Scriptable
+    -- camera bridge alive. If Fly is enabled again before that bridge fully
+    -- releases, the old bridge MUST NOT be allowed to keep writing camera
+    -- CFrames underneath the new Fly session. Capture the live camera first,
+    -- then tear the old bridge down without restoring the old pre-Fly camera.
+    local camera = workspace.CurrentCamera
+    local liveCFrame = camera and camera.CFrame or nil
+
+    RunService:UnbindFromRenderStep("VGD_FlyExitCameraHandoff")
+
+    if flyCameraHandoffActive or flyCameraHandoffRenderConnection then
+        flyCameraHandoffActive = false
+        flyCameraHandoffQuietFrames = 0
+        if flyCameraHandoffRenderConnection then
+            RunService:UnbindFromRenderStep("VGD_FlyCameraHandoff")
+            flyCameraHandoffRenderConnection = false
+        end
+        disconnectFlyCameraInput()
+    end
+
+    -- The live bridge CFrame is the player's actual latest view. Do not put
+    -- CameraModule back through the old saved CFrame here; the next Fly
+    -- session must start from what the player is looking at NOW.
+    if camera and liveCFrame then
+        camera.CFrame = liveCFrame
+    end
+
+    flyCameraSavedType = nil
+    flyCameraSavedSubject = nil
+    flyCameraSavedCFrame = nil
+    flyCameraSavedFOV = nil
+    flyCameraSavedMinZoom = nil
+    flyCameraSavedMaxZoom = nil
+end
+
+local function cancelPendingFlyExitHandoffClean()
+    -- Used for a final clean exit. Never leave an old render-step callback
+    -- alive after a Fly session ends; otherwise a later walk/camera update can
+    -- be overwritten by a callback belonging to a previous session.
+    RunService:UnbindFromRenderStep("VGD_FlyExitCameraHandoff")
+    if flyCameraHandoffRenderConnection then
+        RunService:UnbindFromRenderStep("VGD_FlyCameraHandoff")
+        flyCameraHandoffRenderConnection = false
+    end
+    flyCameraHandoffActive = false
+    flyCameraHandoffQuietFrames = 0
+end
+
+local function disconnectFlyDeathConnection()
+    if flyDiedConnection then
+        pcall(function() flyDiedConnection:Disconnect() end)
+        flyDiedConnection = nil
+    end
+end
+
+local function bindFlyDeathCleanup(humanoid, sessionId)
+    disconnectFlyDeathConnection()
+
+    flyDiedConnection = humanoid.Died:Connect(function()
+        if sessionId ~= flySessionId then return end
+
+        flyEnabled = false
+        flySpectatingOtherPlayer = false
+        updateFlyShiftLockButton()
+        unbindVerticalControls()
+
+        if flyRenderConnection then
+            RunService:UnbindFromRenderStep("VGD_FlySmooth")
+            flyRenderConnection = nil
+        end
+
+        RunService:UnbindFromRenderStep("VGD_FlyExitCameraHandoff")
+        RunService:UnbindFromRenderStep("VGD_FlyExitCameraSeed")
+        RunService:UnbindFromRenderStep("VGD_FlyCameraHandoff")
+        flyCameraHandoffActive = false
+        flyCameraHandoffRenderConnection = false
+        flyCameraHandoffQuietFrames = 0
+
+        clearFlyJoystickHandoffBlock()
+        disconnectFlyCameraInput()
+        clearFlyJoystick()
+        disconnectFlyNoClipWatcher()
+        destroyFlyCollisionProxy()
+        restoreCharacterState()
+
+        -- Never restore the dead character's saved camera.
+        flyCameraSavedType = Enum.CameraType.Custom
+        flyCameraSavedSubject = nil
+        flyCameraSavedCFrame = nil
+        flyCameraSavedFOV = nil
+        flyCameraSavedMinZoom = nil
+        flyCameraSavedMaxZoom = nil
+
+        local camera = workspace.CurrentCamera
+        if camera then
+            camera.CameraType = Enum.CameraType.Custom
+            camera.CameraSubject = nil
+        end
+
+        stateChangedEvent:Fire(false)
+    end)
+end
+
 local function enableFly()
     if flyEnabled then return true end
+
+    -- v93: invalidate every callback belonging to the previous session.
+    flySessionId += 1
+    local thisFlySession = flySessionId
+    disconnectFlyDeathConnection()
+    RunService:UnbindFromRenderStep("VGD_FlyExitCameraHandoff")
+    RunService:UnbindFromRenderStep("VGD_FlyExitCameraSeed")
+    RunService:UnbindFromRenderStep("VGD_FlyCameraHandoff")
+    flyCameraHandoffActive = false
+    flyCameraHandoffRenderConnection = false
+    flyCameraHandoffQuietFrames = 0
+
+    -- v92: repeated OFF -> ON -> OFF cycles must start from the LIVE camera
+    -- state of the previous session, never from an old exit-handoff callback.
+    cancelPendingFlyExitHandoffForReenable()
+
+    -- A new Fly session takes ownership of camera input again, so any previous
+    -- normal-camera handoff blocker can be removed now.
+    clearFlyJoystickHandoffBlock()
+
     local humanoid, root = getHumanoidAndRoot()
     if not humanoid or not root then return false end
 
     saveCharacterState(humanoid, root)
+    bindFlyDeathCleanup(humanoid, thisFlySession)
 
     -- Resolve and enable Roblox's movement controller BEFORE PlatformStand is
     -- applied. This preserves the currently-held mobile joystick instead of
@@ -1950,9 +2278,8 @@ local function enableFly()
     createFlyCollisionProxy()
     currentMoveVector = Vector3.zero
 
-    -- Take ownership of the camera, using the same starting viewpoint model
-    -- as Freecam. The camera is then reconstructed from yaw/pitch every render
-    -- frame, so body rotation can never feed back into camera rotation.
+    -- v103: keep Roblox's normal CameraModule running continuously. We only
+    -- sample its current CFrame to initialize Fly's movement orientation.
     flyCameraSavedType = workspace.CurrentCamera.CameraType
     flyCameraSavedSubject = workspace.CurrentCamera.CameraSubject
     flyCameraSavedCFrame = workspace.CurrentCamera.CFrame
@@ -1964,36 +2291,54 @@ local function enableFly()
     local startCamera = workspace.CurrentCamera
     local startLook = startCamera.CFrame.LookVector
     local startPosition = startCamera.CFrame.Position
+    local startSubjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
 
-    -- Match the actual normal Roblox camera relationship used by Freecam:
-    -- project the camera position onto the look axis from the character, then
-    -- preserve the normal camera's vertical component only. We deliberately
-    -- discard lateral/shoulder offset so the real body remains centered.
+    -- CameraModule follows startSubjectPosition, not the HumanoidRootPart
+    -- pivot. Using the same subject here is the important v81 change: the
+    -- vertical subject offset now participates in the Fly camera geometry in
+    -- exactly the same way it does in the normal camera.
     local startDistanceAlongLook =
-        (startPosition - root.Position):Dot(-startLook)
+        (startPosition - startSubjectPosition):Dot(-startLook)
 
     if startDistanceAlongLook <= 0.01 then
         startDistanceAlongLook =
-            (startPosition - root.Position).Magnitude
+            (startPosition - startSubjectPosition).Magnitude
     end
 
+    local normalCameraLinePosition =
+        startSubjectPosition - startLook * startDistanceAlongLook
+    local normalCameraOffset =
+        startPosition - normalCameraLinePosition
+
+    -- Preserve the normal camera's vertical framing component. Because the
+    -- Fly camera later adds this offset perpendicular to LookVector, the old
+    -- code used startDistanceAlongLook directly as the Fly zoom distance.
+    -- That made the final Fly camera slightly farther from the character than
+    -- the normal camera whenever this offset was non-zero.
+    flyCameraVerticalOffset =
+        normalCameraOffset:Dot(startCamera.CFrame.UpVector)
+
+    -- Match the REAL starting camera-to-subject distance, not just its
+    -- projection along LookVector. The Fly camera position is constructed as
+    --   subject - LookVector * depth + UpVector * verticalOffset
+    -- so its true distance is sqrt(depth^2 + verticalOffset^2). Solve that
+    -- geometry here so enabling Fly does not introduce a small distance jump
+    -- even when the player never touches zoom.
+    local startActualDistance =
+        (startPosition - startSubjectPosition).Magnitude
+    local verticalOffsetMagnitude = math.abs(flyCameraVerticalOffset)
+    local depthSquared =
+        (startActualDistance * startActualDistance)
+        - (verticalOffsetMagnitude * verticalOffsetMagnitude)
+
+    local correctedStartDepth = math.sqrt(math.max(depthSquared, 0))
+
     flyCameraZoomDistance = math.clamp(
-        startDistanceAlongLook,
+        correctedStartDepth,
         FLY_CAMERA_ZOOM_MIN,
         FLY_CAMERA_ZOOM_MAX
     )
     flyCameraTargetZoomDistance = flyCameraZoomDistance
-
-    local normalCameraLinePosition =
-        root.Position - startLook * startDistanceAlongLook
-    local normalCameraOffset =
-        startPosition - normalCameraLinePosition
-
-    -- Keep only the vertical component of the normal camera offset. Express it
-    -- in the starting camera's UpVector so it can rotate naturally with the
-    -- camera without creating lateral drift.
-    flyCameraVerticalOffset =
-        normalCameraOffset:Dot(startCamera.CFrame.UpVector)
 
     flyCameraOffset = Vector3.zero
     flyCameraPitch, flyCameraYaw = startCamera.CFrame:ToOrientation()
@@ -2007,19 +2352,22 @@ local function enableFly()
     flyPosition = root.Position
     loadFlyAnimations(humanoid)
     bindVerticalControls()
-    connectFlyCameraInput()
-    -- Fly owns the camera while enabled, just like Freecam.\n    startCamera.CameraType = Enum.CameraType.Scriptable
+    -- v103: DO NOT disable, replace, or intercept Roblox's normal camera.
+    -- CameraModule remains active during Fly so its own touch/mouse rotation
+    -- and zoom state continue normally. Fly simply reads CurrentCamera.CFrame
+    -- after CameraModule renders and uses that direction for movement.
+    -- Intentionally do NOT call connectFlyCameraInput() here and do not even
+    -- reassign CameraType/CameraSubject when the normal camera is already using
+    -- this Humanoid. Roblox keeps its own camera state continuously.
 
     if flyRenderConnection then
         RunService:UnbindFromRenderStep("VGD_FlySmooth")
         flyRenderConnection = nil
     end
 
-    -- Run immediately AFTER Roblox's CameraModule. This is the critical
-    -- difference from v3: the flight controller now reads the freshly updated
-    -- camera direction in the same render frame, exactly like Freecam's own
-    -- Camera.Value + 1 render pass. We then translate the camera by the body's
-    -- exact displacement so there is no visible one-frame follow lag.
+    -- Run immediately AFTER Roblox's CameraModule. The camera is already
+    -- rendered normally; this step only reads its fresh CFrame and updates Fly
+    -- movement from that direction. It never writes CurrentCamera.CFrame.
     RunService:BindToRenderStep(
         "VGD_FlySmooth",
         Enum.RenderPriority.Camera.Value + 1,
@@ -2030,8 +2378,262 @@ local function enableFly()
     return true
 end
 
+local function stopFlyCameraHandoff()
+    if not flyCameraHandoffActive then
+        return
+    end
+
+    flyCameraHandoffActive = false
+    flyCameraHandoffQuietFrames = 0
+
+    if flyCameraHandoffRenderConnection then
+        RunService:UnbindFromRenderStep("VGD_FlyCameraHandoff")
+        flyCameraHandoffRenderConnection = false
+    end
+
+    disconnectFlyCameraInput()
+
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local finalCFrame = camera.CFrame
+    local savedType = flyCameraSavedType or Enum.CameraType.Custom
+    local savedSubject = flyCameraSavedSubject
+    local savedFOV = flyCameraSavedFOV
+    local savedMinZoom = flyCameraSavedMinZoom
+    local savedMaxZoom = flyCameraSavedMaxZoom
+
+    -- Let Roblox regain ownership immediately after the bridge. The final
+    -- Fly orientation is seeded before CameraModule's next Custom update,
+    -- while the saved subject is restored at the same time. This avoids the
+    -- stale Scriptable camera state that could freeze the camera after the
+    -- joystick was released and the player started walking again.
+    camera.CameraSubject = savedSubject
+    camera.CameraType = savedType
+    if savedType == Enum.CameraType.Custom and savedSubject then
+        camera.CFrame = finalCFrame
+        camera.Focus = CFrame.new(finalCFrame.Position + finalCFrame.LookVector * 20)
+    end
+    if savedFOV then
+        camera.FieldOfView = savedFOV
+    end
+
+    local handoffName = "VGD_FlyExitCameraHandoff"
+    RunService:UnbindFromRenderStep(handoffName)
+    local applied = false
+    RunService:BindToRenderStep(handoffName, Enum.RenderPriority.Camera.Value + 1, function()
+        if applied then return end
+        applied = true
+        RunService:UnbindFromRenderStep(handoffName)
+        if camera.Parent then
+            camera.CFrame = finalCFrame
+        end
+        if savedMinZoom ~= nil then
+            player.CameraMinZoomDistance = savedMinZoom
+        end
+        if savedMaxZoom ~= nil then
+            player.CameraMaxZoomDistance = savedMaxZoom
+        end
+    end)
+
+    flyCameraSavedType = nil
+    flyCameraSavedSubject = nil
+    flyCameraSavedCFrame = nil
+    flyCameraSavedFOV = nil
+    flyCameraSavedMinZoom = nil
+    flyCameraSavedMaxZoom = nil
+end
+
+local function startFlyCameraHandoff(finalFlyCameraCFrame)
+    local camera = workspace.CurrentCamera
+    if not camera or not finalFlyCameraCFrame then
+        return false
+    end
+
+    flyCameraHandoffActive = true
+    flyCameraHandoffQuietFrames = 0
+
+    -- Keep the camera Scriptable while the old joystick finger exists. The
+    -- normal movement controller remains enabled and therefore still receives
+    -- the physical thumbstick. Only camera ownership is temporarily bridged.
+    camera.CameraType = Enum.CameraType.Scriptable
+    camera.CFrame = finalFlyCameraCFrame
+    camera.Focus = CFrame.new(finalFlyCameraCFrame.Position + finalFlyCameraCFrame.LookVector * 20)
+
+    if not flyCameraHandoffRenderConnection then
+        local handoffSessionId = flySessionId
+        RunService:BindToRenderStep(
+            "VGD_FlyCameraHandoff",
+            Enum.RenderPriority.Camera.Value + 1,
+            function(dt)
+                if handoffSessionId ~= flySessionId then
+                    RunService:UnbindFromRenderStep("VGD_FlyCameraHandoff")
+                    flyCameraHandoffActive = false
+                    flyCameraHandoffRenderConnection = false
+                    return
+                end
+                if not flyCameraHandoffActive then
+                    return
+                end
+
+                local humanoid, root = getHumanoidAndRoot()
+                local cam = workspace.CurrentCamera
+                if not humanoid or not root or not cam then
+                    stopFlyCameraHandoff()
+                    return
+                end
+
+                -- The old joystick is intentionally NOT part of the camera
+                -- touch table. New right-side touches continue through the same
+                -- proven Fly camera interpreter, so one-finger movement remains
+                -- movement and two-finger pinch cannot be synthesized from it.
+                flyCameraSmoothLook(dt)
+
+                local zoomAlpha = 1 - math.exp(-14 * math.max(dt or 0, 0))
+                flyCameraZoomDistance = flyCameraZoomDistance
+                    + (flyCameraTargetZoomDistance - flyCameraZoomDistance) * zoomAlpha
+
+                local subjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
+                local bridgeCFrame = getFlyCameraCFrame(subjectPosition)
+                cam.CameraType = Enum.CameraType.Scriptable
+                cam.CFrame = bridgeCFrame
+                cam.Focus = CFrame.new(subjectPosition)
+
+                -- Do not release the bridge merely because the joystick vector
+                -- reaches zero: the thumb may still be physically down. The
+                -- exact tracker clears flyJoystickTouch only on TouchEnded.
+                local joystickStillHeld = flyJoystickTouch ~= nil
+                    or not flyJoystickReleasedSinceLastStart
+                        and flyJoystickVector.Magnitude > 0.001
+
+                local cameraTouchCount = 0
+                for _ in pairs(flyCameraTouchStates) do
+                    cameraTouchCount += 1
+                end
+
+                if not joystickStillHeld and cameraTouchCount == 0 then
+                    -- Two quiet frames let Roblox finish the release processing
+                    -- before CameraModule receives ownership again. This avoids
+                    -- the stale one-frame pinch/rotation state seen on exit.
+                    flyCameraHandoffQuietFrames += 1
+                    if flyCameraHandoffQuietFrames >= 2 then
+                        stopFlyCameraHandoff()
+                    end
+                else
+                    flyCameraHandoffQuietFrames = 0
+                end
+            end
+        )
+        flyCameraHandoffRenderConnection = true
+    end
+
+    return true
+end
+
+-- v103 camera handoff: seed the normal CameraModule BEFORE its render update.
+-- Roblox's default camera calculates its next look direction from
+-- CurrentCamera.CFrame.  The old v97/v99/v100 approach wrote the final Fly
+-- CFrame AFTER CameraModule had already rendered, which left CameraModule's
+-- internal/current look one frame behind and caused the intermittent snap back
+-- to the pre-Fly direction.  We now put the final Fly CFrame in CurrentCamera
+-- at Camera-1, let the real CameraModule consume it at Camera, and then never
+-- write the normal camera again.
+local function seedNormalCameraBeforeCameraModule(finalCFrame, humanoid)
+    if not finalCFrame then
+        return false
+    end
+
+    local camera = workspace.CurrentCamera
+    if not camera or not camera.Parent then
+        return false
+    end
+
+    if humanoid then
+        camera.CameraType = Enum.CameraType.Custom
+        camera.CameraSubject = humanoid
+    end
+
+    -- If Roblox exposes the live CameraModule controller, clear any stale
+    -- accumulated rotation input and seed its last-frame state as well.  The
+    -- script must still work when GetCameras() is intentionally unavailable,
+    -- so the actual handoff does NOT depend on this optional API.
+    local controller = nil
+    pcall(function()
+        local playerScripts = player:FindFirstChildOfClass("PlayerScripts")
+        local playerModule = playerScripts and playerScripts:FindFirstChild("PlayerModule")
+        if not playerModule then return end
+        local module = require(playerModule)
+        if not module or not module.GetCameras then return end
+        local cameras = module:GetCameras()
+        if type(cameras) == "table" then
+            controller = cameras.activeCameraController
+                or cameras.ActiveCameraController
+        end
+    end)
+
+    if controller then
+        pcall(function()
+            if controller.rotateInput ~= nil then
+                controller.rotateInput = Vector2.zero
+            end
+            controller.lastCameraTransform = finalCFrame
+            controller.lastCameraFocus = CFrame.new(finalCFrame.Position + finalCFrame.LookVector * 20)
+            if humanoid then
+                controller.lastSubject = humanoid
+                local root = humanoid.RootPart
+                local subjectPosition = root and getRobloxCameraSubjectPosition(humanoid, root)
+                if subjectPosition then
+                    controller.lastSubjectPosition = subjectPosition
+                    controller.lastSubjectCFrame = root.CFrame
+                end
+            end
+        end)
+    end
+
+    local handoffName = "VGD_FlyExitCameraSeed"
+    RunService:UnbindFromRenderStep(handoffName)
+
+    -- CameraModule is bound at Enum.RenderPriority.Camera.Value.  Running one
+    -- priority before it makes the final Fly orientation the actual input to
+    -- CameraModule instead of fighting the result after it has rendered.
+    local applied = false
+    RunService:BindToRenderStep(
+        handoffName,
+        Enum.RenderPriority.Camera.Value - 1,
+        function()
+            if applied then
+                return
+            end
+            applied = true
+            RunService:UnbindFromRenderStep(handoffName)
+
+            local cam = workspace.CurrentCamera
+            if not cam or not cam.Parent then
+                return
+            end
+
+            if humanoid and humanoid.Parent then
+                cam.CameraType = Enum.CameraType.Custom
+                cam.CameraSubject = humanoid
+            end
+
+            cam.CFrame = finalCFrame
+            cam.Focus = CFrame.new(finalCFrame.Position + finalCFrame.LookVector * 20)
+        end
+    )
+
+    return true
+end
+
 local function disableFly()
     if not flyEnabled then return false end
+
+    -- Invalidate this session before any exit work. This prevents repeated
+    -- ON/OFF cycles from leaving an old lifecycle callback alive.
+    flySessionId += 1
+    disconnectFlyDeathConnection()
 
     -- Capture the joystick state BEFORE disconnectFlyJoystickTracking() clears it.
     -- If the thumb is still held, we hand that movement back to the normal
@@ -2066,6 +2668,22 @@ local function disableFly()
         end
     end
 
+    -- v103: CameraModule never loses ownership during Fly. There is no camera
+    -- CFrame handoff to capture or restore on exit.
+    local finalFlyCameraCFrame = nil
+
+    -- v97 camera ownership rule:
+    -- Never bridge the normal camera through Scriptable on Fly exit.
+    -- The movement joystick is handed back separately below; camera ownership
+    -- is returned directly to Roblox's Custom CameraModule. This keeps one
+    -- ON/OFF while moving from leaving a stale Scriptable camera behind.
+    --
+    -- Also cancel any legacy bridge that might still exist from a previous
+    -- session before we hand the camera back.
+    if flyCameraHandoffActive or flyCameraHandoffRenderConnection then
+        cancelPendingFlyExitHandoffClean()
+    end
+
     flyEnabled = false
     updateFlyShiftLockButton()
     unbindVerticalControls()
@@ -2073,63 +2691,62 @@ local function disableFly()
         RunService:UnbindFromRenderStep("VGD_FlySmooth")
         flyRenderConnection = nil
     end
-    disconnectFlyCameraInput()
+    if not flyCameraHandoffActive then
+        disconnectFlyCameraInput()
+    end
     -- Keep the joystick tracker connected after Fly is disabled so a touch
     -- that started before Fly can remain available for the normal movement
     -- controller and for the next Fly transition.
     flyMoveControls = nil
     disconnectFlyNoClipWatcher()
+    disconnectFlyDeathConnection()
 
     local camera = workspace.CurrentCamera
-    local exitCameraCFrame = camera and camera.CFrame or nil
     local wasSpectatingOtherPlayer = flySpectatingOtherPlayer
-    local exitZoomDistance = nil
-    if camera and exitCameraCFrame and not wasSpectatingOtherPlayer then
-        local _, exitRoot = getHumanoidAndRoot()
-        if exitRoot then
-            local exitLook = exitCameraCFrame.LookVector
-            local projectedZoom =
-                (exitCameraCFrame.Position - exitRoot.Position):Dot(-exitLook)
-            exitZoomDistance = math.clamp(
-                projectedZoom,
-                FLY_CAMERA_ZOOM_MIN,
-                FLY_CAMERA_ZOOM_MAX
-            )
-        end
-    end
+
     if camera then
-        camera.CameraType = flyCameraSavedType or Enum.CameraType.Custom
-        camera.CameraSubject = flyCameraSavedSubject
+        if wasSpectatingOtherPlayer then
+            -- External spectate owns this camera. Do not interfere with its
+            -- current camera state when Fly is disabled.
+            camera.CameraType = flyCameraSavedType or Enum.CameraType.Custom
+            camera.CameraSubject = flyCameraSavedSubject
+        else
+            local humanoid = select(1, getHumanoidAndRoot())
 
-        -- Keep the direction the player was actually looking at when Fly
-        -- was disabled. The old v59 behavior restored flyCameraSavedCFrame,
-        -- which was captured BEFORE Fly started and caused the camera to snap
-        -- back to the pre-Fly direction.
-        if exitCameraCFrame then
-            camera.CFrame = exitCameraCFrame
-        end
-
-        if flyCameraSavedFOV then
-            camera.FieldOfView = flyCameraSavedFOV
-        end
-
-        if exitZoomDistance then
+            -- v103: CameraModule already owns the camera. Do not restore a
+            -- saved CFrame, do not seed a private camera transform, and do not
+            -- switch through Scriptable. Simply ensure the live Humanoid remains
+            -- the subject and let Roblox continue from its current camera state.
+            local savedFOV = flyCameraSavedFOV
             local savedMinZoom = flyCameraSavedMinZoom
             local savedMaxZoom = flyCameraSavedMaxZoom
-            player.CameraMinZoomDistance = exitZoomDistance
-            player.CameraMaxZoomDistance = exitZoomDistance
-            task.delay(0.12, function()
-                if player and player.Parent then
-                    if savedMinZoom ~= nil then
-                        player.CameraMinZoomDistance = savedMinZoom
-                    end
-                    if savedMaxZoom ~= nil then
-                        player.CameraMaxZoomDistance = savedMaxZoom
-                    end
-                end
-            end)
+
+            RunService:UnbindFromRenderStep("VGD_FlyExitCameraHandoff")
+            RunService:UnbindFromRenderStep("VGD_FlyExitCameraSeed")
+
+            -- v103: for a normal local session, leave CameraType and
+            -- CameraSubject completely untouched. They never stopped being
+            -- owned by Roblox, so changing them here would only risk another
+            -- CameraModule rotation reset. The spectate path above is the only
+            -- case that restores an external camera state.
+
+            if savedFOV then
+                camera.FieldOfView = savedFOV
+            end
+
+            -- v103: no CFrame handoff at all. CameraModule has remained the
+            -- camera owner for the entire Fly session, so there is no stale
+            -- pre-Fly camera transform to restore or seed.
+
+            if savedMinZoom ~= nil then
+                player.CameraMinZoomDistance = savedMinZoom
+            end
+            if savedMaxZoom ~= nil then
+                player.CameraMaxZoomDistance = savedMaxZoom
+            end
         end
     end
+
     flyCameraSavedType = nil
     flyCameraSavedSubject = nil
     flyCameraSavedCFrame = nil
@@ -2364,56 +2981,108 @@ end
 
 player.CharacterAdded:Connect(function(character)
     task.spawn(function()
-        character:WaitForChild("Humanoid", 10)
+        local humanoid = character:WaitForChild("Humanoid", 10)
         character:WaitForChild("HumanoidRootPart", 10)
-        if flyEnabled then
-            task.defer(function()
-                if flyEnabled then
-                    local humanoid, root = getHumanoidAndRoot()
-                    if humanoid and root then
-                        flySaved = nil
-                        saveCharacterState(humanoid, root)
-                        flyMoveControls = getFlyMoveControls()
-                        if flyMoveControls then
-                            pcall(function() flyMoveControls:Enable() end)
-                        end
-                        -- The joystick tracker is persistent across Fly state
-                        -- changes and character respawns. Do not reconnect it
-                        -- here or an already-held touch would be lost.
-                        if flyMoveControls then
-                            pcall(function()
-                                local value = flyMoveControls:GetMoveVector()
-                                if typeof(value) == "Vector3" and value.Magnitude > 0.001 then
-                                    flyJoystickVector = value
-                                end
-                            end)
-                        end
-                        createFlyCollisionProxy()
-                        setFlyNoClip(flyNoClipOn)
-                        humanoid.PlatformStand = true
-                        humanoid.AutoRotate = false
-                        root.Anchored = false
-                        currentMoveVector = Vector3.zero
-                        flyPosition = root.Position
-                        flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
-                        flyFlightPreviousDesiredYaw = flyBodyYaw
-                        loadFlyAnimations(humanoid)
 
-                        -- A respawn replaces the old Humanoid/character.
-                        -- Fly can keep running through the respawn, but the
-                        -- camera state saved before the death must NEVER be
-                        -- restored after the new character exists. Otherwise
-                        -- disabling Fly later sends Roblox back to the exact
-                        -- camera CFrame/subject from the death position.
-                        -- Rebind the saved subject to the new Humanoid and
-                        -- let Roblox rebuild the normal camera from it.
-                        local camera = workspace.CurrentCamera
-                        if camera then
-                            flyCameraSavedSubject = humanoid
-                            flyCameraSavedCFrame = nil
-                        end
-                    end
+        -- A character replacement invalidates every camera state belonging to
+        -- the dead character. Never carry a Scriptable death camera through
+        -- respawn.
+        RunService:UnbindFromRenderStep("VGD_FlyExitCameraHandoff")
+        RunService:UnbindFromRenderStep("VGD_FlyExitCameraSeed")
+        RunService:UnbindFromRenderStep("VGD_FlyCameraHandoff")
+        flyCameraHandoffActive = false
+        flyCameraHandoffRenderConnection = false
+        flyCameraHandoffQuietFrames = 0
+        clearFlyJoystickHandoffBlock()
+        disconnectFlyCameraInput()
+
+        local camera = workspace.CurrentCamera
+        if camera then
+            camera.CameraType = Enum.CameraType.Custom
+            camera.CameraSubject = humanoid
+        end
+
+        if flyEnabled then
+            -- Start a fresh Fly session on the new character. The old
+            -- Humanoid, root, camera CFrame and camera subject are discarded.
+            flySessionId += 1
+            local thisFlySession = flySessionId
+
+            task.defer(function()
+                if not flyEnabled or thisFlySession ~= flySessionId then
+                    return
                 end
+
+                local newHumanoid, root = getHumanoidAndRoot()
+                if not newHumanoid or not root then
+                    flyEnabled = false
+                    stateChangedEvent:Fire(false)
+                    return
+                end
+
+                flySaved = nil
+                saveCharacterState(newHumanoid, root)
+                bindFlyDeathCleanup(newHumanoid, thisFlySession)
+
+                flyMoveControls = getFlyMoveControls()
+                if flyMoveControls then
+                    pcall(function() flyMoveControls:Enable() end)
+                end
+
+                createFlyCollisionProxy()
+                setFlyNoClip(flyNoClipOn)
+                newHumanoid.PlatformStand = true
+                newHumanoid.AutoRotate = false
+                root.Anchored = false
+                currentMoveVector = Vector3.zero
+                flyPosition = root.Position
+                flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
+                flyFlightPreviousDesiredYaw = flyBodyYaw
+                loadFlyAnimations(newHumanoid)
+
+                local newCamera = workspace.CurrentCamera
+                if newCamera then
+                    flyCameraSavedType = Enum.CameraType.Custom
+                    flyCameraSavedSubject = newHumanoid
+                    flyCameraSavedCFrame = newCamera.CFrame
+                    flyCameraSavedFOV = newCamera.FieldOfView
+                    flyCameraSavedMinZoom = player.CameraMinZoomDistance
+                    flyCameraSavedMaxZoom = player.CameraMaxZoomDistance
+
+                    flyCameraPitch, flyCameraYaw = newCamera.CFrame:ToOrientation()
+                    flyCameraTargetPitch = flyCameraPitch
+                    flyCameraTargetYaw = flyCameraYaw
+                    flyBodyYaw = flyCameraYaw
+                    flyFlightPreviousDesiredYaw = flyCameraYaw
+
+                    local subjectPosition = getRobloxCameraSubjectPosition(newHumanoid, root)
+                    local startDistance = (newCamera.CFrame.Position - subjectPosition).Magnitude
+                    flyCameraVerticalOffset = 0
+                    flyCameraZoomDistance = math.clamp(
+                        startDistance,
+                        FLY_CAMERA_ZOOM_MIN,
+                        FLY_CAMERA_ZOOM_MAX
+                    )
+                    flyCameraTargetZoomDistance = flyCameraZoomDistance
+                    flyCameraResetInput()
+                    flySpectatingOtherPlayer = false
+
+                    -- v103: leave Roblox CameraModule fully active after
+                    -- respawn as well. Fly reads its live CFrame; it never
+                    -- takes Scriptable camera ownership.
+                    newCamera.CameraType = Enum.CameraType.Custom
+                    newCamera.CameraSubject = newHumanoid
+                end
+
+                if flyRenderConnection then
+                    RunService:UnbindFromRenderStep("VGD_FlySmooth")
+                end
+                RunService:BindToRenderStep(
+                    "VGD_FlySmooth",
+                    Enum.RenderPriority.Camera.Value + 1,
+                    updateFly
+                )
+                flyRenderConnection = true
             end)
         end
     end)
@@ -2461,7 +3130,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.fromOffset(34, 18)
 versionLabel.Position = UDim2.new(1, -67, 0, 10)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "V62"
+versionLabel.Text = "V102"
 versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
 versionLabel.Font = Enum.Font.Gotham
 versionLabel.TextSize = 9
