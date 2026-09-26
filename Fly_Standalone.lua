@@ -1,4 +1,4 @@
--- VGD Fly Standalone v113.1
+-- VGD Fly Standalone v190
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -12,6 +12,9 @@ local ContextActionService = game:GetService("ContextActionService")
 local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
+
+-- V169 register-pressure fix: group camera state into one local table.
+local flyState = {}
 local flyEnabled = false
 local flySpeed = 35
 local flyMinSpeed = 1
@@ -49,34 +52,34 @@ local flyCameraSavedFOV = nil
 local flyCameraSavedMinZoom = nil
 local flyCameraSavedMaxZoom = nil
 local flySpectatingOtherPlayer = false
-local flyCameraYaw = 0
-local flyCameraPitch = 0
-local flyCameraTargetYaw = 0
-local flyCameraTargetPitch = 0
-local flyCameraZoomDistance = 8
-local flyCameraTargetZoomDistance = 8
-local flyCameraOffset = Vector3.zero
-local flyCameraTouchStates = {}
-local flyCameraZoomTouchPositions = {}
-local flyCameraPinchLastDiameter = nil
-local flyCameraTouchDelta = Vector2.new()
-local flyCameraMouseDelta = Vector2.new()
+flyState.flyCameraYaw = 0
+flyState.flyCameraPitch = 0
+flyState.flyCameraTargetYaw = 0
+flyState.flyCameraTargetPitch = 0
+flyState.flyCameraZoomDistance = 8
+flyState.flyCameraTargetZoomDistance = 8
+flyState.flyCameraOffset = Vector3.zero
+flyState.flyCameraTouchStates = {}
+flyState.flyCameraZoomTouchPositions = {}
+flyState.flyCameraPinchLastDiameter = nil
+flyState.flyCameraTouchDelta = Vector2.new()
+flyState.flyCameraMouseDelta = Vector2.new()
 local flyCameraMouseLooking = false
 local flyCameraConnections = {}
 
 -- v57 camera/flight-feel state. These are visual-only layers; they do not
 -- replace the proven v56 movement/camera ownership architecture.
-local flyCameraVelocityBlend = Vector3.zero
-local flyCameraTurnLag = 0
-local flyCameraFOVBlend = 0
-local flyCameraLastYaw = nil
+flyState.flyCameraVelocityBlend = Vector3.zero
+flyState.flyCameraTurnLag = 0
+flyState.flyCameraFOVBlend = 0
+flyState.flyCameraLastYaw = nil
 local flyCameraLastMoveVector = Vector3.zero
 
-local flyAccelerationBlend = 0
-local flyDecelerationBlend = 0
-local flyDirectionChangeBlend = 0
-local flyPreviousMoveDirection = Vector3.zero
-local flyPreviousSpeed = 0
+flyState.flyAccelerationBlend = 0
+flyState.flyDecelerationBlend = 0
+flyState.flyDirectionChangeBlend = 0
+flyState.flyPreviousMoveDirection = Vector3.zero
+flyState.flyPreviousSpeed = 0
 
 -- Read the same PlayerModule movement vector that Roblox mobile/keyboard
 -- controls use. This keeps the joystick alive when Fly switches Humanoid
@@ -451,7 +454,40 @@ local GUI_CONTROLLED = _G.VGD_Fly_GUIControlled == true
 
 local IDLE_ANIMATION_ID = "rbxassetid://106706162821039"
 local MOVE_ANIMATION_ID = "rbxassetid://92749812489844"
-local BACKWARD_ANIMATION_ID = "rbxassetid://117465215021389"
+local BACKWARD_ANIMATION_ID = "rbxassetid://75806320773060"
+
+-- V178: Startup ON uses the new dedicated takeoff animation normally.
+-- The animation begins in the desired landing/crouch pose, so there is no
+-- reverse playback. Startup blends into frame 0, then releases the animation
+-- immediately into the takeoff and Fly Idle handoff.
+-- Runtime finder confirmed this animation as ID 112472797825991 with a length
+-- of approximately 2.650 seconds.
+local FLY_STARTUP_ANIMATION_ID = "rbxassetid://112472797825991"
+
+-- V181 Startup ON timing: blend into the landing/crouch pose for 0.60s,
+-- then start the asset immediately with no extra pose hold. The physical
+-- root lift waits 0.30s into the asset so the animation can leave the crouch
+-- before the character itself starts rising.
+local FLY_STARTUP_POSE_BLEND_TIME = 0.60
+local FLY_STARTUP_POSE_HOLD_TIME = 0.30
+local FLY_STARTUP_CUT_TIME = 0.90
+
+-- V183: use only the FIRST 4.000 seconds of the dedicated ascend animation.
+-- The source asset is 7.000 seconds long, but only the first 4.000 seconds
+-- are intentionally included. Compress the first 4.000 seconds into 0.60 seconds,
+-- giving approximately a 6.67x playback speed.
+local FLY_STARTUP_ASCEND_ANIMATION_ID = "rbxassetid://89651854762169"
+local FLY_STARTUP_ASCEND_SOURCE_DURATION = 4.00
+local FLY_STARTUP_ASCEND_PLAY_DURATION = 0.60
+local FLY_STARTUP_ASCEND_BLEND_IN = 0.50
+local FLY_STARTUP_ASCEND_FADE_OUT = 0.60
+local FLY_STARTUP_LAUNCH_DELAY = 0.50
+local FLY_STARTUP_LAUNCH_DURATION = 0.60
+local FLY_STARTUP_ASSET_DURATION = 2.65
+-- V169: user-facing master switch. The GUI can turn startup on/off without
+-- changing any of the existing Fly camera, movement, joystick, or idle logic.
+local flyStartupAnimationEnabled = true
+
 
 local forwardBlend = 0
 local rightBlend = 0
@@ -464,6 +500,1135 @@ local currentMoveVector = Vector3.zero
 local hoverBlend = 0
 local flyAnimState = "Idle"
 
+-- v121: true R15 pose/keyframe player.
+--
+-- Research-backed approach:
+-- V151 now prefers a real Roblox Animation asset for the startup. The
+-- procedural Pose.CFrame player remains only as a fallback while the asset
+-- is being authored/published.
+--
+-- During startup the character's Animate script is already disabled by
+-- saveCharacterState(), all Animator tracks are stopped, and this player
+-- writes EVERY R15 joint in PreSimulation. That gives the startup complete
+-- ownership of the rig instead of layering a few limb rotations over the
+-- player's current pose.
+local flyStartupActive = false
+local flyStartupTime = 0
+local flyStartupDuration = FLY_STARTUP_POSE_BLEND_TIME + FLY_STARTUP_POSE_HOLD_TIME + FLY_STARTUP_ASSET_DURATION
+local flyStartupHeight = 4.15
+local flyStartupStartPosition = nil
+local flyStartupPoseJoints = nil
+local flyStartupJointBases = nil
+local flyStartupPreSimulationConnection = nil
+local flyStartupSuppressedTracks = {}
+
+-- V169 existing-emote AnimationTrack startup path.
+local flyStartupAnimationTrack = nil
+local flyStartupAnimationStoppedConnection = nil
+local flyStartupAnimationMonitorConnection = nil
+local flyStartupAnimationReady = false
+local flyStartupAssetActive = false
+local flyStartupLaunchActive = false
+local flyStartupLaunchTime = 0
+local flyStartupAscendTrack = nil
+local flyStartupAscendStoppedConnection = nil
+local flyStartupFinalBlendActive = false
+local flyStartupFinalBlendTime = 0
+
+-- V126 controlled joint diagnostic. This deliberately runs BEFORE the
+-- procedural startup animation so we can prove that the live avatar rig
+-- accepts PreSimulation Transform writes without changing camera/movement.
+local flyJointDiagnosticActive = false
+local flyJointDiagnosticTime = 0
+local flyJointDiagnosticDuration = 1.8
+local flyJointDiagnosticJoint = nil
+local flyJointDiagnosticClass = "None"
+local flyJointDiagnosticBodyPart = "RightUpperArm"
+
+local function findJointForBodyPart(character, bodyPartName)
+    if not character or not bodyPartName then return nil, "None" end
+
+    -- Standard Motor6D R15: Part1 is the child body part controlled by
+    -- this joint.
+    for _, instance in ipairs(character:GetDescendants()) do
+        if instance:IsA("Motor6D") then
+            local part1 = instance.Part1
+            if part1 and part1.Name == bodyPartName then
+                return instance, "Motor6D"
+            end
+        end
+    end
+
+    -- Avatar Joint Upgrade / AnimationConstraint R15: Attachment1.Parent is
+    -- the child body part controlled by this constraint.
+    for _, instance in ipairs(character:GetDescendants()) do
+        if instance:IsA("AnimationConstraint") then
+            local attachment1 = instance.Attachment1
+            local parentPart = attachment1 and attachment1.Parent
+            if parentPart and parentPart.Name == bodyPartName then
+                return instance, "AnimationConstraint"
+            end
+        end
+    end
+
+    -- Fallback for rigs that retain the classic joint name.
+    local fallback = character:FindFirstChild("RightShoulder", true)
+    if fallback and (fallback:IsA("Motor6D") or fallback:IsA("AnimationConstraint")) then
+        return fallback, fallback.ClassName
+    end
+
+    return nil, "None"
+end
+
+local function beginFlyJointDiagnostic(character)
+    flyJointDiagnosticActive = true
+    flyJointDiagnosticTime = 0
+    flyJointDiagnosticJoint, flyJointDiagnosticClass =
+        findJointForBodyPart(character, flyJointDiagnosticBodyPart)
+
+    print(string.format(
+        "[VGD Fly V127] JOINT TEST: %s -> %s (%s)",
+        flyJointDiagnosticBodyPart,
+        flyJointDiagnosticJoint and flyJointDiagnosticJoint:GetFullName() or "NOT FOUND",
+        flyJointDiagnosticClass
+    ))
+end
+
+local function stopFlyJointDiagnostic()
+    flyJointDiagnosticActive = false
+    flyJointDiagnosticTime = 0
+
+    if flyStartupPoseJoints then
+        for _, joint in pairs(flyStartupPoseJoints) do
+            if joint and joint.Parent then
+                pcall(function() joint.Transform = CFrame.identity end)
+            end
+        end
+    end
+end
+
+local function updateFlyJointDiagnostic(dt)
+    if not flyJointDiagnosticActive then return false end
+
+    flyJointDiagnosticTime += math.max(dt or 0, 0)
+
+    -- Reset every cached joint so the diagnostic cannot accidentally inherit
+    -- a player animation pose. Only the selected shoulder receives motion.
+    if flyStartupPoseJoints then
+        for _, joint in pairs(flyStartupPoseJoints) do
+            if joint and joint.Parent then
+                pcall(function() joint.Transform = CFrame.identity end)
+            end
+        end
+    end
+
+    local joint = flyJointDiagnosticJoint
+    if joint and joint.Parent then
+        local t = flyJointDiagnosticTime
+        local phase = math.floor(t / 0.6) % 3
+        local angle = math.rad(90)
+        local transform
+
+        if phase == 0 then
+            transform = CFrame.Angles(0, 0, angle)
+        elseif phase == 1 then
+            transform = CFrame.Angles(angle, 0, 0)
+        else
+            transform = CFrame.Angles(0, angle, 0)
+        end
+
+        pcall(function() joint.Transform = transform end)
+    end
+
+    return flyJointDiagnosticTime < flyJointDiagnosticDuration
+end
+
+local R15_STARTUP_JOINTS = {
+    "Root",
+    "Waist",
+    "Neck",
+
+    "LeftShoulder",
+    "LeftElbow",
+    "LeftWrist",
+
+    "RightShoulder",
+    "RightElbow",
+    "RightWrist",
+
+    "LeftHip",
+    "LeftKnee",
+    "LeftAnkle",
+
+    "RightHip",
+    "RightKnee",
+    "RightAnkle",
+}
+
+local function suppressStartupAnimatorTracks(humanoid)
+    if not humanoid then return end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return end
+
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        if track and track.IsPlaying then
+            flyStartupSuppressedTracks[track] = true
+            pcall(function()
+                track:AdjustWeight(0, 0)
+                track:Stop(0)
+            end)
+        end
+    end
+end
+
+local function maintainStartupAnimatorSuppression(humanoid)
+    if not humanoid then return end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return end
+
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        pcall(function()
+            track:AdjustWeight(0, 0)
+            track:Stop(0)
+        end)
+    end
+end
+
+local function clearStartupAnimatorSuppression()
+    table.clear(flyStartupSuppressedTracks)
+end
+
+local function cacheFlyStartupJoints(character)
+    flyStartupPoseJoints = {}
+    flyStartupJointBases = {}
+
+    -- IMPORTANT: Roblox animation Pose channels are named after BODY PARTS,
+    -- not after Motor6D objects. The corresponding joint is the Motor6D /
+    -- AnimationConstraint connecting that body part to its parent.
+    --
+    -- Previous versions found joints by their joint names ("LeftHip",
+    -- "LeftKnee", etc.) and then attempted to convert the authored pose
+    -- through C0.Rotation. That was not equivalent to Roblox's animation
+    -- system and was the main reason the crouch could look like a torso bend.
+    for _, channelName in ipairs(R15_STARTUP_JOINTS) do
+        local info = R15_POSE_PARTS[channelName]
+        local joint = info and findJointForBodyPart(character, info.part)
+
+        if joint then
+            flyStartupPoseJoints[channelName] = joint
+
+            -- Pose.CFrame is already the animation Transform. Do NOT convert
+            -- it through C0.Rotation. Roblox applies the Pose CFrame directly
+            -- to the corresponding joint's Transform.
+            flyStartupJointBases[channelName] = nil
+
+            pcall(function()
+                joint.Transform = CFrame.identity
+            end)
+        end
+    end
+end
+
+local function setStartupTransform(name, transform)
+    local joint = flyStartupPoseJoints and flyStartupPoseJoints[name]
+    if not joint or not joint.Parent then return end
+
+    -- V150: direct Pose.CFrame -> Transform mapping.
+    -- This matches Roblox's documented animation path and removes the custom
+    -- basis conversion that was distorting the authored R15 axes.
+    pcall(function()
+        joint.Transform = transform
+    end)
+end
+
+local function clearFlyStartupPose()
+    if flyStartupPoseJoints then
+        for _, joint in pairs(flyStartupPoseJoints) do
+            if joint and joint.Parent then
+                pcall(function()
+                    joint.Transform = CFrame.identity
+                end)
+            end
+        end
+    end
+
+    flyStartupPoseJoints = nil
+    flyStartupJointBases = nil
+    clearStartupAnimatorSuppression()
+end
+
+local function d(x, y, z)
+    return CFrame.Angles(
+        math.rad(x or 0),
+        math.rad(y or 0),
+        math.rad(z or 0)
+    )
+end
+
+local function pose(...)
+    return {...}
+end
+
+-- These are deliberately authored as FULL R15 poses rather than target
+-- positions. Each keyframe specifies the visible relationship of the whole
+-- body. Missing joints are never left with a previous keyframe's value.
+--
+-- R15 animation convention:
+--   Root       -> HumanoidRootPart -> LowerTorso
+--   Waist      -> LowerTorso -> UpperTorso
+--   Neck       -> UpperTorso -> Head
+-- and the remaining entries correspond to their named R15 joints.
+--
+-- The airborne pose is asymmetric: one arm leads, the other trails, and the
+-- legs are staggered. This creates a readable superhero-flight silhouette.
+-- V126: runtime KeyframeSequence-style R15 player.
+--
+-- Research-backed change: Roblox KeyframeSequence animation data is a
+-- hierarchy of Keyframes -> Pose objects. Pose.CFrame is the value that is
+-- ultimately applied to the corresponding Motor6D.Transform. For a normal
+-- R15 rig the Pose hierarchy is based on the connected BaseParts, not the
+-- Motor6D names. Because a locally-created KeyframeSequence cannot simply be
+-- played through Animator without an uploaded Animation asset, V126 builds
+-- that exact hierarchy in memory and runs the timeline locally. This mirrors
+-- the open-source runtime KeyframeSequence players while retaining complete
+-- client-side control of the startup.
+--
+-- Sources used while rebuilding this layer:
+-- Roblox Keyframe documentation: Keyframes contain Pose hierarchies and Pose
+-- CFrames are interpolated over time.
+-- Roblox KeyframeSequence documentation: KeyframeSequence can be instantiated
+-- in code and contains Keyframes.
+-- DevForum runtime KeyframeSequence player examples: read the sequence,
+-- interpolate Pose.CFrame values, and apply them to Motor6D.Transform.
+
+local flyStartupSequence = nil
+local flyStartupPoseMap = nil
+
+local R15_POSE_PARTS = {
+    Root = {part = "LowerTorso", parent = "HumanoidRootPart"},
+    Waist = {part = "UpperTorso", parent = "LowerTorso"},
+    Neck = {part = "Head", parent = "UpperTorso"},
+
+    LeftShoulder = {part = "LeftUpperArm", parent = "UpperTorso"},
+    LeftElbow = {part = "LeftLowerArm", parent = "LeftUpperArm"},
+    LeftWrist = {part = "LeftHand", parent = "LeftLowerArm"},
+
+    RightShoulder = {part = "RightUpperArm", parent = "UpperTorso"},
+    RightElbow = {part = "RightLowerArm", parent = "RightUpperArm"},
+    RightWrist = {part = "RightHand", parent = "RightLowerArm"},
+
+    LeftHip = {part = "LeftUpperLeg", parent = "LowerTorso"},
+    LeftKnee = {part = "LeftLowerLeg", parent = "LeftUpperLeg"},
+    LeftAnkle = {part = "LeftFoot", parent = "LeftLowerLeg"},
+
+    RightHip = {part = "RightUpperLeg", parent = "LowerTorso"},
+    RightKnee = {part = "RightLowerLeg", parent = "RightUpperLeg"},
+    RightAnkle = {part = "RightFoot", parent = "RightLowerLeg"},
+}
+
+local function suppressStartupAnimatorTracks(humanoid)
+    if not humanoid then return end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return end
+
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        if track and track.IsPlaying then
+            flyStartupSuppressedTracks[track] = true
+            pcall(function()
+                track:AdjustWeight(0, 0)
+                track:Stop(0)
+            end)
+        end
+    end
+end
+
+local function maintainStartupAnimatorSuppression(humanoid)
+    if not humanoid then return end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return end
+
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        pcall(function()
+            track:AdjustWeight(0, 0)
+            track:Stop(0)
+        end)
+    end
+end
+
+local function clearStartupAnimatorSuppression()
+    table.clear(flyStartupSuppressedTracks)
+end
+
+local function cacheFlyStartupJoints(character)
+    flyStartupPoseJoints = {}
+    flyStartupJointBases = {}
+
+    -- V150 IMPORTANT:
+    -- This is the ACTIVE definition (Lua uses the last function definition).
+    -- Resolve each animation channel by the R15 BODY PART it controls, exactly
+    -- like Roblox Pose -> Motor6D.Transform animation mapping. Do not resolve
+    -- by Motor6D object name and do not apply a C0.Rotation basis conversion.
+    for _, channelName in ipairs(R15_STARTUP_JOINTS) do
+        local info = R15_POSE_PARTS[channelName]
+        local joint = info and findJointForBodyPart(character, info.part)
+
+        if joint then
+            flyStartupPoseJoints[channelName] = joint
+            flyStartupJointBases[channelName] = nil
+
+            pcall(function()
+                joint.Transform = CFrame.identity
+            end)
+        end
+    end
+end
+
+local function setStartupTransform(name, transform)
+    local joint = flyStartupPoseJoints and flyStartupPoseJoints[name]
+    if not joint or not joint.Parent then return end
+
+    -- V150: Pose.CFrame is written directly to the resolved joint Transform.
+    pcall(function()
+        joint.Transform = transform
+    end)
+end
+
+local function clearFlyStartupPose()
+    if flyStartupPoseJoints then
+        for _, joint in pairs(flyStartupPoseJoints) do
+            if joint and joint.Parent then
+                pcall(function()
+                    joint.Transform = CFrame.identity
+                end)
+            end
+        end
+    end
+
+    flyStartupPoseJoints = nil
+    flyStartupSequence = nil
+    flyStartupPoseMap = nil
+    clearStartupAnimatorSuppression()
+end
+
+local function d(x, y, z)
+    return CFrame.Angles(
+        math.rad(x or 0),
+        math.rad(y or 0),
+        math.rad(z or 0)
+    )
+end
+
+local function pose(...)
+    return {...}
+end
+
+-- V151 fallback R15 startup choreography.
+--
+-- Deep-research / runtime-mapping correction:
+-- V147 now has a real lower-body bend, but in the actual camera view the
+-- crouch still reads as a small dip rather than a deliberate superhero
+-- preparation. V148 makes the crouch visually unambiguous by:
+--   * keeping the chest/waist almost neutral
+--   * dropping the entire body farther
+--   * using a stronger knee fold
+--   * keeping the crouch for a longer readable beat
+--   * delaying the arm/torso launch pose until AFTER the squat is complete
+--
+-- Both arms remain at the sides.
+-- V151 keeps the corrected procedural path as a fallback while the real Animation asset is used as the primary path:
+-- Pose.CFrame is written directly to the joint Transform in PreSimulation,
+-- with each channel resolved from its corresponding R15 body part. This is
+-- the documented Roblox animation path. The crouch values below are therefore
+-- now interpreted in the same local joint space as an actual R15 animation.
+local STARTUP_POSES = {
+    -- HYBRID V169 PREVIEW TIMELINE
+    -- This is the same choreography we intend to author as the final Roblox
+    -- Animation asset later. The procedural path remains only as a mobile-
+    -- testable preview; the published AnimationId will become the primary path.
+    {
+        time = 0.00,
+        pose = pose(
+            {"Root", CFrame.identity}, {"Waist", CFrame.identity}, {"Neck", CFrame.identity},
+            {"LeftShoulder", d(0,0,-2)}, {"LeftElbow", d(0,0,-2)}, {"LeftWrist", CFrame.identity},
+            {"RightShoulder", d(0,0,2)}, {"RightElbow", d(0,0,2)}, {"RightWrist", CFrame.identity},
+            {"LeftHip", d(0,0,-1)}, {"LeftKnee", d(0,0,1)}, {"LeftAnkle", CFrame.identity},
+            {"RightHip", d(0,0,1)}, {"RightKnee", d(0,0,-1)}, {"RightAnkle", CFrame.identity}
+        ),
+    },
+
+    -- 0.14s: anticipation begins. Keep chest almost neutral.
+    {
+        time = 0.14,
+        pose = pose(
+            {"Root", d(-2,0,0)}, {"Waist", d(-1,0,0)}, {"Neck", d(1,0,0)},
+            {"LeftShoulder", d(-2,0,-3)}, {"LeftElbow", d(7,0,-2)}, {"LeftWrist", d(2,0,0)},
+            {"RightShoulder", d(-2,0,3)}, {"RightElbow", d(7,0,2)}, {"RightWrist", d(2,0,0)},
+            {"LeftHip", d(-4,0,-2)}, {"LeftKnee", d(58,0,0)}, {"LeftAnkle", d(-20,0,-2)},
+            {"RightHip", d(-4,0,2)}, {"RightKnee", d(58,0,0)}, {"RightAnkle", d(-20,0,2)}
+        ),
+    },
+
+    -- 0.28s: deep crouch. This is deliberately held as a readable silhouette.
+    {
+        time = 0.28,
+        pose = pose(
+            {"Root", d(-3,0,0)}, {"Waist", d(-2,0,0)}, {"Neck", d(1,0,0)},
+            {"LeftShoulder", d(-3,0,-4)}, {"LeftElbow", d(10,0,-2)}, {"LeftWrist", d(3,0,0)},
+            {"RightShoulder", d(-3,0,4)}, {"RightElbow", d(10,0,2)}, {"RightWrist", d(3,0,0)},
+            {"LeftHip", d(-26,0,-3)}, {"LeftKnee", d(124,0,0)}, {"LeftAnkle", d(-38,0,-3)},
+            {"RightHip", d(-26,0,3)}, {"RightKnee", d(124,0,0)}, {"RightAnkle", d(-38,0,3)}
+        ),
+    },
+
+    -- 0.40s: anticipation hold. Root trajectory supplies the extra visual drop.
+    {
+        time = 0.40,
+        pose = pose(
+            {"Root", d(-3,0,0)}, {"Waist", d(-2,0,0)}, {"Neck", d(1,0,0)},
+            {"LeftShoulder", d(-3,0,-4)}, {"LeftElbow", d(10,0,-2)}, {"LeftWrist", d(3,0,0)},
+            {"RightShoulder", d(-3,0,4)}, {"RightElbow", d(10,0,2)}, {"RightWrist", d(3,0,0)},
+            {"LeftHip", d(-26,0,-3)}, {"LeftKnee", d(124,0,0)}, {"LeftAnkle", d(-38,0,-3)},
+            {"RightHip", d(-26,0,3)}, {"RightKnee", d(124,0,0)}, {"RightAnkle", d(-38,0,3)}
+        ),
+    },
+
+    -- 0.46s: explosive extension. Arms remain beside the torso.
+    {
+        time = 0.46,
+        pose = pose(
+            {"Root", d(4,0,0)}, {"Waist", d(3,0,0)}, {"Neck", d(-1,0,0)},
+            {"LeftShoulder", d(-8,-1,-10)}, {"LeftElbow", d(22,-1,-2)}, {"LeftWrist", d(5,0,0)},
+            {"RightShoulder", d(-8,1,10)}, {"RightElbow", d(22,1,2)}, {"RightWrist", d(5,0,0)},
+            {"LeftHip", d(-8,-1,-2)}, {"LeftKnee", d(30,0,0)}, {"LeftAnkle", d(-10,0,-2)},
+            {"RightHip", d(-8,1,2)}, {"RightKnee", d(30,0,0)}, {"RightAnkle", d(-10,0,2)}
+        ),
+    },
+
+    -- 0.56s: feet leaving the ground.
+    {
+        time = 0.56,
+        pose = pose(
+            {"Root", d(-6,-1,0)}, {"Waist", d(-3,-1,0)}, {"Neck", d(2,0,0)},
+            {"LeftShoulder", d(-15,-2,-16)}, {"LeftElbow", d(35,-1,-2)}, {"LeftWrist", d(7,0,0)},
+            {"RightShoulder", d(-15,2,16)}, {"RightElbow", d(35,1,2)}, {"RightWrist", d(7,0,0)},
+            {"LeftHip", d(10,-2,-2)}, {"LeftKnee", d(5,0,0)}, {"LeftAnkle", d(-2,0,-2)},
+            {"RightHip", d(10,2,2)}, {"RightKnee", d(5,0,0)}, {"RightAnkle", d(-2,0,2)}
+        ),
+    },
+
+    -- 0.72s: airborne superhero silhouette.
+    {
+        time = 0.72,
+        pose = pose(
+            {"Root", d(-10,0,-4)}, {"Waist", d(-6,0,-2)}, {"Neck", d(3,0,1)},
+            {"LeftShoulder", d(-14,-2,-15)}, {"LeftElbow", d(32,-1,-2)}, {"LeftWrist", d(7,0,0)},
+            {"RightShoulder", d(-14,2,15)}, {"RightElbow", d(32,1,2)}, {"RightWrist", d(7,0,0)},
+            {"LeftHip", d(8,-2,-2)}, {"LeftKnee", d(0,0,0)}, {"LeftAnkle", d(1,0,-1)},
+            {"RightHip", d(8,2,2)}, {"RightKnee", d(0,0,0)}, {"RightAnkle", d(1,0,1)}
+        ),
+    },
+
+    -- 0.92s: brief held pose with only a tiny secondary settling motion.
+    {
+        time = 0.92,
+        pose = pose(
+            {"Root", d(-7,0,-2)}, {"Waist", d(-4,0,-1)}, {"Neck", d(2,0,1)},
+            {"LeftShoulder", d(-10,-2,-11)}, {"LeftElbow", d(25,-1,-2)}, {"LeftWrist", d(5,0,0)},
+            {"RightShoulder", d(-10,2,11)}, {"RightElbow", d(25,1,2)}, {"RightWrist", d(5,0,0)},
+            {"LeftHip", d(6,-2,-2)}, {"LeftKnee", d(1,0,0)}, {"LeftAnkle", d(1,0,-1)},
+            {"RightHip", d(6,2,2)}, {"RightKnee", d(1,0,0)}, {"RightAnkle", d(1,0,1)}
+        ),
+    },
+
+    -- 1.12s: settle toward the existing Fly Idle silhouette.
+    {
+        time = 1.12,
+        pose = pose(
+            {"Root", d(-3,0,-1)}, {"Waist", d(-2,0,0)}, {"Neck", d(1,0,0)},
+            {"LeftShoulder", d(-5,0,-6)}, {"LeftElbow", d(12,0,-1)}, {"LeftWrist", d(2,0,0)},
+            {"RightShoulder", d(-5,0,6)}, {"RightElbow", d(12,0,1)}, {"RightWrist", d(2,0,0)},
+            {"LeftHip", d(4,0,-1)}, {"LeftKnee", d(2,0,0)}, {"LeftAnkle", CFrame.identity},
+            {"RightHip", d(4,0,1)}, {"RightKnee", d(2,0,0)}, {"RightAnkle", CFrame.identity}
+        ),
+    },
+
+    -- 1.30s: near-idle.
+    {
+        time = 1.30,
+        pose = pose(
+            {"Root", d(-1,0,0)}, {"Waist", d(-1,0,0)}, {"Neck", d(1,0,0)},
+            {"LeftShoulder", d(-3,0,-3)}, {"LeftElbow", d(7,0,-1)}, {"LeftWrist", d(1,0,0)},
+            {"RightShoulder", d(-3,0,3)}, {"RightElbow", d(7,0,1)}, {"RightWrist", d(1,0,0)},
+            {"LeftHip", d(4,0,-1)}, {"LeftKnee", d(2,0,0)}, {"LeftAnkle", CFrame.identity},
+            {"RightHip", d(4,0,1)}, {"RightKnee", d(2,0,0)}, {"RightAnkle", CFrame.identity}
+        ),
+    },
+
+    -- 1.42s: clean handoff pose.
+    {
+        time = 1.42,
+        pose = pose(
+            {"Root", CFrame.identity}, {"Waist", CFrame.identity}, {"Neck", CFrame.identity},
+            {"LeftShoulder", CFrame.identity}, {"LeftElbow", CFrame.identity}, {"LeftWrist", CFrame.identity},
+            {"RightShoulder", CFrame.identity}, {"RightElbow", CFrame.identity}, {"RightWrist", CFrame.identity},
+            {"LeftHip", CFrame.identity}, {"LeftKnee", CFrame.identity}, {"LeftAnkle", CFrame.identity},
+            {"RightHip", CFrame.identity}, {"RightKnee", CFrame.identity}, {"RightAnkle", CFrame.identity}
+        ),
+    },
+}
+
+local function buildRuntimeKeyframeSequence()
+    local sequence = Instance.new("KeyframeSequence")
+    sequence.Name = "VGD_FlyStartup_V169_Fallback"
+    sequence.Loop = false
+    sequence.Priority = Enum.AnimationPriority.Action
+
+    local function makePose(name, cframe)
+        local p = Instance.new("Pose")
+        p.Name = name
+        p.CFrame = cframe
+        p.Weight = 1
+        p.EasingStyle = Enum.PoseEasingStyle.Cubic
+        p.EasingDirection = Enum.PoseEasingDirection.In
+        return p
+    end
+
+    local function buildTree(parentPose, poseEntries)
+        local nodes = {}
+        for _, entry in ipairs(poseEntries) do
+            nodes[entry[1]] = makePose(
+                R15_POSE_PARTS[entry[1]].part,
+                entry[2]
+            )
+        end
+
+        -- Root is represented by the LowerTorso Pose under HumanoidRootPart.
+        local root = makePose("HumanoidRootPart", CFrame.identity)
+        root.Weight = 0
+        root.Parent = parentPose
+
+        for jointName, info in pairs(R15_POSE_PARTS) do
+            local node = nodes[jointName]
+            if node then
+                local parentNode = root
+                for otherName, otherInfo in pairs(R15_POSE_PARTS) do
+                    if otherInfo.part == info.parent then
+                        parentNode = nodes[otherName] or root
+                        break
+                    end
+                end
+                node.Parent = parentNode
+            end
+        end
+    end
+
+    for _, authored in ipairs(STARTUP_POSES) do
+        local keyframe = Instance.new("Keyframe")
+        keyframe.Time = authored.time
+        buildTree(keyframe, authored.pose)
+        keyframe.Parent = sequence
+    end
+
+    return sequence
+end
+
+local function buildStartupPoseMap(sequence)
+    local map = {}
+    for _, keyframe in ipairs(sequence:GetKeyframes()) do
+        local frame = {time = keyframe.Time, joints = {}}
+        for _, poseObject in ipairs(keyframe:GetDescendants()) do
+            if poseObject:IsA("Pose") then
+                local partName = poseObject.Name
+                for jointName, info in pairs(R15_POSE_PARTS) do
+                    if info.part == partName then
+                        frame.joints[jointName] = poseObject.CFrame
+                        break
+                    end
+                end
+            end
+        end
+        table.insert(map, frame)
+    end
+    table.sort(map, function(a, b) return a.time < b.time end)
+    return map
+end
+
+local function getStartupPoseAtTime(seconds)
+    local frames = flyStartupPoseMap
+    if not frames or #frames == 0 then return nil, nil, 0 end
+
+    local previous = frames[1]
+    local nextFrame = frames[#frames]
+
+    for i = 2, #frames do
+        if seconds <= frames[i].time then
+            previous = frames[i - 1]
+            nextFrame = frames[i]
+            break
+        end
+    end
+
+    local span = math.max(nextFrame.time - previous.time, 0.0001)
+    local rawAlpha = math.clamp((seconds - previous.time) / span, 0, 1)
+
+    -- Smoothstep: 3a^2 - 2a^3.  It gives zero velocity at each authored
+    -- pose endpoint, so the joints do not travel at a constant robotic rate.
+    local alpha = rawAlpha * rawAlpha * (3 - 2 * rawAlpha)
+
+    return previous, nextFrame, alpha
+end
+
+local function applySuperheroTakeoffPose(seconds)
+    if not flyStartupPoseJoints then return end
+
+    local previous, nextFrame, alpha = getStartupPoseAtTime(seconds)
+    if not previous or not nextFrame then return end
+
+    for _, name in ipairs(R15_STARTUP_JOINTS) do
+        local a = previous.joints[name] or CFrame.identity
+        local b = nextFrame.joints[name] or CFrame.identity
+        setStartupTransform(name, a:Lerp(b, alpha))
+    end
+end
+
+-- V127: forward declaration because the startup PreSimulation driver
+-- is defined before the character helper implementation.
+local getHumanoidAndRoot
+
+local function startFlyStartupPoseDriver()
+    if flyStartupPreSimulationConnection then
+        flyStartupPreSimulationConnection:Disconnect()
+        flyStartupPreSimulationConnection = nil
+    end
+
+    if flyStartupAssetActive then
+        -- V169: a real AnimationTrack owns the startup pose. Do not also
+        -- write Motor6D.Transform procedurally, or the two animation systems
+        -- would fight each other.
+        return
+    end
+
+    flyStartupSequence = buildRuntimeKeyframeSequence()
+    flyStartupPoseMap = buildStartupPoseMap(flyStartupSequence)
+
+    flyStartupPreSimulationConnection = RunService.PreSimulation:Connect(function()
+        if not flyEnabled or not flyStartupActive then
+            return
+        end
+
+        local humanoid = getHumanoidAndRoot()
+        maintainStartupAnimatorSuppression(humanoid)
+
+        -- V127 diagnostic has priority over the startup player. It proves the
+        -- actual live joint type and Transform write path before we spend any
+        -- more time tuning the superhero choreography.
+        if flyJointDiagnosticActive then
+            updateFlyJointDiagnostic(1 / 60)
+            return
+        end
+
+        -- This is the runtime equivalent of an AnimationTrack playing the
+        -- KeyframeSequence. The timeline is continuous, and each joint is
+        -- interpolated between the surrounding Pose.CFrame values.
+        applySuperheroTakeoffPose(flyStartupTime)
+    end)
+end
+
+local function stopFlyStartupAnimation()
+    if flyStartupAnimationStoppedConnection then
+        flyStartupAnimationStoppedConnection:Disconnect()
+        flyStartupAnimationStoppedConnection = nil
+    end
+
+    if flyStartupAnimationMonitorConnection then
+        flyStartupAnimationMonitorConnection:Disconnect()
+        flyStartupAnimationMonitorConnection = nil
+    end
+
+    local track = flyStartupAnimationTrack
+    flyStartupAnimationTrack = nil
+    flyStartupAnimationReady = false
+    flyStartupAssetActive = false
+    flyStartupFinalBlendActive = false
+    flyStartupFinalBlendTime = 0
+
+    if track then
+        pcall(function()
+            track:AdjustWeight(0, 0.10)
+        end)
+        pcall(function()
+            track:AdjustSpeed(0)
+        end)
+        pcall(function()
+            track:Stop(0.10)
+        end)
+        pcall(function()
+            track:Destroy()
+        end)
+    end
+
+    if flyStartupAscendStoppedConnection then
+        flyStartupAscendStoppedConnection:Disconnect()
+        flyStartupAscendStoppedConnection = nil
+    end
+    local ascendTrack = flyStartupAscendTrack
+    flyStartupAscendTrack = nil
+    if ascendTrack then
+        pcall(function() ascendTrack:AdjustSpeed(0) end)
+        pcall(function() ascendTrack:AdjustWeight(0, 0.10) end)
+        pcall(function() ascendTrack:Stop(0.10) end)
+        pcall(function() ascendTrack:Destroy() end)
+    end
+end
+
+local function startNormalFlyAnimationSet(smoothBlend)
+    local humanoidNow = getHumanoidAndRoot()
+    if not humanoidNow then
+        return
+    end
+
+    local animate = flyAnimateScript
+    local idle = flyTracks.idle
+    local move = flyTracks.move
+    local backward = flyTracks.backward
+
+    -- V169: true crossfade handoff. Roblox's live idle remains untouched while
+    -- the Fly Idle track starts at ZERO weight. The per-frame animation blender
+    -- then raises Fly Idle naturally; we do NOT call AdjustWeight(1, 0.22)
+    -- here, because that creates the chunky jump the previous build showed.
+    --
+    -- The important part is the order:
+    --   Roblox Idle (100%) -> Fly Idle (0% -> ~100%) -> disable Animate
+    --
+    -- Animate is disabled only after the incoming Fly Idle has had enough time
+    -- to reach essentially full weight. PlatformStand is also delayed until
+    -- after that handoff, so Roblox cannot replace the live idle with its
+    -- platform-standing pose halfway through the crossfade.
+    if idle then
+        if smoothBlend then
+            idle:Play(0, 0, 1)
+            idle:AdjustWeight(0, 0)
+        else
+            idle:Play(0, 1, 1)
+            idle:AdjustWeight(1, 0)
+        end
+    end
+
+    if move then
+        move:Play(0, 0, 1)
+        move:AdjustWeight(0, 0)
+    end
+    if backward then
+        backward:Play(0, 0, 1)
+        backward:AdjustWeight(0, 0)
+    end
+
+    flyIdleWeight = smoothBlend and 0 or 1
+    flyMoveWeight = 0
+    flyBackwardWeight = 0
+    flyAnimState = "Idle"
+
+    if smoothBlend then
+        -- V169: DO NOT disable Roblox Animate at the end of the handoff.
+        -- The Fly tracks already use Action priority, so they can blend over
+        -- the live Roblox idle without forcing the Animator to rebuild the
+        -- pose on one frame. Disabling Animate here was the remaining source
+        -- of the visible Startup OFF snap after PlatformStand was removed.
+        task.delay(0.90, function()
+            if not flyEnabled or flyStartupActive then
+                return
+            end
+
+            flyIdleWeight = 1
+        end)
+    else
+        if animate and animate.Parent
+            and (animate:IsA("LocalScript") or animate:IsA("Script")) then
+            animate.Disabled = true
+        end
+    end
+
+end
+
+local function finishFlyStartupAnimation()
+    if not flyEnabled or not flyStartupActive then
+        return
+    end
+
+    flyStartupAssetActive = false
+    flyStartupAnimationReady = false
+    flyStartupActive = false
+    flyStartupTime = 0
+    flyStartupStartPosition = nil
+
+    if flyStartupAnimationMonitorConnection then
+        flyStartupAnimationMonitorConnection:Disconnect()
+        flyStartupAnimationMonitorConnection = nil
+    end
+
+    if flyStartupAnimationStoppedConnection then
+        flyStartupAnimationStoppedConnection:Disconnect()
+        flyStartupAnimationStoppedConnection = nil
+    end
+
+    local track = flyStartupAnimationTrack
+    flyStartupAnimationTrack = nil
+    if track then
+        pcall(function()
+            track:AdjustSpeed(0)
+            track:AdjustWeight(0, 0.12)
+            track:Stop(0.12)
+        end)
+        pcall(function()
+            track:Destroy()
+        end)
+    end
+
+    clearStartupAnimatorSuppression()
+    -- Fade from the final startup pose into Fly Idle instead of replacing it
+    -- on one frame. This is the same incoming-track handoff used by Startup OFF.
+    startNormalFlyAnimationSet(true)
+
+end
+
+local function startFlyStartupAscendAnimation(humanoid)
+    if not humanoid then
+        return false
+    end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then
+        animator = Instance.new("Animator")
+        animator.Parent = humanoid
+    end
+
+    local animation = Instance.new("Animation")
+    animation.Name = "VGD_FlyStartupAscend_V183"
+    animation.AnimationId = FLY_STARTUP_ASCEND_ANIMATION_ID
+    animation.Parent = humanoid
+
+    local ok, track = pcall(function()
+        return animator:LoadAnimation(animation)
+    end)
+    animation:Destroy()
+    if not ok or not track then
+        return false
+    end
+
+    track.Priority = Enum.AnimationPriority.Action4
+    track.Looped = false
+    flyStartupAscendTrack = track
+
+    -- Start invisible and frozen at frame 0. The weight ramp supplies the
+    -- 0.90 -> 1.40s crouch-to-ascend transition.
+    track:Play(0, 0.001, 0)
+    track.TimePosition = 0
+    track:AdjustWeight(0, 0)
+    track:AdjustSpeed(FLY_STARTUP_ASCEND_SOURCE_DURATION / FLY_STARTUP_ASCEND_PLAY_DURATION)
+    track:AdjustWeight(1, FLY_STARTUP_ASCEND_BLEND_IN)
+
+    flyStartupAscendStoppedConnection = track.Stopped:Connect(function()
+        if flyStartupAscendTrack == track then
+            flyStartupAscendTrack = nil
+        end
+    end)
+
+    -- Keep the final ascend pose visible until the 1.40 -> 2.00s Fly Idle
+    -- handoff is complete, then clean the track up.
+    task.delay(FLY_STARTUP_ASCEND_PLAY_DURATION, function()
+        if flyStartupAscendTrack ~= track then
+            return
+        end
+        track:AdjustSpeed(0)
+    end)
+
+    return true
+end
+
+local function startFlyStartupAnimation(humanoid)
+    stopFlyStartupAnimation()
+
+    if not humanoid or FLY_STARTUP_ANIMATION_ID == "" then
+        return false
+    end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then
+        animator = Instance.new("Animator")
+        animator.Parent = humanoid
+    end
+
+    local animation = Instance.new("Animation")
+    animation.Name = "VGD_FlyStartup_V181"
+    animation.AnimationId = FLY_STARTUP_ANIMATION_ID
+    animation.Parent = humanoid
+
+    local ok, track = pcall(function()
+        return animator:LoadAnimation(animation)
+    end)
+    animation:Destroy()
+
+    if not ok or not track then
+        return false
+    end
+
+    track.Priority = Enum.AnimationPriority.Action4
+    track.Looped = false
+
+    flyStartupAnimationTrack = track
+    flyStartupAssetActive = true
+    flyStartupAnimationReady = false
+
+    -- V181: Startup ON begins from frame 0 of the new dedicated takeoff
+    -- animation. Keep the track frozen and effectively invisible while it
+    -- blends from the player's current pose into the landing/crouch pose.
+    -- After the 0.60s blend, playback is released forward immediately.
+    track:Play(0, 0.001, 0)
+    track:AdjustSpeed(0)
+    track:AdjustWeight(0.001, 0)
+
+    flyStartupAnimationStoppedConnection = track.Stopped:Connect(function()
+        -- An explicit Fly disable or our controlled finish path stops the track.
+        -- Only an unexpected stop while startup is still active should trigger
+        -- the safe normal-Fly handoff.
+        if flyEnabled and flyStartupActive and flyStartupAssetActive then
+            finishFlyStartupAnimation()
+        end
+    end)
+
+    task.spawn(function()
+        local deadline = os.clock() + 1.50
+
+        while flyEnabled
+            and flyStartupActive
+            and flyStartupAssetActive
+            and track.IsPlaying
+            and track.Length <= 0.05
+            and os.clock() < deadline do
+            task.wait()
+        end
+
+        if not flyEnabled
+            or not flyStartupActive
+            or not flyStartupAssetActive
+            or flyStartupAnimationTrack ~= track
+            or not track.IsPlaying then
+            return
+        end
+
+        local length = track.Length
+        if length <= 0.05 then
+            -- Target game did not deliver the animation. Fail safely into normal
+            -- Fly instead of leaving the character locked in startup.
+            finishFlyStartupAnimation()
+            return
+        end
+
+        flyStartupDuration = FLY_STARTUP_POSE_BLEND_TIME
+            + FLY_STARTUP_POSE_HOLD_TIME
+            + length
+        flyStartupTime = 0
+
+        -- Frame 0 is the desired landing/crouch pose. The track remains frozen
+        -- there while its weight is blended in over 0.60s. Playback then starts
+        -- immediately so the animation can leave the crouch before root lift.
+        if not track.IsPlaying then
+            track:Play(0, 0.001, 0)
+            track:AdjustSpeed(0)
+        end
+
+        track.TimePosition = 0
+        flyStartupAnimationReady = true
+        track:AdjustWeight(1, FLY_STARTUP_POSE_BLEND_TIME)
+
+        task.delay(FLY_STARTUP_POSE_BLEND_TIME + FLY_STARTUP_POSE_HOLD_TIME, function()
+            if not flyEnabled
+                or not flyStartupActive
+                or not flyStartupAssetActive
+                or flyStartupAnimationTrack ~= track
+                or not track.IsPlaying then
+                return
+            end
+
+            track.TimePosition = 0
+            track:AdjustSpeed(1)
+        end)
+
+        flyStartupAnimationMonitorConnection = RunService.Heartbeat:Connect(function()
+            if not flyEnabled
+                or not flyStartupActive
+                or not flyStartupAssetActive
+                or flyStartupAnimationTrack ~= track then
+                return
+            end
+
+            -- V181: the landing asset is intentionally used only for the visible
+            -- crouch/landing portion. Do NOT let its long crouched section
+            -- continue for the remaining ~2 seconds. At 0.90s total startup
+            -- time, freeze the current pose, fade it out, and hand the body
+            -- to Fly Idle while the real root begins a slow upward launch.
+            if flyStartupTime >= FLY_STARTUP_CUT_TIME then
+                track.TimePosition = math.min(track.TimePosition, FLY_STARTUP_CUT_TIME)
+                track:AdjustSpeed(0)
+                track:AdjustWeight(0, FLY_STARTUP_LAUNCH_DURATION)
+
+                flyStartupAssetActive = false
+                flyStartupAnimationReady = false
+                -- Keep flyStartupActive true through 0.90 -> 1.40s so the
+                -- dedicated ascend animation fully owns the pose before Fly Idle
+                -- is introduced. It is released at the launch point below.
+                if flyStartupAnimationMonitorConnection then
+                    flyStartupAnimationMonitorConnection:Disconnect()
+                    flyStartupAnimationMonitorConnection = nil
+                end
+                flyStartupLaunchActive = true
+                flyStartupLaunchTime = 0
+                local _, launchRoot = getHumanoidAndRoot()
+                flyStartupStartPosition = flyStartupStartPosition
+                    or (launchRoot and launchRoot.Position)
+
+                if flyStartupAnimationStoppedConnection then
+                    flyStartupAnimationStoppedConnection:Disconnect()
+                    flyStartupAnimationStoppedConnection = nil
+                end
+
+                flyStartupAnimationTrack = nil
+                clearStartupAnimatorSuppression()
+
+                -- V181: immediately introduce the dedicated 7-second ascend
+                -- animation, compressed into 0.60s. Keep Fly Idle suppressed
+                -- until 1.40s so the ascend pose owns the body during the
+                -- crouch-to-ascend transition.
+                local ascendStarted = startFlyStartupAscendAnimation(humanoid)
+                if not ascendStarted then
+                    -- Safe fallback: if the ascend asset cannot load, keep the
+                    -- previous direct Fly Idle handoff rather than locking startup.
+                    flyStartupActive = false
+                    startNormalFlyAnimationSet(true)
+                end
+
+                pcall(function() track:Stop(FLY_STARTUP_ASCEND_BLEND_IN) end)
+                task.delay(FLY_STARTUP_ASCEND_BLEND_IN, function()
+                    pcall(function() track:Destroy() end)
+                end)
+            end
+        end)
+    end)
+
+    return true
+end
+
+local function stopFlyStartupPoseDriver()
+    if flyStartupPreSimulationConnection then
+        flyStartupPreSimulationConnection:Disconnect()
+        flyStartupPreSimulationConnection = nil
+    end
+end
+
 -- v56: explicit per-track blend weights owned by Fly.
 local flyIdleWeight = 1
 local flyMoveWeight = 0
@@ -473,7 +1638,7 @@ local function getCharacter()
     return player.Character
 end
 
-local function getHumanoidAndRoot()
+getHumanoidAndRoot = function()
     local character = getCharacter()
     if not character then return nil, nil end
     local humanoid = character:FindFirstChildOfClass("Humanoid")
@@ -498,15 +1663,9 @@ local function loadFlyAnimations(humanoid)
         animator.Parent = humanoid
     end
 
-    -- v54: Fly takes explicit ownership of the Animator while active.
-    -- The Animate script may be disabled while its already-playing tracks
-    -- remain alive, so stop those pre-existing tracks before loading the
-    -- custom Fly tracks. This is intentionally limited to Fly enable time.
-    for _, existingTrack in ipairs(animator:GetPlayingAnimationTracks()) do
-        pcall(function()
-            existingTrack:Stop(0)
-        end)
-    end
+    -- V169: do NOT stop the character's existing Animate tracks here.
+    -- Startup OFF needs a real idle -> Fly Idle blend, while Startup ON
+    -- needs the reversed Action4 emote to fade directly over the current idle.
 
     local function load(id, priority)
         local animation = Instance.new("Animation")
@@ -531,26 +1690,19 @@ local function loadFlyAnimations(humanoid)
     flyTracks.move = load(MOVE_ANIMATION_ID, Enum.AnimationPriority.Action)
     flyTracks.backward = load(BACKWARD_ANIMATION_ID, Enum.AnimationPriority.Action)
 
-    -- v52: keep every custom Fly track actively playing while using
-    -- explicit weights for state blending. Use the normal Play() weight
-    -- parameter so the custom tracks are actually registered as active;
-    -- then immediately set their intended blend weights.
-    if flyTracks.idle then
-        flyTracks.idle:Play(0.12, 1, 1)
-        flyTracks.idle:AdjustWeight(1, 0)
-    end
-    if flyTracks.move then
-        flyTracks.move:Play(0.12, 1, 1)
-        flyTracks.move:AdjustWeight(0, 0)
-    end
-    flyIdleWeight = 1
+    -- V169: NEVER start a Fly-owned animation at full weight during loading.
+    -- Both startup modes now enter through the same handoff model:
+    --
+    --   current Roblox idle -> Fly Idle
+    --
+    -- Startup ON additionally inserts the reversed landing emote between those
+    -- states. Startup OFF simply performs the same smooth handoff without the
+    -- emote. Starting Fly Idle here at weight 1 was the source of the visible
+    -- one-frame snap before startNormalFlyAnimationSet() could fade it back out.
+    flyIdleWeight = 0
     flyMoveWeight = 0
     flyBackwardWeight = 0
 
-    if flyTracks.backward then
-        flyTracks.backward:Play(0.12, 1, 1)
-        flyTracks.backward:AdjustWeight(0, 0)
-    end
 end
 
 local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardInput)
@@ -558,6 +1710,21 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
     local move = flyTracks.move
     local backward = flyTracks.backward
     if not idle then return end
+
+    -- During the procedural takeoff, the custom Fly animation tracks must
+    -- NOT contribute to the pose. The startup pose is authored directly on
+    -- Motor6D.Transform, so leaving the Fly Idle track at weight 1 would make
+    -- the character look like it is doing the normal Fly idle while the root
+    -- is being lifted.
+    if flyStartupActive then
+        flyAnimState = "Startup"
+        flyIdleWeight = 0
+        flyMoveWeight = 0
+        flyBackwardWeight = 0
+        -- Keep every Fly track stopped until the procedural startup finishes.
+        -- The startup pose owns Motor6D.Transform directly.
+        return
+    end
 
     local desiredState = "Idle"
     if isMoving and moveDirection.Magnitude > 0.001 then
@@ -573,7 +1740,17 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
     local moveTarget = desiredState == "Forward" and 1 or 0
     local backwardTarget = desiredState == "Backward" and 1 or 0
 
-    local blendAlpha = 1 - math.exp(-deltaTime / 0.18)
+    local blendAlpha
+    if flyStartupFinalBlendActive then
+        flyStartupFinalBlendTime += deltaTime
+        blendAlpha = math.clamp(
+            deltaTime / math.max(FLY_STARTUP_ASCEND_FADE_OUT, 0.05),
+            0,
+            1
+        )
+    else
+        blendAlpha = 1 - math.exp(-deltaTime / 0.18)
+    end
 
     flyIdleWeight = flyIdleWeight
         + (idleTarget - flyIdleWeight) * blendAlpha
@@ -950,13 +2127,21 @@ local function saveCharacterState(humanoid, root)
     flyAnimateScriptDisabled = false
     if animate and (animate:IsA("LocalScript") or animate:IsA("Script")) then
         flyAnimateScriptDisabled = animate.Disabled
-        animate.Disabled = true
+
+        -- V169: keep the player's current Roblox idle/emote track alive during
+        -- Fly activation. Startup OFF uses it as the source of the smooth
+        -- idle -> Fly Idle blend. Startup ON uses it as the source underneath
+        -- the reversed Action4 startup emote. Animate is disabled only after
+        -- the relevant handoff is ready.
+        animate.Disabled = flyAnimateScriptDisabled
     end
 end
 
 local function restoreCharacterState()
     local saved = flySaved
     flySaved = nil
+    stopFlyStartupPoseDriver()
+    stopFlyStartupAnimation()
     stopTracks()
 
     local humanoid, root = getHumanoidAndRoot()
@@ -983,6 +2168,7 @@ local function restoreCharacterState()
 end
 
 local flyBodyYaw = 0
+-- Preserved body heading across Fly OFF -> ON when Shift Lock is OFF.
 local flyFlightPreviousDesiredYaw = nil
 local flyHologramMoveBlend = 0
 local flyAnimTime = 0
@@ -1057,11 +2243,11 @@ local function flyCameraAdjustTouchPitchSensitivity(delta)
 end
 
 local function flyCameraResetInput()
-    table.clear(flyCameraTouchStates)
-    table.clear(flyCameraZoomTouchPositions)
-    flyCameraPinchLastDiameter = nil
-    flyCameraTouchDelta = Vector2.new()
-    flyCameraMouseDelta = Vector2.new()
+    table.clear(flyState.flyCameraTouchStates)
+    table.clear(flyState.flyCameraZoomTouchPositions)
+    flyState.flyCameraPinchLastDiameter = nil
+    flyState.flyCameraTouchDelta = Vector2.new()
+    flyState.flyCameraMouseDelta = Vector2.new()
     flyCameraMouseLooking = false
 end
 
@@ -1069,16 +2255,16 @@ local function flyCameraSmoothLook(dt)
     local alpha =
         1 - math.exp(-FLY_CAMERA_LOOK_SMOOTHNESS * math.max(dt, 0))
 
-    flyCameraYaw =
-        flyCameraYaw + (flyCameraTargetYaw - flyCameraYaw) * alpha
+    flyState.flyCameraYaw =
+        flyState.flyCameraYaw + (flyState.flyCameraTargetYaw - flyState.flyCameraYaw) * alpha
 
-    flyCameraPitch =
-        flyCameraPitch + (flyCameraTargetPitch - flyCameraPitch) * alpha
+    flyState.flyCameraPitch =
+        flyState.flyCameraPitch + (flyState.flyCameraTargetPitch - flyState.flyCameraPitch) * alpha
 end
 
 local function flyCameraApplyLookInput()
-    local mouseDelta = flyCameraMouseDelta
-    flyCameraMouseDelta = Vector2.new()
+    local mouseDelta = flyState.flyCameraMouseDelta
+    flyState.flyCameraMouseDelta = Vector2.new()
 
     if mouseDelta.Magnitude > 0 then
         local rotation = Vector2.new(
@@ -1086,11 +2272,11 @@ local function flyCameraApplyLookInput()
             mouseDelta.Y * FLY_CAMERA_MOUSE_ROTATION_SPEED.Y
         )
 
-        flyCameraTargetYaw =
-            flyCameraTargetYaw - rotation.X
+        flyState.flyCameraTargetYaw =
+            flyState.flyCameraTargetYaw - rotation.X
 
-        flyCameraTargetPitch = math.clamp(
-            flyCameraTargetPitch - rotation.Y,
+        flyState.flyCameraTargetPitch = math.clamp(
+            flyState.flyCameraTargetPitch - rotation.Y,
             FLY_CAMERA_MIN_PITCH,
             FLY_CAMERA_MAX_PITCH
         )
@@ -1182,8 +2368,8 @@ local function disconnectFlyCameraInput()
 
     table.clear(flyCameraConnections)
     flyCameraResetInput()
-    flyCameraPinchLastDiameter = nil
-    table.clear(flyCameraZoomTouchPositions)
+    flyState.flyCameraPinchLastDiameter = nil
+    table.clear(flyState.flyCameraZoomTouchPositions)
 end
 
 local function connectFlyCameraInput()
@@ -1216,13 +2402,13 @@ local function connectFlyCameraInput()
                 return Enum.ContextActionResult.Pass
             end
 
-            flyCameraTouchStates[inputObject] = true
-            flyCameraZoomTouchPositions[inputObject] = inputObject.Position
+            flyState.flyCameraTouchStates[inputObject] = true
+            flyState.flyCameraZoomTouchPositions[inputObject] = inputObject.Position
 
             local zoomTouchCount = 0
             local firstZoomPosition = nil
             local secondZoomPosition = nil
-            for _, position in pairs(flyCameraZoomTouchPositions) do
+            for _, position in pairs(flyState.flyCameraZoomTouchPositions) do
                 zoomTouchCount += 1
                 if not firstZoomPosition then
                     firstZoomPosition = position
@@ -1232,38 +2418,38 @@ local function connectFlyCameraInput()
             end
 
             if zoomTouchCount >= 2 then
-                flyCameraPinchLastDiameter =
+                flyState.flyCameraPinchLastDiameter =
                     (firstZoomPosition - secondZoomPosition).Magnitude
             end
 
             return Enum.ContextActionResult.Sink
         end
 
-        if flyCameraTouchStates[inputObject] then
+        if flyState.flyCameraTouchStates[inputObject] then
             -- Defensive cleanup for the rare case where Roblox reuses an
             -- InputObject/state during a joystick transition. The joystick
             -- must never participate in camera pinch detection.
             if inputObject == flyJoystickTouch
                 or flyCameraIsInDynamicThumbstickArea(inputObject.Position) then
-                flyCameraTouchStates[inputObject] = nil
-                flyCameraZoomTouchPositions[inputObject] = nil
+                flyState.flyCameraTouchStates[inputObject] = nil
+                flyState.flyCameraZoomTouchPositions[inputObject] = nil
                 local remaining = 0
-                for _ in pairs(flyCameraZoomTouchPositions) do
+                for _ in pairs(flyState.flyCameraZoomTouchPositions) do
                     remaining += 1
                 end
                 if remaining < 2 then
-                    flyCameraPinchLastDiameter = nil
+                    flyState.flyCameraPinchLastDiameter = nil
                 end
                 return Enum.ContextActionResult.Pass
             end
 
             if inputState == Enum.UserInputState.Change then
-                flyCameraZoomTouchPositions[inputObject] = inputObject.Position
+                flyState.flyCameraZoomTouchPositions[inputObject] = inputObject.Position
 
                 local zoomTouchCount = 0
                 local firstZoomPosition = nil
                 local secondZoomPosition = nil
-                for _, position in pairs(flyCameraZoomTouchPositions) do
+                for _, position in pairs(flyState.flyCameraZoomTouchPositions) do
                     zoomTouchCount += 1
                     if not firstZoomPosition then
                         firstZoomPosition = position
@@ -1276,11 +2462,11 @@ local function connectFlyCameraInput()
                     local diameter =
                         (firstZoomPosition - secondZoomPosition).Magnitude
 
-                    if flyCameraPinchLastDiameter then
+                    if flyState.flyCameraPinchLastDiameter then
                         local pinchDelta =
-                            diameter - flyCameraPinchLastDiameter
+                            diameter - flyState.flyCameraPinchLastDiameter
                         local zoomDelta = -pinchDelta * 0.04
-                        local currentZoom = flyCameraTargetZoomDistance
+                        local currentZoom = flyState.flyCameraTargetZoomDistance
                         local newZoom
 
                         if zoomDelta > 0 then
@@ -1291,14 +2477,14 @@ local function connectFlyCameraInput()
                                 / (1 - zoomDelta * 0.5)
                         end
 
-                        flyCameraTargetZoomDistance = math.clamp(
+                        flyState.flyCameraTargetZoomDistance = math.clamp(
                             newZoom,
                             FLY_CAMERA_ZOOM_MIN,
                             FLY_CAMERA_ZOOM_MAX
                         )
                     end
 
-                    flyCameraPinchLastDiameter = diameter
+                    flyState.flyCameraPinchLastDiameter = diameter
                     return Enum.ContextActionResult.Sink
                 end
 
@@ -1309,9 +2495,9 @@ local function connectFlyCameraInput()
                         delta.X * FLY_CAMERA_TOUCH_ROTATION_SPEED.X,
                         delta.Y * FLY_CAMERA_TOUCH_ROTATION_SPEED.Y
                     )
-                    flyCameraTargetYaw = flyCameraTargetYaw - rotation.X
-                    flyCameraTargetPitch = math.clamp(
-                        flyCameraTargetPitch - rotation.Y,
+                    flyState.flyCameraTargetYaw = flyState.flyCameraTargetYaw - rotation.X
+                    flyState.flyCameraTargetPitch = math.clamp(
+                        flyState.flyCameraTargetPitch - rotation.Y,
                         FLY_CAMERA_MIN_PITCH,
                         FLY_CAMERA_MAX_PITCH
                     )
@@ -1321,15 +2507,15 @@ local function connectFlyCameraInput()
 
             if inputState == Enum.UserInputState.End
                 or inputState == Enum.UserInputState.Cancel then
-                flyCameraTouchStates[inputObject] = nil
-                flyCameraZoomTouchPositions[inputObject] = nil
+                flyState.flyCameraTouchStates[inputObject] = nil
+                flyState.flyCameraZoomTouchPositions[inputObject] = nil
 
                 local zoomTouchCount = 0
-                for _ in pairs(flyCameraZoomTouchPositions) do
+                for _ in pairs(flyState.flyCameraZoomTouchPositions) do
                     zoomTouchCount += 1
                 end
                 if zoomTouchCount < 2 then
-                    flyCameraPinchLastDiameter = nil
+                    flyState.flyCameraPinchLastDiameter = nil
                 end
 
                 return Enum.ContextActionResult.Sink
@@ -1350,15 +2536,15 @@ local function connectFlyCameraInput()
     )
 
     flyCameraConnections.TouchEnded = UserInputService.TouchEnded:Connect(function(input)
-        flyCameraTouchStates[input] = nil
-        flyCameraZoomTouchPositions[input] = nil
+        flyState.flyCameraTouchStates[input] = nil
+        flyState.flyCameraZoomTouchPositions[input] = nil
 
         local zoomTouchCount = 0
-        for _ in pairs(flyCameraZoomTouchPositions) do
+        for _ in pairs(flyState.flyCameraZoomTouchPositions) do
             zoomTouchCount += 1
         end
         if zoomTouchCount < 2 then
-            flyCameraPinchLastDiameter = nil
+            flyState.flyCameraPinchLastDiameter = nil
         end
     end)
 
@@ -1384,7 +2570,7 @@ local function connectFlyCameraInput()
             end
 
             if input.UserInputType == Enum.UserInputType.MouseMovement then
-                flyCameraMouseDelta += input.Delta
+                flyState.flyCameraMouseDelta += input.Delta
             end
         end)
 
@@ -1406,7 +2592,7 @@ local function connectFlyCameraInput()
 
             if wheel ~= 0 then
                 local zoomDelta = -wheel
-                local currentZoom = flyCameraTargetZoomDistance
+                local currentZoom = flyState.flyCameraTargetZoomDistance
                 local newZoom
 
                 if zoomDelta > 0 then
@@ -1417,7 +2603,7 @@ local function connectFlyCameraInput()
                         / (1 - zoomDelta * 0.5)
                 end
 
-                flyCameraTargetZoomDistance = math.clamp(
+                flyState.flyCameraTargetZoomDistance = math.clamp(
                     newZoom,
                     FLY_CAMERA_ZOOM_MIN,
                     FLY_CAMERA_ZOOM_MAX
@@ -1462,8 +2648,8 @@ end
 local function getFlyCameraCFrame(subjectPosition)
     local cameraLookCFrame =
         CFrame.new(subjectPosition) *
-        CFrame.Angles(0, flyCameraYaw, 0) *
-        CFrame.Angles(flyCameraPitch, 0, 0)
+        CFrame.Angles(0, flyState.flyCameraYaw, 0) *
+        CFrame.Angles(flyState.flyCameraPitch, 0, 0)
 
     local cameraLook = cameraLookCFrame.LookVector
     local cameraUp = cameraLookCFrame.UpVector
@@ -1474,7 +2660,7 @@ local function getFlyCameraCFrame(subjectPosition)
     -- that makes the body drift or twitch.
     local cameraPosition =
         subjectPosition
-        - cameraLook * flyCameraZoomDistance
+        - cameraLook * flyState.flyCameraZoomDistance
         + cameraUp * flyCameraVerticalOffset
 
     return CFrame.lookAt(cameraPosition, cameraPosition + cameraLook, cameraUp)
@@ -1506,6 +2692,73 @@ local function syncRobloxCameraZoomState(distance)
     end
 end
 
+local function computeFlyCameraVisualState(moveVector, currentSpeed, dt, cameraSubjectPosition)
+    -- Kept separate from updateFly() so the large flight loop does not hit
+    -- Luau's local-register limit. Camera behavior itself is unchanged.
+    local cameraPosition = nil
+    local cameraRotation = nil
+
+    if flyCameraFeelOn then
+        local horizontalVelocity = Vector3.new(moveVector.X, 0, moveVector.Z)
+        local cameraLagTarget = Vector3.zero
+
+        if horizontalVelocity.Magnitude > 0.001 then
+            local speedRatio = math.clamp(currentSpeed, 0, 1)
+            local travelDirection = horizontalVelocity.Unit
+            cameraLagTarget = -travelDirection * (FLY_CAMERA_MAX_LAG * speedRatio)
+
+            cameraLagTarget *= 1
+                + flyState.flyAccelerationBlend * 0.18
+                + flyState.flyDecelerationBlend * 0.08
+        end
+
+        local cameraLagAlpha = 1 - math.exp(-FLY_CAMERA_MOMENTUM_SMOOTHNESS * dt)
+        flyState.flyCameraVelocityBlend = flyState.flyCameraVelocityBlend
+            + (cameraLagTarget - flyState.flyCameraVelocityBlend) * cameraLagAlpha
+
+        local cameraYawDelta = flyState.flyCameraLastYaw
+            and shortestAngleDelta(flyState.flyCameraLastYaw, flyState.flyCameraYaw)
+            or 0
+        flyState.flyCameraLastYaw = flyState.flyCameraYaw
+
+        local turnLagTarget = math.clamp(
+            -cameraYawDelta / math.max(dt, 1 / 240) * 0.006,
+            math.rad(-1.8),
+            math.rad(1.8)
+        )
+        flyState.flyCameraTurnLag = flyState.flyCameraTurnLag
+            + (turnLagTarget - flyState.flyCameraTurnLag)
+            * (1 - math.exp(-dt / 0.09))
+
+        local baseCameraCFrame = getFlyCameraCFrame(cameraSubjectPosition)
+        cameraPosition = baseCameraCFrame.Position + flyState.flyCameraVelocityBlend
+        cameraRotation =
+            CFrame.lookAt(
+                Vector3.zero,
+                baseCameraCFrame.LookVector,
+                baseCameraCFrame.UpVector
+            ).Rotation
+            * CFrame.Angles(0, 0, flyState.flyCameraTurnLag)
+
+        local speedFOVTarget = math.clamp(currentSpeed, 0, 1)
+            * FLY_CAMERA_FOV_MAX_BOOST
+        flyState.flyCameraFOVBlend = flyState.flyCameraFOVBlend
+            + (speedFOVTarget - flyState.flyCameraFOVBlend)
+            * (1 - math.exp(-dt / 0.20))
+    else
+        flyState.flyCameraVelocityBlend = Vector3.zero
+        flyState.flyCameraTurnLag = 0
+        flyState.flyCameraFOVBlend = 0
+        flyState.flyCameraLastYaw = flyState.flyCameraYaw
+
+        local baseCameraCFrame = getFlyCameraCFrame(cameraSubjectPosition)
+        cameraPosition = baseCameraCFrame.Position
+        cameraRotation = baseCameraCFrame.Rotation
+    end
+
+    return cameraPosition, cameraRotation
+end
+
 local function updateFly(deltaTime)
     if not flyEnabled then return end
 
@@ -1533,9 +2786,9 @@ local function updateFly(deltaTime)
     if spectatingOtherPlayer then
         if not flySpectatingOtherPlayer then
             flyCameraResetInput()
-            table.clear(flyCameraTouchStates)
-            table.clear(flyCameraZoomTouchPositions)
-            flyCameraPinchLastDiameter = nil
+            table.clear(flyState.flyCameraTouchStates)
+            table.clear(flyState.flyCameraZoomTouchPositions)
+            flyState.flyCameraPinchLastDiameter = nil
         end
         flySpectatingOtherPlayer = true
     elseif flySpectatingOtherPlayer then
@@ -1544,38 +2797,38 @@ local function updateFly(deltaTime)
         -- before Fly takes Scriptable ownership back.
         flySpectatingOtherPlayer = false
         local resumePitch, resumeYaw = cam.CFrame:ToOrientation()
-        flyCameraPitch = resumePitch
-        flyCameraYaw = resumeYaw
-        flyCameraTargetPitch = resumePitch
-        flyCameraTargetYaw = resumeYaw
+        flyState.flyCameraPitch = resumePitch
+        flyState.flyCameraYaw = resumeYaw
+        flyState.flyCameraTargetPitch = resumePitch
+        flyState.flyCameraTargetYaw = resumeYaw
 
         local resumeSubjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
         local resumeDistance = (cam.CFrame.Position - resumeSubjectPosition):Dot(-cam.CFrame.LookVector)
         if resumeDistance <= 0.01 then
             resumeDistance = (cam.CFrame.Position - resumeSubjectPosition).Magnitude
         end
-        flyCameraZoomDistance = math.clamp(
+        flyState.flyCameraZoomDistance = math.clamp(
             resumeDistance,
             FLY_CAMERA_ZOOM_MIN,
             FLY_CAMERA_ZOOM_MAX
         )
-        flyCameraTargetZoomDistance = flyCameraZoomDistance
-        flyCameraLastYaw = nil
-        flyCameraVelocityBlend = Vector3.zero
-        flyCameraTurnLag = 0
-        flyCameraFOVBlend = 0
+        flyState.flyCameraTargetZoomDistance = flyState.flyCameraZoomDistance
+        flyState.flyCameraLastYaw = nil
+        flyState.flyCameraVelocityBlend = Vector3.zero
+        flyState.flyCameraTurnLag = 0
+        flyState.flyCameraFOVBlend = 0
         cam.CameraType = Enum.CameraType.Custom
     end
 
     -- Apply the same smooth target->current zoom interpolation used by
-    -- Freecam. v28 updated flyCameraTargetZoomDistance correctly, but it
-    -- never copied that target into flyCameraZoomDistance, so the camera
+    -- Freecam. v28 updated flyState.flyCameraTargetZoomDistance correctly, but it
+    -- never copied that target into flyState.flyCameraZoomDistance, so the camera
     -- stayed at the original distance forever.
     local zoomAlpha = 1 - math.exp(-14 * math.max(deltaTime, 0))
-    flyCameraZoomDistance = flyCameraZoomDistance
-        + (flyCameraTargetZoomDistance - flyCameraZoomDistance) * zoomAlpha
+    flyState.flyCameraZoomDistance = flyState.flyCameraZoomDistance
+        + (flyState.flyCameraTargetZoomDistance - flyState.flyCameraZoomDistance) * zoomAlpha
 
-    syncRobloxCameraZoomState(flyCameraZoomDistance)
+    syncRobloxCameraZoomState(flyState.flyCameraZoomDistance)
 
     -- No Clip is authoritative while enabled. Re-assert the state every
     -- render frame so a transient Roblox physics/avatar update cannot leave
@@ -1587,6 +2840,106 @@ local function updateFly(deltaTime)
     if not flyPosition then
         flyPosition = root.Position
     end
+
+    -- ================================================================
+    -- FLY STARTUP / SUPERHERO TAKEOFF
+    -- ================================================================
+    local startupPitch = 0
+    local startupFrame = flyStartupActive or flyStartupLaunchActive
+    local t = 0
+    if flyStartupActive then
+        flyStartupTime += dt
+        t = math.clamp(
+            flyStartupTime / math.max(flyStartupDuration, 0.001),
+            0,
+            1
+        )
+    end
+
+    -- V183: the landing animation owns the 0.00 -> 0.90s crouch. The
+    -- dedicated ascend animation uses only its first 4.00s over 0.60s, while the real body
+    -- begins its physical lift at 1.40s and settles into Fly Idle by 2.00s.
+    local startupOffset = 0
+    if flyStartupLaunchActive and flyStartupStartPosition then
+        -- 0.90 -> 1.40s: ascend animation owns the pose; stay grounded.
+        -- 1.40 -> 2.00s: begin the physical lift and crossfade to Fly Idle.
+        local elapsed = flyStartupLaunchTime
+        if elapsed >= FLY_STARTUP_LAUNCH_DELAY then
+            local p = math.clamp(
+                (elapsed - FLY_STARTUP_LAUNCH_DELAY)
+                    / math.max(FLY_STARTUP_LAUNCH_DURATION, 0.05),
+                0,
+                1
+            )
+            local eased = 1 - (1 - p) ^ 3
+            startupOffset = flyStartupHeight * eased
+
+            if flyStartupActive then
+                flyStartupActive = false
+                flyStartupFinalBlendActive = true
+                flyStartupFinalBlendTime = 0
+                startNormalFlyAnimationSet(true)
+            end
+        end
+
+        flyStartupLaunchTime += dt
+        if flyStartupLaunchTime >= FLY_STARTUP_LAUNCH_DELAY + FLY_STARTUP_LAUNCH_DURATION then
+            flyStartupLaunchActive = false
+            flyStartupLaunchTime = 0
+            flyStartupFinalBlendActive = false
+            flyStartupFinalBlendTime = 0
+            flyStartupStartPosition = nil
+            local ascendTrack = flyStartupAscendTrack
+            flyStartupAscendTrack = nil
+            if flyStartupAscendStoppedConnection then
+                flyStartupAscendStoppedConnection:Disconnect()
+                flyStartupAscendStoppedConnection = nil
+            end
+            if ascendTrack then
+                pcall(function() ascendTrack:AdjustSpeed(0) end)
+                pcall(function() ascendTrack:AdjustWeight(0, FLY_STARTUP_ASCEND_FADE_OUT) end)
+                task.delay(FLY_STARTUP_ASCEND_FADE_OUT, function()
+                    pcall(function() ascendTrack:Stop(0) end)
+                    pcall(function() ascendTrack:Destroy() end)
+                end)
+            end
+        end
+    elseif flyStartupActive and flyStartupAnimationReady then
+        -- During the 0.60s visual blend and the short asset section, stay grounded.
+        startupOffset = 0
+    end
+
+    if startupFrame and flyStartupStartPosition then
+        flyPosition = flyStartupStartPosition
+            + Vector3.new(0, startupOffset, 0)
+    end
+
+    if startupFrame then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
+
+    if flyStartupActive and flyJointDiagnosticActive and flyJointDiagnosticTime >= flyJointDiagnosticDuration then
+            stopFlyJointDiagnostic()
+            flyStartupActive = false
+            flyStartupTime = 0
+            flyStartupStartPosition = nil
+            stopFlyStartupPoseDriver()
+            clearFlyStartupPose()
+            clearStartupAnimatorSuppression()
+            startNormalFlyAnimationSet()
+        elseif flyStartupActive and t >= 1 and not flyJointDiagnosticActive and not flyStartupAssetActive then
+            -- V181: normal startup completion is handled by
+            -- finishFlyStartupAnimation(). This branch remains only for the
+            -- legacy diagnostic/procedural path.
+            flyStartupActive = false
+            flyStartupTime = 0
+            flyStartupStartPosition = nil
+            stopFlyStartupPoseDriver()
+            clearFlyStartupPose()
+            clearStartupAnimatorSuppression()
+            startNormalFlyAnimationSet()
+        end
 
     -- ================================================================
     -- THIS IS THE FREECAM HOLOGRAM FLIGHT ALGORITHM, PORTED DIRECTLY.
@@ -1605,8 +2958,8 @@ local function updateFly(deltaTime)
 
     local cameraLookCFrame =
         CFrame.new(flyPosition) *
-        CFrame.Angles(0, flyCameraYaw, 0) *
-        CFrame.Angles(flyCameraPitch, 0, 0)
+        CFrame.Angles(0, flyState.flyCameraYaw, 0) *
+        CFrame.Angles(flyState.flyCameraPitch, 0, 0)
     local cameraLook = cameraLookCFrame.LookVector
     local cameraRight = cameraLookCFrame.RightVector
     -- Get the actual current joystick/controller vector directly.
@@ -1660,6 +3013,13 @@ local function updateFly(deltaTime)
     -- render loop to error before updating the camera/body.
     local horizontalMove = Vector3.new(moveVector.X, 0, moveVector.Z)
 
+    -- A held joystick must not cancel the takeoff. The live control vector is
+    -- consumed normally as soon as the startup state finishes.
+    if flyStartupActive then
+        moveVector = Vector3.zero
+        horizontalMove = Vector3.zero
+    end
+
     -- The real-body Fly follows the same camera-pitch flight as the hologram.
     -- Space/Ctrl remains an optional extra vertical input, but the normal
     -- flight path itself is entirely driven by joystick + camera look.
@@ -1671,6 +3031,9 @@ local function updateFly(deltaTime)
     end
 
     local isMoving = moveVector.Magnitude > 0.05
+    if flyStartupActive then
+        isMoving = false
+    end
 
     -- ================================================================
     -- v57 FLIGHT DYNAMICS / MOMENTUM VISUALS
@@ -1678,33 +3041,33 @@ local function updateFly(deltaTime)
     -- These values are visual response layers. The actual movement vector and
     -- position integration remain exactly v56.
     local currentSpeed = moveVector.Magnitude
-    local speedDelta = currentSpeed - flyPreviousSpeed
+    local speedDelta = currentSpeed - flyState.flyPreviousSpeed
     local speedDeltaAlpha = 1 - math.exp(-dt / 0.09)
 
     local accelerationTarget = math.clamp(math.max(speedDelta, 0) * 5, 0, 1)
     local decelerationTarget = math.clamp(math.max(-speedDelta, 0) * 5, 0, 1)
 
-    flyAccelerationBlend = flyAccelerationBlend
-        + (accelerationTarget - flyAccelerationBlend) * speedDeltaAlpha
-    flyDecelerationBlend = flyDecelerationBlend
-        + (decelerationTarget - flyDecelerationBlend) * speedDeltaAlpha
+    flyState.flyAccelerationBlend = flyState.flyAccelerationBlend
+        + (accelerationTarget - flyState.flyAccelerationBlend) * speedDeltaAlpha
+    flyState.flyDecelerationBlend = flyState.flyDecelerationBlend
+        + (decelerationTarget - flyState.flyDecelerationBlend) * speedDeltaAlpha
 
     local directionChangeTarget = 0
-    if isMoving and flyPreviousMoveDirection.Magnitude > 0.05 then
-        local previousUnit = flyPreviousMoveDirection.Unit
+    if isMoving and flyState.flyPreviousMoveDirection.Magnitude > 0.05 then
+        local previousUnit = flyState.flyPreviousMoveDirection.Unit
         local currentUnit = moveVector.Unit
         local directionDot = math.clamp(previousUnit:Dot(currentUnit), -1, 1)
         directionChangeTarget = math.clamp((1 - directionDot) * 0.85, 0, 1)
     end
 
     local directionChangeAlpha = 1 - math.exp(-dt / 0.075)
-    flyDirectionChangeBlend = flyDirectionChangeBlend
-        + (directionChangeTarget - flyDirectionChangeBlend) * directionChangeAlpha
+    flyState.flyDirectionChangeBlend = flyState.flyDirectionChangeBlend
+        + (directionChangeTarget - flyState.flyDirectionChangeBlend) * directionChangeAlpha
 
     -- Keep the previous movement vector alive until the procedural pose has
     -- consumed it below. This is what makes v57's direction-change reaction
     -- compare the actual previous frame against the current frame.
-    flyPreviousSpeed = currentSpeed
+    flyState.flyPreviousSpeed = currentSpeed
 
     -- ================================================================
     -- PHYSICS-DRIVEN POSITION / REAL COLLISION
@@ -1718,12 +3081,14 @@ local function updateFly(deltaTime)
     -- that position later in this render step. This prevents a touching
     -- object OR another player's character from getting one physics frame to
     -- push the Fly before the CanCollide state catches up.
-    if flyNoClipOn then
+    if flyNoClipOn or startupFrame then
         if flyGravityForce and flyGravityForce.Parent then
             flyGravityForce.Force = Vector3.zero
         end
 
-        flyPosition = flyPosition + moveVector * flySpeed * dt
+        if not startupFrame then
+            flyPosition = flyPosition + moveVector * flySpeed * dt
+        end
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
     else
@@ -1759,7 +3124,7 @@ local function updateFly(deltaTime)
     -- is actually moving; while stationary, keep the current body heading.
     local desiredFlightYaw = flyBodyYaw or 0
     if flyShiftLockOn then
-        desiredFlightYaw = flyCameraYaw
+        desiredFlightYaw = flyState.flyCameraYaw
     elseif horizontalMove.Magnitude > 0.001 and isMoving then
         local movementUnit = horizontalMove.Unit
         desiredFlightYaw = math.atan2(-movementUnit.X, -movementUnit.Z)
@@ -1883,6 +3248,10 @@ local function updateFly(deltaTime)
         animationForwardInput
     )
 
+    -- v117: the procedural startup is applied by the PreSimulation driver.
+    -- Do not write Motor6D.Transform from the camera/render loop; Animator
+    -- evaluation and render timing can otherwise leave the old locomotion pose
+    -- underneath the takeoff.
     local forwardTarget = 0
     local rightTarget = 0
     if moveVector.Magnitude > 0.001 and isMoving then
@@ -1932,9 +3301,9 @@ local function updateFly(deltaTime)
     -- v57 acceleration/deceleration body response. This supplements the
     -- existing v56 directional lean rather than replacing it.
     local accelerationPitch = math.rad(7)
-        * flyAccelerationBlend * b
+        * flyState.flyAccelerationBlend * b
     local brakingPitch = math.rad(5)
-        * flyDecelerationBlend * b
+        * flyState.flyDecelerationBlend * b
 
     local flyLeanPitch = math.rad(16) * movementForward * b
         + accelerationPitch
@@ -1944,13 +3313,13 @@ local function updateFly(deltaTime)
     -- Direction-change reaction: briefly counter-roll into a sharp change,
     -- then let the existing turn-bank system take over.
     local directionSign = 0
-    if moveVector.Magnitude > 0.001 and flyPreviousMoveDirection.Magnitude > 0.05 then
-        local crossY = flyPreviousMoveDirection.Unit:Cross(moveVector.Unit).Y
+    if moveVector.Magnitude > 0.001 and flyState.flyPreviousMoveDirection.Magnitude > 0.05 then
+        local crossY = flyState.flyPreviousMoveDirection.Unit:Cross(moveVector.Unit).Y
         directionSign = math.clamp(crossY, -1, 1)
     end
     local directionChangeRoll = math.rad(4)
         * directionSign
-        * flyDirectionChangeBlend
+        * flyState.flyDirectionChangeBlend
         * b
 
     local verticalTravelRatio = 0
@@ -2034,7 +3403,7 @@ local function updateFly(deltaTime)
         baseCFrame *
         CFrame.new(0, bob + hoverBob, 0) *
         CFrame.Angles(
-            flightPitch - flyLeanPitch - speedPosePitch,
+            flightPitch - flyLeanPitch - speedPosePitch + startupPitch,
             hoverYaw,
             -flyLeanRoll - flightBankBlend
                 + directionChangeRoll
@@ -2044,7 +3413,10 @@ local function updateFly(deltaTime)
     -- No Clip ON owns the position directly so the character cannot be
     -- physically pushed back by another player or an object. No Clip OFF keeps
     -- the v21 physics-resolved position completely untouched.
-    if flyNoClipOn then
+    if flyNoClipOn or startupFrame then
+        -- Startup owns the root position even when No Clip is OFF so physics
+        -- cannot cancel the procedural takeoff. Once startup finishes, the
+        -- normal No Clip ON/OFF position ownership resumes unchanged.
         root.CFrame = CFrame.new(flyPosition) * animatedCFrame.Rotation
         root.AssemblyLinearVelocity = Vector3.zero
     else
@@ -2061,100 +3433,27 @@ local function updateFly(deltaTime)
 
     -- Commit the movement direction after all visual direction-change
     -- calculations have consumed the previous frame's value.
-    flyPreviousMoveDirection = moveVector
+    flyState.flyPreviousMoveDirection = moveVector
 
     -- ================================================================
     -- v58 OPTIONAL CAMERA FLIGHT FEEL
     -- ================================================================
-    -- The camera-feel layer is fully optional because the translation lag,
-    -- turn follow-through and speed FOV can be uncomfortable for players
-    -- who are sensitive to motion. Turning it OFF restores the direct v56/v57
-    -- camera position, rotation and saved FOV without changing flight movement.
-    local cameraPosition = nil
-    local cameraRotation = nil
-
-    if flyCameraFeelOn then
-        local horizontalVelocity = Vector3.new(moveVector.X, 0, moveVector.Z)
-        local cameraLagTarget = Vector3.zero
-
-        if horizontalVelocity.Magnitude > 0.001 then
-            local speedRatio = math.clamp(currentSpeed, 0, 1)
-            local travelDirection = horizontalVelocity.Unit
-            cameraLagTarget = -travelDirection
-                * (FLY_CAMERA_MAX_LAG * speedRatio)
-
-            -- Acceleration/deceleration briefly changes how much the camera lags,
-            -- creating a restrained sense of mass without making aiming sluggish.
-            cameraLagTarget *= 1
-                + flyAccelerationBlend * 0.18
-                + flyDecelerationBlend * 0.08
-        end
-
-        local cameraLagAlpha = 1 - math.exp(-FLY_CAMERA_MOMENTUM_SMOOTHNESS * dt)
-        flyCameraVelocityBlend = flyCameraVelocityBlend
-            + (cameraLagTarget - flyCameraVelocityBlend) * cameraLagAlpha
-
-        -- Camera turn inertia: tiny rotational follow-through, while the actual
-        -- camera yaw remains fully responsive.
-        local cameraYawDelta = flyCameraLastYaw
-            and shortestAngleDelta(flyCameraLastYaw, flyCameraYaw)
-            or 0
-        flyCameraLastYaw = flyCameraYaw
-
-        local turnLagTarget = math.clamp(
-            -cameraYawDelta / math.max(dt, 1 / 240) * 0.006,
-            math.rad(-1.8),
-            math.rad(1.8)
+    -- Kept in a helper to avoid exceeding Luau's local-register budget.
+    local cameraPosition, cameraRotation =
+        computeFlyCameraVisualState(
+            moveVector,
+            currentSpeed,
+            dt,
+            cameraSubjectPosition
         )
-        flyCameraTurnLag = flyCameraTurnLag
-            + (turnLagTarget - flyCameraTurnLag)
-            * (1 - math.exp(-dt / 0.09))
-
-        local baseCameraCFrame = getFlyCameraCFrame(cameraSubjectPosition)
-        cameraPosition = baseCameraCFrame.Position
-            + flyCameraVelocityBlend
-
-        local cameraLookVector = baseCameraCFrame.LookVector
-        local cameraUpVector = baseCameraCFrame.UpVector
-
-        cameraRotation =
-            CFrame.lookAt(
-                Vector3.zero,
-                cameraLookVector,
-                cameraUpVector
-            ).Rotation
-            * CFrame.Angles(0, 0, flyCameraTurnLag)
-
-        -- Speed FOV is intentionally subtle. The baseline FOV is restored when
-        -- stopped, while faster flight opens the view smoothly.
-        local speedFOVTarget = math.clamp(currentSpeed, 0, 1)
-            * FLY_CAMERA_FOV_MAX_BOOST
-        flyCameraFOVBlend = flyCameraFOVBlend
-            + (speedFOVTarget - flyCameraFOVBlend)
-            * (1 - math.exp(-dt / 0.20))
-    else
-        -- Hard-disable all optional camera-feel offsets. This makes the toggle
-        -- immediately useful for motion-sensitive players instead of waiting
-        -- for the old inertia layers to decay.
-        flyCameraVelocityBlend = Vector3.zero
-        flyCameraTurnLag = 0
-        flyCameraFOVBlend = 0
-        flyCameraLastYaw = flyCameraYaw
-
-        local baseCameraCFrame = getFlyCameraCFrame(cameraSubjectPosition)
-        cameraPosition = baseCameraCFrame.Position
-        cameraRotation = baseCameraCFrame.Rotation
-    end
 
     if not flySpectatingOtherPlayer then
-        -- V113: Scriptable camera means Roblox CameraModule cannot overwrite
+        -- v113: Scriptable camera means Roblox CameraModule cannot overwrite
         -- the camera from the character rotation that this same frame creates.
-        -- This is also why the camera can pass through geometry while Fly is
-        -- active instead of being pulled back by normal camera occlusion.
         cam.CameraType = Enum.CameraType.Scriptable
         cam.CFrame = CFrame.new(cameraPosition) * cameraRotation
         cam.FieldOfView = (flyCameraSavedFOV or FLY_CAMERA_FOV_BASE)
-            + (flyCameraFeelOn and flyCameraFOVBlend or 0)
+            + (flyCameraFeelOn and flyState.flyCameraFOVBlend or 0)
         cam.Focus = CFrame.new(cameraSubjectPosition)
     end
 end
@@ -2309,6 +3608,15 @@ local function enableFly()
 
     local humanoid, root = getHumanoidAndRoot()
     if not humanoid or not root then return false end
+    local character = humanoid.Parent
+    if not character then return false end
+
+    -- V188: snapshot the character's LIVE facing direction at the exact
+    -- moment Fly is enabled, before Fly/camera ownership changes anything.
+    local enableBodyYaw = math.atan2(
+        -root.CFrame.LookVector.X,
+        -root.CFrame.LookVector.Z
+    )
 
     saveCharacterState(humanoid, root)
     bindFlyDeathCleanup(humanoid, thisFlySession)
@@ -2341,7 +3649,9 @@ local function enableFly()
     end
 
     flyEnabled = true
-    flyShiftLockOn = true
+    -- Preserve the user's Shift Lock state across Fly disable/enable.
+    -- It defaults to ON for the first session, then follows the user's last choice.
+    -- Do not reset flyShiftLockOn here.
     -- Preserve the user's last No Clip preference across Fly disable/enable.
     -- No Clip is ON by default only for the first Fly session; after the user
     -- turns it OFF, disabling and re-enabling Fly keeps it OFF.
@@ -2349,23 +3659,41 @@ local function enableFly()
     setFlyNoClip(flyNoClipOn)
     flyVerticalInput = 0
     forwardBlend, rightBlend, flightPitchBlend, flightBankBlend, flightTurnRateBlend, speedBlend, hoverBlend = 0, 0, 0, 0, 0, 0, 0
-    flyCameraVelocityBlend = Vector3.zero
-    flyCameraTurnLag = 0
-    flyCameraFOVBlend = 0
-    flyCameraLastYaw = nil
+    flyState.flyCameraVelocityBlend = Vector3.zero
+    flyState.flyCameraTurnLag = 0
+    flyState.flyCameraFOVBlend = 0
+    flyState.flyCameraLastYaw = nil
     flyCameraLastMoveVector = Vector3.zero
-    flyAccelerationBlend = 0
-    flyDecelerationBlend = 0
-    flyDirectionChangeBlend = 0
-    flyPreviousMoveDirection = Vector3.zero
-    flyPreviousSpeed = 0
-    flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
+    flyState.flyAccelerationBlend = 0
+    flyState.flyDecelerationBlend = 0
+    flyState.flyDirectionChangeBlend = 0
+    flyState.flyPreviousMoveDirection = Vector3.zero
+    flyState.flyPreviousSpeed = 0
+    if flyShiftLockOn then
+        flyBodyYaw = flyState.flyCameraYaw
+    else
+        flyBodyYaw = enableBodyYaw
+    end
     flyFlightPreviousDesiredYaw = flyBodyYaw
     flyHologramMoveBlend = 0
     flyAnimTime = 0
     flyIdleWeight = 1
     flyMoveWeight = 0
     flyBackwardWeight = 0
+    flyStartupActive = flyStartupAnimationEnabled
+    flyStartupTime = 0
+    flyStartupLaunchActive = false
+    flyStartupLaunchTime = 0
+    flyStartupAscendTrack = nil
+    flyStartupAscendStoppedConnection = nil
+    flyStartupFinalBlendActive = false
+    flyStartupFinalBlendTime = 0
+    flyStartupStartPosition = flyStartupAnimationEnabled and root.Position or nil
+    stopFlyStartupAnimation()
+
+    -- Startup OFF now uses the same character-state takeover as V162 Startup ON.
+    -- Keep PlatformStand enabled during Fly ownership and let the existing Fly
+    -- controller take over exactly as that older, tested activation path did.
     humanoid.PlatformStand = true
     humanoid.AutoRotate = false
     root.Anchored = false
@@ -2428,24 +3756,57 @@ local function enableFly()
 
     local correctedStartDepth = math.sqrt(math.max(depthSquared, 0))
 
-    flyCameraZoomDistance = math.clamp(
+    flyState.flyCameraZoomDistance = math.clamp(
         correctedStartDepth,
         FLY_CAMERA_ZOOM_MIN,
         FLY_CAMERA_ZOOM_MAX
     )
-    flyCameraTargetZoomDistance = flyCameraZoomDistance
+    flyState.flyCameraTargetZoomDistance = flyState.flyCameraZoomDistance
 
-    flyCameraOffset = Vector3.zero
-    flyCameraPitch, flyCameraYaw = startCamera.CFrame:ToOrientation()
-    flyCameraTargetPitch = flyCameraPitch
-    flyCameraTargetYaw = flyCameraYaw
-    flyBodyYaw = flyCameraYaw
-    flyFlightPreviousDesiredYaw = flyCameraYaw
+    flyState.flyCameraOffset = Vector3.zero
+    flyState.flyCameraPitch, flyState.flyCameraYaw = startCamera.CFrame:ToOrientation()
+    flyState.flyCameraTargetPitch = flyState.flyCameraPitch
+    flyState.flyCameraTargetYaw = flyState.flyCameraYaw
+
+    -- V188: Shift Lock OFF uses the live character heading captured when
+    -- enableFly() began. Camera yaw must not overwrite that heading.
+    if flyShiftLockOn then
+        flyBodyYaw = flyState.flyCameraYaw
+    else
+        flyBodyYaw = enableBodyYaw
+    end
+    flyFlightPreviousDesiredYaw = flyBodyYaw
     flyCameraResetInput()
     flyMoveControls = getFlyMoveControls()
 
     flyPosition = root.Position
+    flyStartupStartPosition = flyPosition
+    cacheFlyStartupJoints(character)
+    -- V128: the Motor6D diagnostic is complete; Fly now enters the
+    -- actual procedural superhero takeoff immediately.
     loadFlyAnimations(humanoid)
+
+    -- V178: use the dedicated takeoff animation normally.
+    -- If it cannot be delivered, cancel startup cleanly and enter normal Fly;
+    -- never fall back into the old procedural startup lock.
+    if flyStartupAnimationEnabled then
+        local usingStartupAsset = startFlyStartupAnimation(humanoid)
+        if not usingStartupAsset then
+            flyStartupActive = false
+            flyStartupTime = 0
+            flyStartupStartPosition = nil
+            startNormalFlyAnimationSet(true)
+        end
+    else
+        flyStartupActive = false
+        flyStartupTime = 0
+        flyStartupStartPosition = nil
+        -- Startup OFF uses the V162 Startup ON activation state, but skips the
+        -- startup emote itself. Enter the normal Fly animation set immediately
+        -- after the same PlatformStand/body/camera ownership setup.
+        startNormalFlyAnimationSet()
+    end
+
     bindVerticalControls()
     connectFlyCameraInput()
     -- V113: use the proven v60 camera ownership model. The default
@@ -2586,8 +3947,8 @@ local function startFlyCameraHandoff(finalFlyCameraCFrame)
                 flyCameraSmoothLook(dt)
 
                 local zoomAlpha = 1 - math.exp(-14 * math.max(dt or 0, 0))
-                flyCameraZoomDistance = flyCameraZoomDistance
-                    + (flyCameraTargetZoomDistance - flyCameraZoomDistance) * zoomAlpha
+                flyState.flyCameraZoomDistance = flyState.flyCameraZoomDistance
+                    + (flyState.flyCameraTargetZoomDistance - flyState.flyCameraZoomDistance) * zoomAlpha
 
                 local subjectPosition = getRobloxCameraSubjectPosition(humanoid, root)
                 local bridgeCFrame = getFlyCameraCFrame(subjectPosition)
@@ -2603,7 +3964,7 @@ local function startFlyCameraHandoff(finalFlyCameraCFrame)
                         and flyJoystickVector.Magnitude > 0.001
 
                 local cameraTouchCount = 0
-                for _ in pairs(flyCameraTouchStates) do
+                for _ in pairs(flyState.flyCameraTouchStates) do
                     cameraTouchCount += 1
                 end
 
@@ -2628,6 +3989,10 @@ end
 
 local function disableFly()
     if not flyEnabled then return false end
+
+    -- v117: never leave the procedural PreSimulation driver alive across a
+    -- Fly session boundary.
+    stopFlyStartupPoseDriver()
 
     -- Invalidate this session before any exit work. This prevents repeated
     -- ON/OFF cycles from leaving an old lifecycle callback alive.
@@ -2803,6 +4168,11 @@ local function disableFly()
     flyCameraSavedFOV = nil
     flyCameraSavedMinZoom = nil
     flyCameraSavedMaxZoom = nil
+    flyStartupActive = false
+    flyStartupTime = 0
+    flyStartupStartPosition = nil
+    stopFlyStartupAnimation()
+    clearFlyStartupPose()
     setFlyNoClip(false)
     destroyFlyCollisionProxy()
     restoreCharacterState()
@@ -2869,6 +4239,17 @@ local function disableFly()
             -- touches remain available to the normal camera.
             blockFlyJoystickDuringCameraHandoff(handoffTouch)
 
+            -- V190: keep the held joystick touch blocked for the ENTIRE
+            -- handoff, not just the first 0.18 seconds. The old timed release
+            -- allowed the left joystick finger to become visible to Roblox's
+            -- CameraModule again while it was still physically held. When a
+            -- second finger was then used to rotate the camera, Roblox saw
+            -- two touches and interpreted them as a pinch, causing zoom.
+            --
+            -- clearFlyJoystickHandoffBlock() is called by TouchEnded for the
+            -- exact joystick InputObject, so normal camera pinch/zoom behavior
+            -- returns automatically once the joystick finger is actually
+            -- released.
             local handoffReleased = false
             local handoffReleaseConnection = nil
             local handoffNewTouchConnection = nil
@@ -3089,14 +4470,46 @@ player.CharacterAdded:Connect(function(character)
 
                 createFlyCollisionProxy()
                 setFlyNoClip(flyNoClipOn)
-                newHumanoid.PlatformStand = true
+                -- V169: keep the live idle visible through the shared startup
+                -- handoff; PlatformStand is applied after the same short window
+                -- used by the main enable path.
                 newHumanoid.AutoRotate = false
                 root.Anchored = false
                 currentMoveVector = Vector3.zero
                 flyPosition = root.Position
-                flyBodyYaw = math.atan2(root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
+                flyStartupActive = flyStartupAnimationEnabled
+                flyStartupTime = 0
+                flyStartupStartPosition = flyStartupAnimationEnabled and flyPosition or nil
+                stopFlyStartupAnimation()
+                cacheFlyStartupJoints(newHumanoid.Parent)
+                if flyShiftLockOn then
+                    flyBodyYaw = flyState.flyCameraYaw
+                else
+                    flyBodyYaw = math.atan2(
+                        root.CFrame.LookVector.X,
+                        -root.CFrame.LookVector.Z
+                    )
+                end
                 flyFlightPreviousDesiredYaw = flyBodyYaw
-                loadFlyAnimations(newHumanoid)
+                if flyStartupAnimationEnabled then
+                    local usingStartupAsset = startFlyStartupAnimation(newHumanoid)
+                    if not usingStartupAsset then
+                        flyStartupActive = false
+                        flyStartupTime = 0
+                        flyStartupStartPosition = nil
+                        startNormalFlyAnimationSet(true)
+                    end
+                else
+                    flyStartupActive = false
+                    flyStartupTime = 0
+                    flyStartupStartPosition = nil
+                    startNormalFlyAnimationSet(true)
+                end
+
+                -- V169: keep PlatformStand out of the startup animation itself.
+                -- V169: PlatformStand is not forced during activation.
+                -- This keeps the animation handoff completely visual; the
+                -- custom Fly controller already owns movement.
 
                 local newCamera = workspace.CurrentCamera
                 if newCamera then
@@ -3107,21 +4520,31 @@ player.CharacterAdded:Connect(function(character)
                     flyCameraSavedMinZoom = player.CameraMinZoomDistance
                     flyCameraSavedMaxZoom = player.CameraMaxZoomDistance
 
-                    flyCameraPitch, flyCameraYaw = newCamera.CFrame:ToOrientation()
-                    flyCameraTargetPitch = flyCameraPitch
-                    flyCameraTargetYaw = flyCameraYaw
-                    flyBodyYaw = flyCameraYaw
-                    flyFlightPreviousDesiredYaw = flyCameraYaw
+                    flyState.flyCameraPitch, flyState.flyCameraYaw = newCamera.CFrame:ToOrientation()
+                    flyState.flyCameraTargetPitch = flyState.flyCameraPitch
+                    flyState.flyCameraTargetYaw = flyState.flyCameraYaw
+
+                    -- V188: the new character's live facing is authoritative
+                    -- when Shift Lock is OFF; never restore an old session yaw.
+                    if flyShiftLockOn then
+                        flyBodyYaw = flyState.flyCameraYaw
+                    else
+                        flyBodyYaw = math.atan2(
+                            root.CFrame.LookVector.X,
+                            -root.CFrame.LookVector.Z
+                        )
+                    end
+                    flyFlightPreviousDesiredYaw = flyBodyYaw
 
                     local subjectPosition = getRobloxCameraSubjectPosition(newHumanoid, root)
                     local startDistance = (newCamera.CFrame.Position - subjectPosition).Magnitude
                     flyCameraVerticalOffset = 0
-                    flyCameraZoomDistance = math.clamp(
+                    flyState.flyCameraZoomDistance = math.clamp(
                         startDistance,
                         FLY_CAMERA_ZOOM_MIN,
                         FLY_CAMERA_ZOOM_MAX
                     )
-                    flyCameraTargetZoomDistance = flyCameraZoomDistance
+                    flyState.flyCameraTargetZoomDistance = flyState.flyCameraZoomDistance
                     flyCameraResetInput()
                     flySpectatingOtherPlayer = false
 
@@ -3146,6 +4569,11 @@ end)
 -- =========================================================
 -- MINI GUI
 -- =========================================================
+-- Keep the large GUI construction in its own function so its local UI
+-- references do not consume the top-level chunk's local-register budget.
+-- This is structural only; GUI layout/behavior is unchanged.
+
+local function buildMiniGui()
 
 screenGui = Instance.new("ScreenGui")
 screenGui.Name = "VGD_Fly_Standalone"
@@ -3156,7 +4584,7 @@ screenGui.Enabled = not GUI_CONTROLLED
 screenGui.Parent = player:WaitForChild("PlayerGui")
 
 local panel = Instance.new("Frame")
-panel.Size = UDim2.fromOffset(220, 197)
+panel.Size = UDim2.fromOffset(220, 232)
 -- Compact the entire mini GUI without changing the shortcut.
 -- Keep the same 12px right margin after scaling.
 panel.Position = UDim2.new(1, -188, 0, 92)
@@ -3185,7 +4613,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.fromOffset(34, 18)
 versionLabel.Position = UDim2.new(1, -67, 0, 10)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "V113.1"
+versionLabel.Text = "V190"
 versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
 versionLabel.Font = Enum.Font.Gotham
 versionLabel.TextSize = 9
@@ -3272,9 +4700,21 @@ cameraFeelToggle.TextSize = 10
 cameraFeelToggle.Parent = panel
 Instance.new("UICorner", cameraFeelToggle).CornerRadius = UDim.new(0, 8)
 
+-- V169: startup animation master toggle.
+local startupAnimationToggle = Instance.new("TextButton")
+startupAnimationToggle.Size = UDim2.fromOffset(200, 30)
+startupAnimationToggle.Position = UDim2.fromOffset(10, 161)
+startupAnimationToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+startupAnimationToggle.BorderSizePixel = 0
+startupAnimationToggle.TextColor3 = Color3.new(1, 1, 1)
+startupAnimationToggle.Font = Enum.Font.GothamBold
+startupAnimationToggle.TextSize = 10
+startupAnimationToggle.Parent = panel
+Instance.new("UICorner", startupAnimationToggle).CornerRadius = UDim.new(0, 8)
+
 local hint = Instance.new("TextLabel")
 hint.Size = UDim2.new(1, -20, 0, 28)
-hint.Position = UDim2.fromOffset(10, 163)
+hint.Position = UDim2.fromOffset(10, 198)
 hint.BackgroundTransparency = 1
 hint.Text = "Move + look to climb/dive   •   Space/Ctrl optional"
 hint.TextColor3 = Color3.fromRGB(145, 145, 145)
@@ -3332,12 +4772,19 @@ flyShiftLockButton.Activated:Connect(function()
 end)
 
 local function refreshUI()
-    status.Text = flyEnabled and ("ON  •  Speed " .. tostring(math.floor(flySpeed + 0.5))) or "OFF"
+    if flyEnabled and flyStartupActive then
+        status.Text = "TAKEOFF  •  Speed " .. tostring(math.floor(flySpeed + 0.5))
+    elseif flyEnabled then
+        status.Text = "ON  •  Speed " .. tostring(math.floor(flySpeed + 0.5))
+    else
+        status.Text = "OFF"
+    end
     toggle.Text = flyEnabled and "DISABLE" or "ENABLE"
     shortcut.Text = flyEnabled and "✈  ON" or "✈  FLY"
     noClipToggle.Text = "NO CLIP  •  " .. (flyNoClipOn and "ON" or "OFF")
     collisionDebugToggle.Text = "COLLISION  •  " .. (flyCollisionDebugOn and "ON" or "OFF")
     cameraFeelToggle.Text = "CAMERA FEEL  •  " .. (flyCameraFeelOn and "ON" or "OFF")
+    startupAnimationToggle.Text = "STARTUP ANIMATION  •  " .. (flyStartupAnimationEnabled and "ON" or "OFF")
 end
 
 local function showMiniGui(show)
@@ -3382,11 +4829,32 @@ cameraFeelToggle.Activated:Connect(function()
     if not flyEnabled then return end
     flyCameraFeelOn = not flyCameraFeelOn
     if not flyCameraFeelOn then
-        flyCameraVelocityBlend = Vector3.zero
-        flyCameraTurnLag = 0
-        flyCameraFOVBlend = 0
-        flyCameraLastYaw = flyCameraYaw
+        flyState.flyCameraVelocityBlend = Vector3.zero
+        flyState.flyCameraTurnLag = 0
+        flyState.flyCameraFOVBlend = 0
+        flyState.flyCameraLastYaw = flyState.flyCameraYaw
     end
+    refreshUI()
+end)
+
+startupAnimationToggle.Activated:Connect(function()
+    flyStartupAnimationEnabled = not flyStartupAnimationEnabled
+
+    -- If the user turns startup OFF while it is currently playing, cancel it
+    -- cleanly and hand control straight to normal Fly Idle. Turning it ON
+    -- affects the next Fly activation (not the current session).
+    if not flyStartupAnimationEnabled and flyEnabled and flyStartupActive then
+        flyStartupActive = false
+        flyStartupTime = 0
+        flyStartupStartPosition = nil
+        stopFlyStartupAnimation()
+        stopFlyStartupPoseDriver()
+        clearFlyStartupPose()
+        clearStartupAnimatorSuppression()
+
+        startNormalFlyAnimationSet()
+    end
+
     refreshUI()
 end)
 
@@ -3455,3 +4923,6 @@ function Controller.HideUI()
 end
 Controller.Changed = stateChangedEvent.Event
 return Controller
+end
+
+return buildMiniGui()
