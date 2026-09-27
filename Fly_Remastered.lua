@@ -4836,8 +4836,7 @@ local FLY_CAMERA_INPUT_MODULE_URL =
     "https://raw.githubusercontent.com/shahrinedham/VGD-Scripts/main/Modules/Fly_CameraInput.lua"
 local FlyCameraInputModule = loadstring(game:HttpGet(FLY_CAMERA_INPUT_MODULE_URL))()
 
-local function buildMiniGui()
-    local controller = FlyGuiModule.build({
+local FlyGuiContext = {
         player = player,
         GUI_CONTROLLED = GUI_CONTROLLED,
         stateChangedEvent = stateChangedEvent,
@@ -4872,14 +4871,9 @@ local function buildMiniGui()
         disableFly = disableFly,
         getFlyShiftLockOn = function() return flyShiftLockOn end,
         setFlyShiftLockOn = function(value) flyShiftLockOn = value end,
-    })
-    updateFlyShiftLockButton = controller.UpdateShiftLockButton
-    controller.UpdateShiftLockButton()
-    return controller
-end
+    }
 
-local function connectFlyCameraInput()
-    FlyCameraInputModule.connect({
+local FlyCameraInputContext = {
         disconnect = disconnectFlyCameraInput,
         flyCameraConnections = flyCameraConnections,
         flyState = flyState,
@@ -4898,7 +4892,17 @@ local function connectFlyCameraInput()
         FLY_CAMERA_TOUCH_ROTATION_SPEED = FLY_CAMERA_TOUCH_ROTATION_SPEED,
         ContextActionService = ContextActionService,
         UserInputService = UserInputService,
-    })
+    }
+
+local function buildMiniGui()
+    local controller = FlyGuiModule.build(FlyGuiContext)
+    updateFlyShiftLockButton = controller.UpdateShiftLockButton
+    controller.UpdateShiftLockButton()
+    return controller
+end
+
+local function connectFlyCameraInput()
+    FlyCameraInputModule.connect(FlyCameraInputContext)
 end
 
 local Controller = buildMiniGui()
