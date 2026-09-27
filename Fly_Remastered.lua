@@ -1,4 +1,4 @@
--- VGD Fly Standalone v198 - Modular
+-- VGD Fly Standalone v198
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -456,13 +456,7 @@ local IDLE_ANIMATION_ID = "rbxassetid://106706162821039"
 local MOVE_ANIMATION_ID = "rbxassetid://92749812489844"
 local BACKWARD_ANIMATION_ID = "rbxassetid://75806320773060"
 
--- V198: delayed Fly Idle fidget variations with exact-pose interruption handoff and live direction redirection.
--- Keep all fidget configuration/state in one table so this near-register-limit
--- script does not consume extra top-level local registers.
--- Fidget #1 uses the tested middle 5.000s of its 7.700s source.
--- Fidget #2 uses its full 7.458s source and deliberately fades back to Fly Idle
--- over the final 1.000s so its ending pose can differ slightly without snapping.
--- Fidget #3 uses its full 10.000s source with a 0.700s blend-in and 0.800s blend-out.
+-- V198 behavior preserved. Fidget configuration/state is supplied by the external module.
 local FLY_FIDGET_MODULE_URL = "https://raw.githubusercontent.com/shahrinedham/VGD-Scripts/main/Modules/Fly_Fidget.lua"
 local FlyFidgetModule = loadstring(game:HttpGet(FLY_FIDGET_MODULE_URL))()
 local flyIdleFidget = FlyFidgetModule.new()
@@ -1372,7 +1366,11 @@ local function startNormalFlyAnimationSet(smoothBlend)
     flyAnimState = "Idle"
     flyPreviousDesiredState = "Idle"
     flyIdleStableTime = 0
-    flyIdleFidget:Reset(flyTracks)
+    flyIdleFidget.idleTime = 0
+    flyIdleFidget.active = false
+    flyIdleFidget.elapsed = 0
+    flyIdleFidget.activeVariant = 1
+    FlyFidgetModule.resetTracks(flyTracks)
 
     if smoothBlend then
         -- V169: DO NOT disable Roblox Animate at the end of the handoff.
@@ -1697,7 +1695,9 @@ local function stopTracks()
     flyAnimState = "Idle"
     flyPreviousDesiredState = "Idle"
     flyIdleStableTime = 0
-    flyIdleFidget:Reset(flyTracks)
+    flyIdleFidget.idleTime = 0
+    flyIdleFidget.active = false
+    flyIdleFidget.elapsed = 0
 end
 
 local function loadFlyAnimations(humanoid)
@@ -1734,7 +1734,7 @@ local function loadFlyAnimations(humanoid)
     flyTracks.idle = load(IDLE_ANIMATION_ID, Enum.AnimationPriority.Action)
     flyTracks.move = load(MOVE_ANIMATION_ID, Enum.AnimationPriority.Action)
     flyTracks.backward = load(BACKWARD_ANIMATION_ID, Enum.AnimationPriority.Action)
-    flyIdleFidget:LoadTracks(humanoid, flyTracks, load)
+    FlyFidgetModule.loadTracks(flyTracks, load)
 
     -- V169: NEVER start a Fly-owned animation at full weight during loading.
     -- Both startup modes now enter through the same handoff model:
@@ -1767,7 +1767,20 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
         flyIdleWeight = 0
         flyMoveWeight = 0
         flyBackwardWeight = 0
-        flyIdleFidget:Reset(flyTracks)
+        flyIdleFidget.idleTime = 0
+        if not flyIdleFidget.interrupting then
+            flyIdleFidget.active = false
+            flyIdleFidget.elapsed = 0
+        end
+        flyIdleFidget.interrupting = false
+        flyIdleFidget.interruptElapsed = 0
+        local startupFidget = flyTracks.fidget
+        if startupFidget then
+            pcall(function()
+                startupFidget:AdjustWeight(0, 0)
+                startupFidget:Stop(0)
+            end)
+        end
         flyDirectionTransitionActive = false
         -- Keep every Fly track stopped until the procedural startup finishes.
         -- The startup pose owns Motor6D.Transform directly.
@@ -1808,22 +1821,76 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
 
     flyAnimState = requestedState
 
-    local fidgetResult = flyIdleFidget:BeginOrUpdateInterruption({
-        requestedState = requestedState,
-        desiredState = desiredState,
-        deltaTime = deltaTime,
-        flyTracks = flyTracks,
-        idleTrack = idle,
-        moveTrack = move,
-        backwardTrack = backward,
-        idleWeight = flyIdleWeight,
-        moveWeight = flyMoveWeight,
-        backwardWeight = flyBackwardWeight,
-    })
+    local fidgetVariant = flyIdleFidget.variants[flyIdleFidget.activeVariant] or flyIdleFidget.variants[1]
+    local fidget = flyTracks[fidgetVariant.trackKey]
+    if desiredState ~= "Idle" then
+        -- V197: interrupt the active fidget through the SAME direction handoff
+        -- window instead of simply stopping the fidget and letting the normal
+        -- movement blend start independently. The current fidget becomes the
+        -- outgoing pose, while the requested Forward/Backward track becomes the
+        -- incoming pose. This makes Fidget -> movement feel like one continuous
+        -- transition and follows the live requested direction immediately.
+        flyIdleFidget.idleTime = 0
+        if flyIdleFidget.active and not flyIdleFidget.interrupting and fidget then
+            -- V197.3: LOCK the exact fidget track and its current pose at the
+            -- instant movement begins. The fidget stays alive/frozen while
+            -- its weight is handed directly to Forward/Backward. We do NOT
+            -- mark it inactive until the handoff is completely finished.
+            flyIdleFidget.interrupting = true
+            flyIdleFidget.interruptElapsed = 0
+            flyIdleFidget.interruptStartFidgetWeight = math.clamp(
+                fidget.WeightCurrent, 0, 1
+            )
+            flyIdleFidget.interruptStartIdleWeight = math.clamp(
+                flyIdleWeight, 0, 1
+            )
+            flyIdleFidget.interruptMoveWeight = 0
+            flyIdleFidget.interruptBackwardWeight = 0
+            flyIdleFidget.interruptDirectionBlend = requestedState == "Forward" and 1 or 0
+        elseif not flyIdleFidget.interrupting then
+            flyIdleFidget.interrupting = false
+            flyIdleFidget.interruptElapsed = 0
+            flyIdleFidget.activeVariant = 1
+        end
+        -- Keep the original fidget active/frozen for the entire interruption.
+        -- It is the actual outgoing pose, not a placeholder that gets replaced
+        -- by Fly Idle. The interruption block below clears it only after the
+        -- outgoing weight has reached zero.
+        if not flyIdleFidget.interrupting then
+            flyIdleFidget.active = false
+            flyIdleFidget.elapsed = 0
+        end
+    elseif requestedState == "Idle" and not flyIdleFidget.active then
+        flyIdleFidget.idleTime = math.min(
+            flyIdleFidget.idleTime + math.max(deltaTime, 0),
+            flyIdleFidget.triggerDelay
+        )
 
-    flyIdleWeight = fidgetResult.idleWeight
-    flyMoveWeight = fidgetResult.moveWeight
-    flyBackwardWeight = fidgetResult.backwardWeight
+        if flyIdleFidget.idleTime >= flyIdleFidget.triggerDelay then
+            -- Cycle through all configured fidgets so the same variation is not
+            -- repeated every time the player remains idle.
+            local variantCount = #flyIdleFidget.variants
+            local nextVariant = (flyIdleFidget.lastVariant % variantCount) + 1
+            flyIdleFidget.activeVariant = nextVariant
+            flyIdleFidget.lastVariant = nextVariant
+            fidgetVariant = flyIdleFidget.variants[nextVariant]
+            fidget = flyTracks[fidgetVariant.trackKey]
+
+            if fidget then
+                flyIdleFidget.active = true
+                flyIdleFidget.interrupting = false
+                flyIdleFidget.interruptElapsed = 0
+                flyIdleFidget.elapsed = 0
+                flyIdleFidget.idleTime = 0
+                pcall(function()
+                    fidget:Play(0, 0, 1)
+                    fidget.TimePosition = fidgetVariant.sourceStart
+                    fidget:AdjustSpeed(1)
+                    fidget:AdjustWeight(0, 0)
+                end)
+            end
+        end
+    end
 
     -- V190.11: keep logical direction independent from animation residue.
     -- A real stop commits Idle, but we remember the last committed directional
@@ -1856,11 +1923,81 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
         (flyAnimState == "Forward" and flyDirectionTransitionTo == "Backward")
         or (flyAnimState == "Backward" and flyDirectionTransitionTo == "Forward")
 
-    -- V198 fidget interruption is fully owned by Fly_Fidget.lua.
-    -- The module has already applied the exact live-pose handoff for this frame.
+    -- V198: preserve the exact current fidget pose on the first movement
+    -- frame, then continuously crossfade it into the live direction and allow
+    -- the live directional target to redirect without a snap.
+    if flyIdleFidget.interrupting and (requestedState == "Forward" or requestedState == "Backward") then
+        flyIdleFidget.interruptDuration = math.max(fidgetVariant.blendOut, 0.05)
+        flyIdleFidget.interruptElapsed = math.min(
+            flyIdleFidget.interruptElapsed + math.max(deltaTime, 0),
+            flyIdleFidget.interruptDuration
+        )
+        flyIdleFidget.interruptT = math.clamp(
+            flyIdleFidget.interruptElapsed / flyIdleFidget.interruptDuration,
+            0,
+            1
+        )
+        flyIdleFidget.interruptSmoothT =
+            flyIdleFidget.interruptT * flyIdleFidget.interruptT
+            * (3 - 2 * flyIdleFidget.interruptT)
+
+        local t = flyIdleFidget.interruptSmoothT
+        local outgoingScale = 1 - t
+        local fidgetWeight = flyIdleFidget.interruptStartFidgetWeight * outgoingScale
+        flyIdleWeight = flyIdleFidget.interruptStartIdleWeight * outgoingScale
+
+        -- V198: the interruption target is LIVE. If the player changes from
+        -- Forward to Backward (or vice versa) while the fidget handoff is still
+        -- in progress, do not restart the blend and do not snap the directional
+        -- animation. Redirect the incoming movement share from its CURRENT mix.
+        local desiredDirectionBlend = requestedState == "Forward" and 1 or 0
+        local directionRedirectAlpha = 1 - math.exp(-math.max(deltaTime, 0) / 0.12)
+        flyIdleFidget.interruptDirectionBlend =
+            flyIdleFidget.interruptDirectionBlend
+            + (desiredDirectionBlend - flyIdleFidget.interruptDirectionBlend)
+                * directionRedirectAlpha
+
+        flyMoveWeight = t * flyIdleFidget.interruptDirectionBlend
+        flyBackwardWeight = t * (1 - flyIdleFidget.interruptDirectionBlend)
+        flyIdleFidget.interruptMoveWeight = flyMoveWeight
+        flyIdleFidget.interruptBackwardWeight = flyBackwardWeight
+
+        if idle and not idle.IsPlaying then idle:Play(0, 1, 1) end
+        if move and not move.IsPlaying then move:Play(0, 1, 1) end
+        if backward and not backward.IsPlaying then backward:Play(0, 1, 1) end
+        if idle then idle:AdjustWeight(flyIdleWeight, 0) end
+        if move then move:AdjustWeight(flyMoveWeight, 0) end
+        if backward then backward:AdjustWeight(flyBackwardWeight, 0) end
+
+        if fidget then
+            pcall(function()
+                fidget:AdjustWeight(fidgetWeight, 0)
+                if flyIdleFidget.interruptT >= 1 then
+                    fidget:AdjustWeight(0, 0)
+                    fidget:Stop(0)
+                end
+            end)
+        end
+
+        if flyIdleFidget.interruptT >= 1 then
+            flyIdleFidget.interrupting = false
+            flyIdleFidget.interruptElapsed = 0
+            flyIdleFidget.active = false
+            flyIdleFidget.activeVariant = 1
+            flyIdleFidget.interruptDuration = 0
+            flyIdleFidget.interruptT = 0
+            flyIdleFidget.interruptSmoothT = 0
+            flyIdleFidget.interruptStartFidgetWeight = 0
+            flyIdleFidget.interruptStartIdleWeight = 0
+            flyIdleFidget.interruptMoveWeight = 0
+            flyIdleFidget.interruptBackwardWeight = 0
+            flyIdleFidget.interruptDirectionBlend = 1
+            flyIdleFidget.currentWeight = 0
+        end
+    end
 
     if requestedState == "Forward" or requestedState == "Backward" then
-        if fidgetResult.interrupting then
+        if flyIdleFidget.interrupting then
             -- The dedicated fidget handoff above already owns the directional
             -- weights for this frame. Keep the normal transition state neutral
             -- so the existing reversal system takes over cleanly on the next
@@ -1930,7 +2067,7 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
 
     flyPreviousDesiredState = requestedState
 
-    if not fidgetResult.interrupting and flyDirectionTransitionActive
+    if not flyIdleFidget.interrupting and flyDirectionTransitionActive
         and (flyDirectionTransitionFrom == "Forward" or flyDirectionTransitionFrom == "Backward")
         and (flyDirectionTransitionTo == "Forward" or flyDirectionTransitionTo == "Backward") then
 
@@ -2003,7 +2140,7 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
             backward:AdjustWeight(flyBackwardWeight, 0)
 
         end
-    elseif not fidgetResult.interrupting then
+    elseif not flyIdleFidget.interrupting then
         -- Normal V190 behavior for Idle and for ordinary non-reversal states.
         local idleTarget = requestedState == "Idle" and 1 or 0
         local moveTarget = requestedState == "Forward" and 1 or 0
@@ -2050,22 +2187,63 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
                 + (backwardTarget - flyBackwardWeight) * blendAlpha
         end
 
-        local activeFidgetResult = flyIdleFidget:ApplyActiveIdle({
-            requestedState = requestedState,
-            deltaTime = deltaTime,
-            flyTracks = flyTracks,
-            idleTrack = idle,
-            moveTrack = move,
-            backwardTrack = backward,
-            idleWeight = flyIdleWeight,
-            moveWeight = flyMoveWeight,
-            backwardWeight = flyBackwardWeight,
-        })
+        if flyIdleFidget.active and not flyIdleFidget.interrupting and requestedState == "Idle" and fidget then
+            -- Crossfade the active fidget against Fly Idle across its complete
+            -- configured source window. Fidget #2 deliberately uses a 1.000s
+            -- fade-out, so its different ending pose is already blending toward
+            -- the normal Fly Idle pose before the source reaches its final frame.
+            flyIdleFidget.elapsed = math.min(
+                flyIdleFidget.elapsed + math.max(deltaTime, 0),
+                fidgetVariant.duration
+            )
 
-        if activeFidgetResult.handled then
-            flyIdleWeight = activeFidgetResult.idleWeight
-            flyMoveWeight = activeFidgetResult.moveWeight
-            flyBackwardWeight = activeFidgetResult.backwardWeight
+            local elapsed = flyIdleFidget.elapsed
+            local fidgetWeight = 1
+
+            if elapsed < fidgetVariant.blendIn then
+                local p = math.clamp(elapsed / fidgetVariant.blendIn, 0, 1)
+                fidgetWeight = p * p * (3 - 2 * p)
+            elseif elapsed > fidgetVariant.duration - fidgetVariant.blendOut then
+                local p = math.clamp(
+                    (fidgetVariant.duration - elapsed) / fidgetVariant.blendOut,
+                    0,
+                    1
+                )
+                fidgetWeight = p * p * (3 - 2 * p)
+            end
+
+            flyIdleWeight = 1 - fidgetWeight
+            flyMoveWeight = 0
+            flyBackwardWeight = 0
+            flyIdleFidget.currentWeight = fidgetWeight
+
+            pcall(function()
+                fidget.TimePosition = fidgetVariant.sourceStart + elapsed
+                fidget:AdjustWeight(fidgetWeight, 0)
+            end)
+
+            if elapsed >= fidgetVariant.duration then
+                flyIdleFidget.active = false
+                flyIdleFidget.elapsed = 0
+                flyIdleFidget.idleTime = 0
+                pcall(function()
+                    fidget:AdjustWeight(0, 0)
+                    fidget:Stop(0)
+                end)
+                flyIdleWeight = 1
+                flyIdleFidget.currentWeight = 0
+            end
+        elseif fidget and not flyIdleFidget.active then
+            fidget:AdjustWeight(0, 0)
+        end
+
+        -- Keep every inactive fidget track fully suppressed. This remains
+        -- scalable as additional idle variations are added.
+        for _, variant in ipairs(flyIdleFidget.variants) do
+            local variantTrack = flyTracks[variant.trackKey]
+            if variantTrack and (not flyIdleFidget.active and not flyIdleFidget.interrupting) then
+                variantTrack:AdjustWeight(0, 0)
+            end
         end
 
         if idle and not idle.IsPlaying then
