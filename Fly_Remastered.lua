@@ -2860,252 +2860,6 @@ local function disconnectFlyCameraInput()
     table.clear(flyState.flyCameraZoomTouchPositions)
 end
 
-local function connectFlyCameraInput()
-    disconnectFlyCameraInput()
-
-    -- Match Freecam's proven mobile touch architecture exactly.
-    -- ContextActionService owns world touches, and the same touch table is
-    -- used to detect a two-finger pinch because the touch action consumes
-    -- the touches before UserInputService.TouchPinch can be relied on.
-    local touchAction = function(_, inputState, inputObject)
-        if (not flyEnabled and not flyCameraHandoffActive)
-            or inputObject.UserInputType ~= Enum.UserInputType.Touch then
-            return Enum.ContextActionResult.Pass
-        end
-
-        if flySpectatingOtherPlayer then
-            return Enum.ContextActionResult.Pass
-        end
-
-        if inputState == Enum.UserInputState.Begin then
-            -- The mobile joystick is a separate input stream. If the player
-            -- keeps the joystick held while using a second finger to look
-            -- around, NEVER let that joystick touch enter the camera's pinch
-            -- table. Otherwise the camera sees the joystick + look finger as
-            -- a two-finger pinch and changes zoom instead of yaw/pitch.
-            local isJoystickTouch = inputObject == flyJoystickTouch
-                or flyCameraIsInDynamicThumbstickArea(inputObject.Position)
-
-            if isJoystickTouch or flyCameraIsOverGui(inputObject.Position) then
-                return Enum.ContextActionResult.Pass
-            end
-
-            flyState.flyCameraTouchStates[inputObject] = true
-            flyState.flyCameraZoomTouchPositions[inputObject] = inputObject.Position
-
-            local zoomTouchCount = 0
-            local firstZoomPosition = nil
-            local secondZoomPosition = nil
-            for _, position in pairs(flyState.flyCameraZoomTouchPositions) do
-                zoomTouchCount += 1
-                if not firstZoomPosition then
-                    firstZoomPosition = position
-                elseif not secondZoomPosition then
-                    secondZoomPosition = position
-                end
-            end
-
-            if zoomTouchCount >= 2 then
-                flyState.flyCameraPinchLastDiameter =
-                    (firstZoomPosition - secondZoomPosition).Magnitude
-            end
-
-            return Enum.ContextActionResult.Sink
-        end
-
-        if flyState.flyCameraTouchStates[inputObject] then
-            -- Defensive cleanup for the rare case where Roblox reuses an
-            -- InputObject/state during a joystick transition. The joystick
-            -- must never participate in camera pinch detection.
-            if inputObject == flyJoystickTouch
-                or flyCameraIsInDynamicThumbstickArea(inputObject.Position) then
-                flyState.flyCameraTouchStates[inputObject] = nil
-                flyState.flyCameraZoomTouchPositions[inputObject] = nil
-                local remaining = 0
-                for _ in pairs(flyState.flyCameraZoomTouchPositions) do
-                    remaining += 1
-                end
-                if remaining < 2 then
-                    flyState.flyCameraPinchLastDiameter = nil
-                end
-                return Enum.ContextActionResult.Pass
-            end
-
-            if inputState == Enum.UserInputState.Change then
-                flyState.flyCameraZoomTouchPositions[inputObject] = inputObject.Position
-
-                local zoomTouchCount = 0
-                local firstZoomPosition = nil
-                local secondZoomPosition = nil
-                for _, position in pairs(flyState.flyCameraZoomTouchPositions) do
-                    zoomTouchCount += 1
-                    if not firstZoomPosition then
-                        firstZoomPosition = position
-                    elseif not secondZoomPosition then
-                        secondZoomPosition = position
-                    end
-                end
-
-                if zoomTouchCount >= 2 then
-                    local diameter =
-                        (firstZoomPosition - secondZoomPosition).Magnitude
-
-                    if flyState.flyCameraPinchLastDiameter then
-                        local pinchDelta =
-                            diameter - flyState.flyCameraPinchLastDiameter
-                        local zoomDelta = -pinchDelta * 0.04
-                        local currentZoom = flyState.flyCameraTargetZoomDistance
-                        local newZoom
-
-                        if zoomDelta > 0 then
-                            newZoom = currentZoom
-                                + zoomDelta * (1 + currentZoom * 0.5)
-                        else
-                            newZoom = (currentZoom + zoomDelta)
-                                / (1 - zoomDelta * 0.5)
-                        end
-
-                        flyState.flyCameraTargetZoomDistance = math.clamp(
-                            newZoom,
-                            FLY_CAMERA_ZOOM_MIN,
-                            FLY_CAMERA_ZOOM_MAX
-                        )
-                    end
-
-                    flyState.flyCameraPinchLastDiameter = diameter
-                    return Enum.ContextActionResult.Sink
-                end
-
-                local delta = inputObject.Delta
-                if delta.Magnitude > 0 then
-                    delta = flyCameraAdjustTouchPitchSensitivity(delta)
-                    local rotation = Vector2.new(
-                        delta.X * FLY_CAMERA_TOUCH_ROTATION_SPEED.X,
-                        delta.Y * FLY_CAMERA_TOUCH_ROTATION_SPEED.Y
-                    )
-                    flyState.flyCameraTargetYaw = flyState.flyCameraTargetYaw - rotation.X
-                    flyState.flyCameraTargetPitch = math.clamp(
-                        flyState.flyCameraTargetPitch - rotation.Y,
-                        FLY_CAMERA_MIN_PITCH,
-                        FLY_CAMERA_MAX_PITCH
-                    )
-                end
-                return Enum.ContextActionResult.Sink
-            end
-
-            if inputState == Enum.UserInputState.End
-                or inputState == Enum.UserInputState.Cancel then
-                flyState.flyCameraTouchStates[inputObject] = nil
-                flyState.flyCameraZoomTouchPositions[inputObject] = nil
-
-                local zoomTouchCount = 0
-                for _ in pairs(flyState.flyCameraZoomTouchPositions) do
-                    zoomTouchCount += 1
-                end
-                if zoomTouchCount < 2 then
-                    flyState.flyCameraPinchLastDiameter = nil
-                end
-
-                return Enum.ContextActionResult.Sink
-            end
-
-            return Enum.ContextActionResult.Sink
-        end
-
-        return Enum.ContextActionResult.Pass
-    end
-
-    ContextActionService:BindActionAtPriority(
-        "VGD_FlyCameraTouch",
-        touchAction,
-        false,
-        Enum.ContextActionPriority.High.Value,
-        Enum.UserInputType.Touch
-    )
-
-    flyCameraConnections.TouchEnded = UserInputService.TouchEnded:Connect(function(input)
-        flyState.flyCameraTouchStates[input] = nil
-        flyState.flyCameraZoomTouchPositions[input] = nil
-
-        local zoomTouchCount = 0
-        for _ in pairs(flyState.flyCameraZoomTouchPositions) do
-            zoomTouchCount += 1
-        end
-        if zoomTouchCount < 2 then
-            flyState.flyCameraPinchLastDiameter = nil
-        end
-    end)
-
-    -- Desktop: same right-mouse drag behavior as Freecam.
-    flyCameraConnections.MouseBegan =
-        UserInputService.InputBegan:Connect(function(
-            input,
-            gameProcessedEvent
-        )
-            if (not flyEnabled and not flyCameraHandoffActive) or flySpectatingOtherPlayer or gameProcessedEvent then
-                return
-            end
-
-            if input.UserInputType == Enum.UserInputType.MouseButton2 then
-                flyCameraMouseLooking = true
-            end
-        end)
-
-    flyCameraConnections.MouseChanged =
-        UserInputService.InputChanged:Connect(function(input)
-            if (not flyEnabled and not flyCameraHandoffActive) or flySpectatingOtherPlayer or not flyCameraMouseLooking then
-                return
-            end
-
-            if input.UserInputType == Enum.UserInputType.MouseMovement then
-                flyState.flyCameraMouseDelta += input.Delta
-            end
-        end)
-
-    flyCameraConnections.MouseEnded =
-        UserInputService.InputEnded:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton2 then
-                flyCameraMouseLooking = false
-            end
-        end)
-
-    -- Match Freecam's desktop zoom exactly.
-    flyCameraConnections.MouseWheel = UserInputService.InputChanged:Connect(function(input)
-        if (not flyEnabled and not flyCameraHandoffActive) or flySpectatingOtherPlayer then
-            return
-        end
-
-        if input.UserInputType == Enum.UserInputType.MouseWheel then
-            local wheel = input.Position.Z
-
-            if wheel ~= 0 then
-                local zoomDelta = -wheel
-                local currentZoom = flyState.flyCameraTargetZoomDistance
-                local newZoom
-
-                if zoomDelta > 0 then
-                    newZoom = currentZoom
-                        + zoomDelta * (1 + currentZoom * 0.5)
-                else
-                    newZoom = (currentZoom + zoomDelta)
-                        / (1 - zoomDelta * 0.5)
-                end
-
-                flyState.flyCameraTargetZoomDistance = math.clamp(
-                    newZoom,
-                    FLY_CAMERA_ZOOM_MIN,
-                    FLY_CAMERA_ZOOM_MAX
-                )
-            end
-        end
-    end)
-
-end
-
--- Mirror Roblox CameraModule's living-Humanoid subject point instead of
--- using HumanoidRootPart.Position directly. CameraModule follows a point
--- above the root (plus Humanoid.CameraOffset), and that vertical offset is
--- exactly what makes the apparent exit distance depend on camera pitch.
 local function getRobloxCameraSubjectPosition(humanoid, root)
     if not humanoid or not root or not root:IsA("BasePart") then
         return root and root.Position or Vector3.zero
@@ -5074,356 +4828,78 @@ end)
 -- references do not consume the top-level chunk's local-register budget.
 -- This is structural only; GUI layout/behavior is unchanged.
 
+local FLY_GUI_MODULE_URL =
+    "https://raw.githubusercontent.com/shahrinedham/VGD-Scripts/main/Modules/Fly_GUI.lua"
+local FlyGuiModule = loadstring(game:HttpGet(FLY_GUI_MODULE_URL))()
+
+local FLY_CAMERA_INPUT_MODULE_URL =
+    "https://raw.githubusercontent.com/shahrinedham/VGD-Scripts/main/Modules/Fly_CameraInput.lua"
+local FlyCameraInputModule = loadstring(game:HttpGet(FLY_CAMERA_INPUT_MODULE_URL))()
+
 local function buildMiniGui()
-
-screenGui = Instance.new("ScreenGui")
-screenGui.Name = "VGD_Fly_Standalone"
-screenGui.ResetOnSpawn = false
-screenGui.IgnoreGuiInset = true
-screenGui.DisplayOrder = 1998
-screenGui.Enabled = not GUI_CONTROLLED
-screenGui.Parent = player:WaitForChild("PlayerGui")
-
-local panel = Instance.new("Frame")
-panel.Size = UDim2.fromOffset(220, 232)
--- Compact the entire mini GUI without changing the shortcut.
--- Keep the same 12px right margin after scaling.
-panel.Position = UDim2.new(1, -188, 0, 92)
-panel.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-panel.BackgroundTransparency = 0.08
-panel.BorderSizePixel = 0
-panel.Parent = screenGui
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
-
-local miniGuiScale = Instance.new("UIScale")
-miniGuiScale.Scale = 0.80
-miniGuiScale.Parent = panel
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -20, 0, 24)
-title.Position = UDim2.fromOffset(10, 7)
-title.BackgroundTransparency = 1
-title.Text = "VGD  •  FLY"
-title.TextColor3 = Color3.new(1, 1, 1)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 15
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = panel
-
-local versionLabel = Instance.new("TextLabel")
-versionLabel.Size = UDim2.fromOffset(34, 18)
-versionLabel.Position = UDim2.new(1, -67, 0, 10)
-versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "V198"
-versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
-versionLabel.Font = Enum.Font.Gotham
-versionLabel.TextSize = 9
-versionLabel.TextXAlignment = Enum.TextXAlignment.Right
-versionLabel.Parent = panel
-
-local closeButton = Instance.new("TextButton")
-closeButton.Size = UDim2.fromOffset(22, 22)
-closeButton.Position = UDim2.new(1, -29, 0, 5)
-closeButton.BackgroundTransparency = 1
-closeButton.Text = "×"
-closeButton.TextColor3 = Color3.fromRGB(180, 180, 180)
-closeButton.Font = Enum.Font.GothamBold
-closeButton.TextSize = 18
-closeButton.Parent = panel
-
-local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -20, 0, 18)
-status.Position = UDim2.fromOffset(10, 31)
-status.BackgroundTransparency = 1
-status.Text = "OFF"
-status.TextColor3 = Color3.fromRGB(170, 170, 170)
-status.Font = Enum.Font.Gotham
-status.TextSize = 11
-status.TextXAlignment = Enum.TextXAlignment.Left
-status.Parent = panel
-
-local speedBox = Instance.new("TextBox")
-speedBox.Size = UDim2.fromOffset(92, 30)
-speedBox.Position = UDim2.fromOffset(10, 54)
-speedBox.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-speedBox.BorderSizePixel = 0
-speedBox.TextColor3 = Color3.new(1, 1, 1)
-speedBox.PlaceholderText = "Speed"
-speedBox.Text = tostring(flySpeed)
-speedBox.Font = Enum.Font.Gotham
-speedBox.TextSize = 12
-speedBox.ClearTextOnFocus = false
-speedBox.Parent = panel
-Instance.new("UICorner", speedBox).CornerRadius = UDim.new(0, 8)
-
-local toggle = Instance.new("TextButton")
-toggle.Size = UDim2.fromOffset(102, 30)
-toggle.Position = UDim2.fromOffset(108, 54)
-toggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-toggle.BorderSizePixel = 0
-toggle.TextColor3 = Color3.new(1, 1, 1)
-toggle.Text = "ENABLE"
-toggle.Font = Enum.Font.GothamBold
-toggle.TextSize = 11
-toggle.Parent = panel
-Instance.new("UICorner", toggle).CornerRadius = UDim.new(0, 8)
-
-local noClipToggle = Instance.new("TextButton")
-noClipToggle.Size = UDim2.fromOffset(200, 30)
-noClipToggle.Position = UDim2.fromOffset(10, 91)
-noClipToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-noClipToggle.BorderSizePixel = 0
-noClipToggle.TextColor3 = Color3.new(1, 1, 1)
-noClipToggle.Font = Enum.Font.GothamBold
-noClipToggle.TextSize = 11
-noClipToggle.Parent = panel
-Instance.new("UICorner", noClipToggle).CornerRadius = UDim.new(0, 8)
-
-local collisionDebugToggle = Instance.new("TextButton")
-collisionDebugToggle.Size = UDim2.fromOffset(97, 30)
-collisionDebugToggle.Position = UDim2.fromOffset(10, 126)
-collisionDebugToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-collisionDebugToggle.BorderSizePixel = 0
-collisionDebugToggle.TextColor3 = Color3.new(1, 1, 1)
-collisionDebugToggle.Font = Enum.Font.GothamBold
-collisionDebugToggle.TextSize = 10
-collisionDebugToggle.Parent = panel
-Instance.new("UICorner", collisionDebugToggle).CornerRadius = UDim.new(0, 8)
-
-local cameraFeelToggle = Instance.new("TextButton")
-cameraFeelToggle.Size = UDim2.fromOffset(97, 30)
-cameraFeelToggle.Position = UDim2.fromOffset(113, 126)
-cameraFeelToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-cameraFeelToggle.BorderSizePixel = 0
-cameraFeelToggle.TextColor3 = Color3.new(1, 1, 1)
-cameraFeelToggle.Font = Enum.Font.GothamBold
-cameraFeelToggle.TextSize = 10
-cameraFeelToggle.Parent = panel
-Instance.new("UICorner", cameraFeelToggle).CornerRadius = UDim.new(0, 8)
-
--- V169: startup animation master toggle.
-local startupAnimationToggle = Instance.new("TextButton")
-startupAnimationToggle.Size = UDim2.fromOffset(200, 30)
-startupAnimationToggle.Position = UDim2.fromOffset(10, 161)
-startupAnimationToggle.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-startupAnimationToggle.BorderSizePixel = 0
-startupAnimationToggle.TextColor3 = Color3.new(1, 1, 1)
-startupAnimationToggle.Font = Enum.Font.GothamBold
-startupAnimationToggle.TextSize = 10
-startupAnimationToggle.Parent = panel
-Instance.new("UICorner", startupAnimationToggle).CornerRadius = UDim.new(0, 8)
-
-local hint = Instance.new("TextLabel")
-hint.Size = UDim2.new(1, -20, 0, 28)
-hint.Position = UDim2.fromOffset(10, 198)
-hint.BackgroundTransparency = 1
-hint.Text = "Move + look to climb/dive   •   Space/Ctrl optional"
-hint.TextColor3 = Color3.fromRGB(145, 145, 145)
-hint.Font = Enum.Font.Gotham
-hint.TextSize = 9
-hint.TextXAlignment = Enum.TextXAlignment.Left
-hint.Parent = panel
-
--- Small shortcut button used after the mini GUI is hidden.
-local shortcut = Instance.new("TextButton")
-shortcut.Size = UDim2.fromOffset(74, 32)
-shortcut.Position = UDim2.new(1, -84, 0, 92)
-shortcut.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-shortcut.BackgroundTransparency = 0.08
-shortcut.BorderSizePixel = 0
-shortcut.TextColor3 = Color3.new(1, 1, 1)
-shortcut.Text = "✈  FLY"
-shortcut.Font = Enum.Font.GothamBold
-shortcut.TextSize = 11
-shortcut.Visible = false
-shortcut.Parent = screenGui
-Instance.new("UICorner", shortcut).CornerRadius = UDim.new(0, 10)
-
--- Freecam-style Shift Lock button.
--- EXACT FreeCam_Standalone.lua dimensions/placement:
---   Size = 30x30
---   AnchorPoint = (0, 0.5)
---   Position = (0, 18, 0.5, 0)
---   ZIndex = 2001
-flyShiftLockButton = Instance.new("ImageButton")
-flyShiftLockButton.Name = "VGD_FlyShiftLock"
-flyShiftLockButton.Size = UDim2.fromOffset(30,30)
-flyShiftLockButton.AnchorPoint = Vector2.new(0,0.5)
-flyShiftLockButton.Position = UDim2.new(0,18,0.5,0)
-flyShiftLockButton.BackgroundTransparency = 1
-flyShiftLockButton.BorderSizePixel = 0
-flyShiftLockButton.AutoButtonColor = false
-flyShiftLockButton.ScaleType = Enum.ScaleType.Fit
-flyShiftLockButton.Visible = false
-flyShiftLockButton.ZIndex = 2001
-flyShiftLockButton.Parent = screenGui
-
-updateFlyShiftLockButton = function()
-    if not flyShiftLockButton then return end
-    flyShiftLockButton.Visible = flyEnabled
-    flyShiftLockButton.Image = flyShiftLockOn
-        and "rbxasset://textures/ui/mouseLock_on@2x.png"
-        or "rbxasset://textures/ui/mouseLock_off@2x.png"
+    local controller = FlyGuiModule.build({
+        player = player,
+        GUI_CONTROLLED = GUI_CONTROLLED,
+        stateChangedEvent = stateChangedEvent,
+        getFlyEnabled = function() return flyEnabled == true end,
+        getFlySpeed = function() return flySpeed end,
+        setFlySpeed = function(value) flySpeed = math.clamp(value, flyMinSpeed, flyMaxSpeed) end,
+        getFlyMinSpeed = function() return flyMinSpeed end,
+        getFlyMaxSpeed = function() return flyMaxSpeed end,
+        getFlyNoClipOn = function() return flyNoClipOn end,
+        setFlyNoClipOn = function(value) flyNoClipOn = value end,
+        setFlyNoClip = setFlyNoClip,
+        getFlyCollisionDebugOn = function() return flyCollisionDebugOn end,
+        setFlyCollisionDebugOn = function(value) flyCollisionDebugOn = value end,
+        updateFlyCollisionDebug = updateFlyCollisionDebug,
+        getFlyCameraFeelOn = function() return flyCameraFeelOn end,
+        setFlyCameraFeelOn = function(value) flyCameraFeelOn = value end,
+        flyState = flyState,
+        getFlyStartupAnimationEnabled = function() return flyStartupAnimationEnabled end,
+        setFlyStartupAnimationEnabled = function(value) flyStartupAnimationEnabled = value end,
+        getFlyStartupActive = function() return flyStartupActive end,
+        setFlyStartupActive = function(value) flyStartupActive = value end,
+        getFlyStartupTime = function() return flyStartupTime end,
+        setFlyStartupTime = function(value) flyStartupTime = value end,
+        getFlyStartupStartPosition = function() return flyStartupStartPosition end,
+        setFlyStartupStartPosition = function(value) flyStartupStartPosition = value end,
+        stopFlyStartupAnimation = stopFlyStartupAnimation,
+        stopFlyStartupPoseDriver = stopFlyStartupPoseDriver,
+        clearFlyStartupPose = clearFlyStartupPose,
+        clearStartupAnimatorSuppression = clearStartupAnimatorSuppression,
+        startNormalFlyAnimationSet = startNormalFlyAnimationSet,
+        enableFly = enableFly,
+        disableFly = disableFly,
+        getFlyShiftLockOn = function() return flyShiftLockOn end,
+        setFlyShiftLockOn = function(value) flyShiftLockOn = value end,
+    })
+    updateFlyShiftLockButton = controller.UpdateShiftLockButton
+    controller.UpdateShiftLockButton()
+    return controller
 end
 
-flyShiftLockButton.Activated:Connect(function()
-    if not flyEnabled then return end
-    flyShiftLockOn = not flyShiftLockOn
-    updateFlyShiftLockButton()
-end)
-
-local function refreshUI()
-    if flyEnabled and flyStartupActive then
-        status.Text = "TAKEOFF  •  Speed " .. tostring(math.floor(flySpeed + 0.5))
-    elseif flyEnabled then
-        status.Text = "ON  •  Speed " .. tostring(math.floor(flySpeed + 0.5))
-    else
-        status.Text = "OFF"
-    end
-    toggle.Text = flyEnabled and "DISABLE" or "ENABLE"
-    shortcut.Text = flyEnabled and "✈  ON" or "✈  FLY"
-    noClipToggle.Text = "NO CLIP  •  " .. (flyNoClipOn and "ON" or "OFF")
-    collisionDebugToggle.Text = "COLLISION  •  " .. (flyCollisionDebugOn and "ON" or "OFF")
-    cameraFeelToggle.Text = "CAMERA FEEL  •  " .. (flyCameraFeelOn and "ON" or "OFF")
-    startupAnimationToggle.Text = "STARTUP ANIMATION  •  " .. (flyStartupAnimationEnabled and "ON" or "OFF")
+local function connectFlyCameraInput()
+    FlyCameraInputModule.connect({
+        disconnect = disconnectFlyCameraInput,
+        flyCameraConnections = flyCameraConnections,
+        flyState = flyState,
+        getFlyEnabled = function() return flyEnabled end,
+        getFlyCameraHandoffActive = function() return flyCameraHandoffActive end,
+        getFlySpectatingOtherPlayer = function() return flySpectatingOtherPlayer end,
+        getFlyJoystickTouch = function() return flyJoystickTouch end,
+        setFlyCameraMouseLooking = function(value) flyCameraMouseLooking = value end,
+        getFlyCameraMouseLooking = function() return flyCameraMouseLooking end,
+        flyCameraIsInDynamicThumbstickArea = flyCameraIsInDynamicThumbstickArea,
+        flyCameraIsOverGui = flyCameraIsOverGui,
+        flyCameraAdjustTouchPitchSensitivity = flyCameraAdjustTouchPitchSensitivity,
+        FLY_CAMERA_ZOOM_MIN = FLY_CAMERA_ZOOM_MIN,
+        FLY_CAMERA_ZOOM_MAX = FLY_CAMERA_ZOOM_MAX,
+        FLY_CAMERA_MIN_PITCH = FLY_CAMERA_MIN_PITCH,
+        FLY_CAMERA_TOUCH_ROTATION_SPEED = FLY_CAMERA_TOUCH_ROTATION_SPEED,
+        ContextActionService = ContextActionService,
+        UserInputService = UserInputService,
+    })
 end
 
-local function showMiniGui(show)
-    screenGui.Enabled = show == true
-    if screenGui.Enabled then
-        panel.Visible = true
-        shortcut.Visible = false
-    end
-end
-
-closeButton.Activated:Connect(function()
-    if screenGui.Enabled then
-        panel.Visible = false
-        shortcut.Visible = true
-    end
-end)
-
-toggle.Activated:Connect(function()
-    if flyEnabled then disableFly() else enableFly() end
-end)
-
-shortcut.Activated:Connect(function()
-    panel.Visible = true
-    shortcut.Visible = false
-end)
-
-noClipToggle.Activated:Connect(function()
-    if not flyEnabled then return end
-    flyNoClipOn = not flyNoClipOn
-    setFlyNoClip(flyNoClipOn)
-    refreshUI()
-end)
-
-collisionDebugToggle.Activated:Connect(function()
-    if not flyEnabled then return end
-    flyCollisionDebugOn = not flyCollisionDebugOn
-    updateFlyCollisionDebug()
-    refreshUI()
-end)
-
-cameraFeelToggle.Activated:Connect(function()
-    if not flyEnabled then return end
-    flyCameraFeelOn = not flyCameraFeelOn
-    if not flyCameraFeelOn then
-        flyState.flyCameraVelocityBlend = Vector3.zero
-        flyState.flyCameraTurnLag = 0
-        flyState.flyCameraFOVBlend = 0
-        flyState.flyCameraLastYaw = flyState.flyCameraYaw
-    end
-    refreshUI()
-end)
-
-startupAnimationToggle.Activated:Connect(function()
-    flyStartupAnimationEnabled = not flyStartupAnimationEnabled
-
-    -- If the user turns startup OFF while it is currently playing, cancel it
-    -- cleanly and hand control straight to normal Fly Idle. Turning it ON
-    -- affects the next Fly activation (not the current session).
-    if not flyStartupAnimationEnabled and flyEnabled and flyStartupActive then
-        flyStartupActive = false
-        flyStartupTime = 0
-        flyStartupStartPosition = nil
-        stopFlyStartupAnimation()
-        stopFlyStartupPoseDriver()
-        clearFlyStartupPose()
-        clearStartupAnimatorSuppression()
-
-        startNormalFlyAnimationSet()
-    end
-
-    refreshUI()
-end)
-
-speedBox.FocusLost:Connect(function()
-    local value = tonumber(speedBox.Text)
-    if value then flySpeed = math.clamp(value, flyMinSpeed, flyMaxSpeed) end
-    speedBox.Text = tostring(math.floor(flySpeed + 0.5))
-    refreshUI()
-end)
-
-stateChangedEvent.Event:Connect(function(enabled)
-    -- Changing Fly state must never change GUI visibility.
-    -- ENABLE/DISABLE only controls the Fly feature itself.
-    -- The X button is the only thing that closes the panel.
-    refreshUI()
-end)
-
-refreshUI()
-
-local Controller = {}
-function Controller.EnableUI()
-    -- VGD Self-page Toggle ON: expose the Fly feature without starting flight.
-    screenGui.Enabled = true
-    panel.Visible = false
-    shortcut.Visible = true
-    refreshUI()
-    return true
-end
-function Controller.DisableUI()
-    -- VGD Self-page Toggle OFF: stop flight if necessary and remove the whole
-    -- Fly UI (shortcut + mini GUI).
-    disableFly()
-    refreshUI()
-    panel.Visible = false
-    shortcut.Visible = false
-    screenGui.Enabled = false
-    return true
-end
--- Keep Enable/Disable for the standalone mini GUI/API: these control actual flight.
-function Controller.Enable()
-    local ok = enableFly() == true
-    showMiniGui(true)
-    return ok
-end
-function Controller.Disable()
-    local result = disableFly()
-    refreshUI()
-    return result == false
-end
-function Controller.IsEnabled() return flyEnabled == true end
-function Controller.SetSpeed(value)
-    local n = tonumber(value)
-    if not n then return flySpeed end
-    flySpeed = math.clamp(n, flyMinSpeed, flyMaxSpeed)
-    speedBox.Text = tostring(math.floor(flySpeed + 0.5))
-    refreshUI()
-    return flySpeed
-end
-function Controller.GetSpeed() return flySpeed end
-function Controller.ShowUI() showMiniGui(true) end
-function Controller.HideUI()
-    if screenGui.Enabled then
-        panel.Visible = false
-        shortcut.Visible = true
-    end
-end
-Controller.Changed = stateChangedEvent.Event
+local Controller = buildMiniGui()
 return Controller
-end
-
-return buildMiniGui()
