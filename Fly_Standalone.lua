@@ -1,4 +1,4 @@
--- VGD Fly Standalone v190
+-- VGD Fly Standalone v191
 -- Real-body flight controller for VGD.
 -- Uses the same flight-pose concepts as VGD Freecam:
 -- animation blending, forward/side lean, turning bank, speed pose,
@@ -499,6 +499,31 @@ local previousDesiredYaw = nil
 local currentMoveVector = Vector3.zero
 local hoverBlend = 0
 local flyAnimState = "Idle"
+
+-- V190.12: V190.11 functional baseline plus a V190-like response curve for
+-- Forward <-> Backward reversal feel. State handling and no-snap logic remain unchanged.
+-- The Fly Idle track is used only as a temporary pose cushion while the
+-- outgoing and incoming direction tracks remain continuously crossfaded.
+-- Unlike the earlier neutral-bridge tests, Idle never becomes the visible
+-- standalone state, so there is no stop/pause between directions.
+local FLY_DIRECTION_CONTINUOUS_BLEND_TIME = 0.45
+local FLY_DIRECTION_CONTINUOUS_IDLE_MAX = 0.30
+local flyDirectionTransitionActive = false
+local flyDirectionTransitionFrom = nil
+local flyDirectionTransitionTo = nil
+local flyDirectionTransitionTime = 0
+
+-- V190.9 diagnostic: remember the actual requested animation state, not just
+-- whichever directional track still has the larger weight. This prevents a
+-- stopped Forward/Backward track from being mistaken for the active direction
+-- when the player starts moving again in the opposite direction.
+local flyPreviousDesiredState = "Idle"
+local flyLastDirectionalState = nil
+-- Require a tiny real Idle dwell before treating the next movement as a
+-- fresh Idle -> Direction transition. This filters a one-frame mobile input
+-- deadzone/flicker so a genuine reversal cannot accidentally bypass the blend.
+local flyIdleStableTime = 0
+local FLY_IDLE_STABLE_THRESHOLD = 0.05
 
 -- v121: true R15 pose/keyframe player.
 --
@@ -1331,6 +1356,8 @@ local function startNormalFlyAnimationSet(smoothBlend)
     flyMoveWeight = 0
     flyBackwardWeight = 0
     flyAnimState = "Idle"
+    flyPreviousDesiredState = "Idle"
+    flyIdleStableTime = 0
 
     if smoothBlend then
         -- V169: DO NOT disable Roblox Animate at the end of the handoff.
@@ -1653,6 +1680,8 @@ local function stopTracks()
     end
     flyTracks = {}
     flyAnimState = "Idle"
+    flyPreviousDesiredState = "Idle"
+    flyIdleStableTime = 0
 end
 
 local function loadFlyAnimations(humanoid)
@@ -1721,6 +1750,7 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
         flyIdleWeight = 0
         flyMoveWeight = 0
         flyBackwardWeight = 0
+        flyDirectionTransitionActive = false
         -- Keep every Fly track stopped until the procedural startup finishes.
         -- The startup pose owns Motor6D.Transform directly.
         return
@@ -1733,45 +1763,280 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
 
     flyAnimState = desiredState
 
-    -- v56: manually blend the three continuously-playing tracks. This avoids
-    -- Stop()/Play() snaps and avoids leaving Roblox's internal weight target
-    -- stuck after a state transition.
-    local idleTarget = desiredState == "Idle" and 1 or 0
-    local moveTarget = desiredState == "Forward" and 1 or 0
-    local backwardTarget = desiredState == "Backward" and 1 or 0
+    -- V190.9: use hysteresis for Idle detection. A transient zero from the
+    -- joystick/controller is NOT allowed to convert the previous direction
+    -- into Idle for the next frame. Only a continuously held Idle state past
+    -- the threshold commits the state machine to Idle. This prevents the old
+    -- direction bug from returning when input briefly flickers during a
+    -- Forward <-> Backward reversal.
+    local requestedState = desiredState
+    if desiredState == "Idle" then
+        flyIdleStableTime = math.min(
+            flyIdleStableTime + math.max(deltaTime, 0),
+            FLY_IDLE_STABLE_THRESHOLD
+        )
 
-    local blendAlpha
-    if flyStartupFinalBlendActive then
-        flyStartupFinalBlendTime += deltaTime
-        blendAlpha = math.clamp(
-            deltaTime / math.max(FLY_STARTUP_ASCEND_FADE_OUT, 0.05),
+        if flyIdleStableTime < FLY_IDLE_STABLE_THRESHOLD
+            and (flyPreviousDesiredState == "Forward" or flyPreviousDesiredState == "Backward") then
+            -- Treat this as a transient input gap. Keep the previous committed
+            -- direction alive so the active reversal blend is not destroyed.
+            requestedState = flyPreviousDesiredState
+        else
+            requestedState = "Idle"
+        end
+    else
+        flyIdleStableTime = 0
+    end
+
+    flyAnimState = requestedState
+
+    -- V190.11: keep logical direction independent from animation residue.
+    -- A real stop commits Idle, but we remember the last committed directional
+    -- state separately so a quick Idle -> opposite-direction restart can still
+    -- use the continuous reversal blend without changing the requested state.
+    local startedMovingFromIdle =
+        flyPreviousDesiredState == "Idle"
+        and (requestedState == "Forward" or requestedState == "Backward")
+
+    local residualReversalFrom = nil
+    if startedMovingFromIdle then
+        -- Use the last directional state before the committed Idle instead of
+        -- guessing from current animation weights. This preserves symmetrical
+        -- Forward -> Stop -> Backward and Backward -> Stop -> Forward behavior.
+        local lastDirectionalState = flyLastDirectionalState
+        if lastDirectionalState == "Forward" or lastDirectionalState == "Backward" then
+            if lastDirectionalState ~= requestedState then
+                residualReversalFrom = lastDirectionalState
+            end
+        end
+    end
+
+    -- V190.9 diagnostic:
+    -- Forward <-> Backward uses a continuous THREE-WAY blend instead of
+    -- Forward -> Idle -> Backward. Idle acts only as a temporary pose cushion.
+    -- The outgoing and incoming direction tracks never both reach zero, and
+    -- the Idle track never reaches weight 1, so the character never visibly
+    -- stops in Idle during a reversal.
+    local directDirectionReversal =
+        (flyAnimState == "Forward" and flyDirectionTransitionTo == "Backward")
+        or (flyAnimState == "Backward" and flyDirectionTransitionTo == "Forward")
+
+    if requestedState == "Forward" or requestedState == "Backward" then
+        if startedMovingFromIdle then
+            -- A genuine Idle -> movement start. No directional residue remains
+            -- strong enough to justify a reversal transition.
+            flyDirectionTransitionActive = false
+            flyDirectionTransitionFrom = nil
+            flyDirectionTransitionTo = nil
+            flyDirectionTransitionTime = 0
+            flyIdleWeight = 1
+            flyMoveWeight = 0
+            flyBackwardWeight = 0
+        elseif residualReversalFrom and not flyDirectionTransitionActive then
+            -- A short stop left enough of the previous direction alive to make
+            -- this a real reversal. Start the same V190.9 continuous 3-way
+            -- blend from that residual direction instead of resetting to Idle.
+            flyDirectionTransitionActive = true
+            flyDirectionTransitionFrom = residualReversalFrom
+            flyDirectionTransitionTo = requestedState
+            flyDirectionTransitionTime = 0
+
+            print(string.format(
+                "[VGD Fly V190.11] Continuous stop-reversal: %s -> %s; 3-way blend %.2fs (Idle max %.0f%%)",
+                residualReversalFrom,
+                requestedState,
+                FLY_DIRECTION_CONTINUOUS_BLEND_TIME,
+                FLY_DIRECTION_CONTINUOUS_IDLE_MAX * 100
+            ))
+        elseif not flyDirectionTransitionActive then
+            local currentDominant
+            if flyMoveWeight >= flyBackwardWeight then
+                currentDominant = "Forward"
+            else
+                currentDominant = "Backward"
+            end
+
+            if currentDominant ~= requestedState then
+                flyDirectionTransitionActive = true
+                flyDirectionTransitionFrom = currentDominant
+                flyDirectionTransitionTo = requestedState
+                flyDirectionTransitionTime = 0
+
+                print(string.format(
+                    "[VGD Fly V190.12] Continuous direction diagnostic: %s -> %s; 3-way blend %.2fs (Idle max %.0f%%)",
+                    currentDominant,
+                    requestedState,
+                    FLY_DIRECTION_CONTINUOUS_BLEND_TIME,
+                    FLY_DIRECTION_CONTINUOUS_IDLE_MAX * 100
+                ))
+            end
+        elseif flyDirectionTransitionTo ~= requestedState then
+            -- Reverse an active transition without dropping through Idle.
+            -- Mirror the progress so the currently dominant direction stays
+            -- dominant instead of resetting weights and creating a second snap.
+            local previousTo = flyDirectionTransitionTo
+            flyDirectionTransitionTo = requestedState
+            flyDirectionTransitionFrom = previousTo
+            flyDirectionTransitionTime =
+                math.max(FLY_DIRECTION_CONTINUOUS_BLEND_TIME - flyDirectionTransitionTime, 0)
+
+            print(string.format(
+                "[VGD Fly V190.12] Continuous direction diagnostic: transition interrupted; reversing %s -> %s without Idle pause",
+                previousTo,
+                requestedState
+            ))
+        end
+    else
+        -- Entering Idle explicitly ends any reversal state. The next movement
+        -- must therefore start from Idle, even if the previous direction track
+        -- is still fading out underneath it.
+        flyDirectionTransitionActive = false
+        flyDirectionTransitionFrom = nil
+        flyDirectionTransitionTo = nil
+        flyDirectionTransitionTime = 0
+    end
+
+    if requestedState == "Forward" or requestedState == "Backward" then
+        flyLastDirectionalState = requestedState
+    end
+
+    flyPreviousDesiredState = requestedState
+
+    if flyDirectionTransitionActive
+        and (flyDirectionTransitionFrom == "Forward" or flyDirectionTransitionFrom == "Backward")
+        and (flyDirectionTransitionTo == "Forward" or flyDirectionTransitionTo == "Backward") then
+
+        flyDirectionTransitionTime = math.min(
+            flyDirectionTransitionTime + deltaTime,
+            FLY_DIRECTION_CONTINUOUS_BLEND_TIME
+        )
+
+        local rawT = math.clamp(
+            flyDirectionTransitionTime / FLY_DIRECTION_CONTINUOUS_BLEND_TIME,
             0,
             1
         )
+        -- V190.12: keep the V190.11 no-snap three-way path, but restore a
+        -- response curve closer to V190's normal exponential animation blend.
+        -- The reversal still has a fixed 0.45s window, but the directional
+        -- handoff starts and settles more like V190 instead of the slower
+        -- smoothstep trajectory used by the previous diagnostic versions.
+        local V190_REVERSAL_RESPONSE = 0.18
+        local responseEnd = 1 - math.exp(-FLY_DIRECTION_CONTINUOUS_BLEND_TIME / V190_REVERSAL_RESPONSE)
+        local t = 0
+        if responseEnd > 0.000001 then
+            t = (1 - math.exp(
+                -flyDirectionTransitionTime / V190_REVERSAL_RESPONSE
+            )) / responseEnd
+        end
+        t = math.clamp(t, 0, 1)
+        local idlePulse = math.sin(math.pi * t) * FLY_DIRECTION_CONTINUOUS_IDLE_MAX
+        local directionalShare = 1 - idlePulse
+
+        local fromWeight = directionalShare * (1 - t)
+        local toWeight = directionalShare * t
+
+        flyIdleWeight = idlePulse
+        if flyDirectionTransitionFrom == "Forward" then
+            flyMoveWeight = fromWeight
+            flyBackwardWeight = toWeight
+        else
+            flyBackwardWeight = fromWeight
+            flyMoveWeight = toWeight
+        end
+
+        if idle and not idle.IsPlaying then
+            idle:Play(0, 1, 1)
+        end
+        if move and not move.IsPlaying then
+            move:Play(0, 1, 1)
+        end
+        if backward and not backward.IsPlaying then
+            backward:Play(0, 1, 1)
+        end
+
+        idle:AdjustWeight(flyIdleWeight, 0)
+        move:AdjustWeight(flyMoveWeight, 0)
+        backward:AdjustWeight(flyBackwardWeight, 0)
+
+        if rawT >= 1 then
+            flyDirectionTransitionActive = false
+            flyDirectionTransitionFrom = nil
+            flyDirectionTransitionTo = nil
+            flyDirectionTransitionTime = 0
+
+            -- Finish exactly on the requested direction, with no Idle tail.
+            flyIdleWeight = 0
+            flyMoveWeight = requestedState == "Forward" and 1 or 0
+            flyBackwardWeight = requestedState == "Backward" and 1 or 0
+
+            idle:AdjustWeight(0, 0)
+            move:AdjustWeight(flyMoveWeight, 0)
+            backward:AdjustWeight(flyBackwardWeight, 0)
+
+            print("[VGD Fly V190.12] Continuous direction diagnostic: transition complete; no Idle pause")
+        end
     else
-        blendAlpha = 1 - math.exp(-deltaTime / 0.18)
-    end
+        -- Normal V190 behavior for Idle and for ordinary non-reversal states.
+        local idleTarget = requestedState == "Idle" and 1 or 0
+        local moveTarget = requestedState == "Forward" and 1 or 0
+        local backwardTarget = requestedState == "Backward" and 1 or 0
 
-    flyIdleWeight = flyIdleWeight
-        + (idleTarget - flyIdleWeight) * blendAlpha
-    flyMoveWeight = flyMoveWeight
-        + (moveTarget - flyMoveWeight) * blendAlpha
-    flyBackwardWeight = flyBackwardWeight
-        + (backwardTarget - flyBackwardWeight) * blendAlpha
+        local blendAlpha
+        if flyStartupFinalBlendActive then
+            -- V191: synchronize the animation crossfade to the SAME physical
+            -- launch progress instead of letting Fly Idle ease in independently.
+            -- This keeps the Ascend pose continuously moving toward Idle while
+            -- the character is rising, so there is no end-of-launch pose snap.
+            local launchElapsed = math.max(
+                flyStartupLaunchTime - FLY_STARTUP_LAUNCH_DELAY,
+                0
+            )
+            local launchP = math.clamp(
+                launchElapsed / math.max(FLY_STARTUP_LAUNCH_DURATION, 0.05),
+                0,
+                1
+            )
+            local smoothP = launchP * launchP * (3 - 2 * launchP)
 
-    if idle and not idle.IsPlaying then
-        idle:Play(0, 1, 1)
-    end
-    if move and not move.IsPlaying then
-        move:Play(0, 1, 1)
-    end
-    if backward and not backward.IsPlaying then
-        backward:Play(0, 1, 1)
-    end
+            flyStartupFinalBlendTime = launchElapsed
+            flyIdleWeight = smoothP
+            flyMoveWeight = 0
+            flyBackwardWeight = 0
 
-    if idle then idle:AdjustWeight(flyIdleWeight, 0) end
-    if move then move:AdjustWeight(flyMoveWeight, 0) end
-    if backward then backward:AdjustWeight(flyBackwardWeight, 0) end
+            local ascendTrack = flyStartupAscendTrack
+            if ascendTrack then
+                pcall(function()
+                    ascendTrack:AdjustWeight(1 - smoothP, 0)
+                end)
+            end
+
+            blendAlpha = 0
+        else
+            blendAlpha = 1 - math.exp(-deltaTime / 0.18)
+
+            flyIdleWeight = flyIdleWeight
+                + (idleTarget - flyIdleWeight) * blendAlpha
+            flyMoveWeight = flyMoveWeight
+                + (moveTarget - flyMoveWeight) * blendAlpha
+            flyBackwardWeight = flyBackwardWeight
+                + (backwardTarget - flyBackwardWeight) * blendAlpha
+        end
+
+        if idle and not idle.IsPlaying then
+            idle:Play(0, 1, 1)
+        end
+        if move and not move.IsPlaying then
+            move:Play(0, 1, 1)
+        end
+        if backward and not backward.IsPlaying then
+            backward:Play(0, 1, 1)
+        end
+
+        if idle then idle:AdjustWeight(flyIdleWeight, 0) end
+        if move then move:AdjustWeight(flyMoveWeight, 0) end
+        if backward then backward:AdjustWeight(flyBackwardWeight, 0) end
+    end
 
     local speedTarget = isMoving
         and math.clamp(moveDirection.Magnitude, 0, 1)
@@ -2856,9 +3121,11 @@ local function updateFly(deltaTime)
         )
     end
 
-    -- V183: the landing animation owns the 0.00 -> 0.90s crouch. The
-    -- dedicated ascend animation uses only its first 4.00s over 0.60s, while the real body
-    -- begins its physical lift at 1.40s and settles into Fly Idle by 2.00s.
+    -- V191: the landing animation owns the 0.00 -> 0.90s crouch. The
+    -- dedicated ascend animation uses only its first 4.00s over 0.60s.
+    -- From 1.40s -> 2.00s, the physical rise and Ascend -> Fly Idle crossfade
+    -- share one normalized progress value so the character reaches the top
+    -- already blended into Fly Idle instead of holding the Ascend pose first.
     local startupOffset = 0
     if flyStartupLaunchActive and flyStartupStartPosition then
         -- 0.90 -> 1.40s: ascend animation owns the pose; stay grounded.
@@ -2879,6 +3146,15 @@ local function updateFly(deltaTime)
                 flyStartupFinalBlendActive = true
                 flyStartupFinalBlendTime = 0
                 startNormalFlyAnimationSet(true)
+
+                -- The dedicated Ascend track stays fully continuous here.
+                -- V191 fades it by the same normalized progress used for the
+                -- physical rise, rather than scheduling a separate delayed
+                -- fade at the top.
+                local ascendTrack = flyStartupAscendTrack
+                if ascendTrack then
+                    pcall(function() ascendTrack:AdjustWeight(1, 0) end)
+                end
             end
         end
 
@@ -2897,8 +3173,10 @@ local function updateFly(deltaTime)
             end
             if ascendTrack then
                 pcall(function() ascendTrack:AdjustSpeed(0) end)
-                pcall(function() ascendTrack:AdjustWeight(0, FLY_STARTUP_ASCEND_FADE_OUT) end)
-                task.delay(FLY_STARTUP_ASCEND_FADE_OUT, function()
+                -- The weight has already reached zero through the synchronized
+                -- launch crossfade. Stop only after the blend has completed.
+                pcall(function() ascendTrack:AdjustWeight(0, 0) end)
+                task.delay(0.05, function()
                     pcall(function() ascendTrack:Stop(0) end)
                     pcall(function() ascendTrack:Destroy() end)
                 end)
@@ -4613,7 +4891,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.fromOffset(34, 18)
 versionLabel.Position = UDim2.new(1, -67, 0, 10)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "V190"
+versionLabel.Text = "V191"
 versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
 versionLabel.Font = Enum.Font.Gotham
 versionLabel.TextSize = 9
