@@ -1,26 +1,19 @@
--- VGD Standalone Animation ID Finder v1
--- Extracted from the VGD Design2 v120 animation-ID finder.
---
--- Purpose:
---   Watch the LOCAL CHARACTER's playing AnimationTracks and report
---   previously unknown animation IDs to the Developer Console (F9).
---
--- Usage:
---   1. Execute this script.
---   2. Play/equip the animation you want to identify.
---   3. Press F9 and check the Log/Output.
---   4. Look for:
---      [VGD ANIMATION FINDER] NEW UNKNOWN | ID=...
---
--- This script does not contain the VGD GUI, Fly, Freecam, ESP, etc.
+-- =========================================================
+-- VGD STANDALONE ANIMATION ID FINDER v6
+-- VGD-STYLE C CONSOLE SHORTCUT
+-- =========================================================
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
 
 local player = Players.LocalPlayer
 
--- IDs already identified in the original VGD finder.
--- These are ignored so the console focuses on new animations.
+-- =========================================================
+-- KNOWN ANIMATION IDS
+-- =========================================================
+
 local KNOWN_ANIMATION_IDS = {
     ["106706162821039"] = "Known Idle",
     ["122267405214601"] = "Known Walk",
@@ -32,8 +25,16 @@ local KNOWN_ANIMATION_IDS = {
     ["9249714289844"] = "Known/old candidate",
 }
 
+-- =========================================================
+-- ANIMATION FINDER
+-- =========================================================
+
 local animationFinderConnection = nil
 local animationFinderSeen = {}
+
+-- Console output policy:
+--   * Normal startup/known-ID information: print() -> normal/white
+--   * Newly detected unknown animation IDs: warn() -> yellow
 
 local function scanAnimations()
     local character = player.Character
@@ -79,16 +80,288 @@ local function startAnimationFinder()
 
     animationFinderSeen = {}
 
-    animationFinderConnection = RunService.Heartbeat:Connect(scanAnimations)
+    animationFinderConnection =
+        RunService.Heartbeat:Connect(scanAnimations)
 
-    warn("[VGD ANIMATION FINDER] v1 ACTIVE.")
-    warn("[VGD ANIMATION FINDER] Known IDs are blocked: Idle=106706162821039, Walk=122267405214601, Run=92749812489844, Backward=117465215021389.")
-    warn("[VGD ANIMATION FINDER] Play/equip the animation you want to identify and look for NEW UNKNOWN.")
+    -- Normal informational messages use print(), so they appear
+    -- as normal console text instead of yellow warnings.
+    print("[VGD ANIMATION FINDER] v5 ACTIVE.")
+    print("[VGD ANIMATION FINDER] Known IDs are blocked:")
+    print("[VGD ANIMATION FINDER] Idle=106706162821039")
+    print("[VGD ANIMATION FINDER] Walk=122267405214601")
+    print("[VGD ANIMATION FINDER] Run=92749812489844")
+    print("[VGD ANIMATION FINDER] Backward=117465215021389")
 end
 
-startAnimationFinder()
+-- =========================================================
+-- GUI
+-- =========================================================
+
+local playerGui = player:WaitForChild("PlayerGui")
+
+local oldGui = playerGui:FindFirstChild("VGD_AnimationFinder")
+if oldGui then
+    oldGui:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "VGD_AnimationFinder"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = playerGui
+
+-- =========================================================
+-- VGD-STYLE C SHORTCUT
+-- =========================================================
+
+local ConsoleButton = Instance.new("TextButton", ScreenGui)
+
+ConsoleButton.Name = "ConsoleShortcut"
+
+ConsoleButton.Size = UDim2.new(
+    0, 44,
+    0, 44
+)
+
+ConsoleButton.Position = UDim2.new(
+    1, -55,
+    0.55, -150
+)
+
+ConsoleButton.AnchorPoint = Vector2.new(0.5, 0.5)
+
+ConsoleButton.BackgroundColor3 = Color3.fromRGB(18, 26, 34)
+
+ConsoleButton.Text = "C"
+ConsoleButton.TextColor3 = Color3.new(1, 1, 1)
+ConsoleButton.Font = Enum.Font.SourceSansBold
+ConsoleButton.TextSize = 22
+
+ConsoleButton.AutoButtonColor = false
+ConsoleButton.Active = true
+
+local ConsoleCorner = Instance.new("UICorner")
+ConsoleCorner.CornerRadius = UDim.new(0, 8)
+ConsoleCorner.Parent = ConsoleButton
+
+local ConsoleShortcutStroke = Instance.new("UIStroke")
+ConsoleShortcutStroke.Color = Color3.fromRGB(45, 170, 255)
+ConsoleShortcutStroke.Thickness = 1.5
+ConsoleShortcutStroke.Transparency = 0.15
+ConsoleShortcutStroke.Parent = ConsoleButton
+
+-- =========================================================
+-- C BUTTON DRAG STATE
+-- =========================================================
+
+local consoleDragging = false
+local consoleDragStart = nil
+local consoleStartPosition = nil
+local consoleActiveInput = nil
+local consoleMoved = false
+
+local function clampConsolePosition(position)
+    local parent = ConsoleButton.Parent
+
+    if not parent then
+        return position
+    end
+
+    local parentSize = parent.AbsoluteSize
+    local buttonSize = ConsoleButton.AbsoluteSize
+
+    if parentSize.X <= 0
+        or parentSize.Y <= 0
+        or buttonSize.X <= 0
+        or buttonSize.Y <= 0
+    then
+        return position
+    end
+
+    local centerX =
+        parentSize.X * position.X.Scale
+        + position.X.Offset
+
+    local centerY =
+        parentSize.Y * position.Y.Scale
+        + position.Y.Offset
+
+    local halfWidth = buttonSize.X * 0.5
+    local halfHeight = buttonSize.Y * 0.5
+
+    local minCenterX = halfWidth
+    local maxCenterX = math.max(
+        minCenterX,
+        parentSize.X - halfWidth
+    )
+
+    local minCenterY = halfHeight
+    local maxCenterY = math.max(
+        halfHeight,
+        parentSize.Y - halfHeight
+    )
+
+    centerX = math.clamp(
+        centerX,
+        minCenterX,
+        maxCenterX
+    )
+
+    centerY = math.clamp(
+        centerY,
+        minCenterY,
+        maxCenterY
+    )
+
+    return UDim2.new(
+        position.X.Scale,
+        centerX - (
+            parentSize.X * position.X.Scale
+        ),
+        position.Y.Scale,
+        centerY - (
+            parentSize.Y * position.Y.Scale
+        )
+    )
+end
+
+-- =========================================================
+-- CONSOLE TOGGLE
+-- =========================================================
+--
+-- Use Roblox's actual DevConsoleVisible core state instead of
+-- maintaining our own boolean. This is important because the
+-- Developer Console can also be closed by its own X button.
+--
+-- Roblox documents:
+--   StarterGui:GetCore("DevConsoleVisible")
+-- as returning the current Developer Console visibility.
+-- =========================================================
+
+local function getConsoleVisible()
+    for _ = 1, 3 do
+        local success, visible = pcall(function()
+            return StarterGui:GetCore("DevConsoleVisible")
+        end)
+
+        if success and type(visible) == "boolean" then
+            return visible
+        end
+
+        task.wait(0.05)
+    end
+
+    return nil
+end
+
+local function setConsoleVisible(visible)
+    for _ = 1, 3 do
+        local success = pcall(function()
+            StarterGui:SetCore(
+                "DevConsoleVisible",
+                visible
+            )
+        end)
+
+        if success then
+            return true
+        end
+
+        task.wait(0.05)
+    end
+
+    return false
+end
+
+local function toggleConsole()
+    local currentVisible = getConsoleVisible()
+
+    if currentVisible == nil then
+        -- If Roblox has not exposed the state yet, default to opening.
+        setConsoleVisible(true)
+        return
+    end
+
+    setConsoleVisible(not currentVisible)
+end
+
+-- =========================================================
+-- C BUTTON INPUT
+-- =========================================================
+
+ConsoleButton.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1
+    then
+        consoleDragging = true
+        consoleMoved = false
+        consoleActiveInput = input
+
+        consoleDragStart = input.Position
+        consoleStartPosition = ConsoleButton.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if not consoleDragging then
+        return
+    end
+
+    if input ~= consoleActiveInput then
+        return
+    end
+
+    local delta = input.Position - consoleDragStart
+
+    if math.abs(delta.X) > 5
+        or math.abs(delta.Y) > 5
+    then
+        consoleMoved = true
+    end
+
+    local newPosition = UDim2.new(
+        consoleStartPosition.X.Scale,
+        consoleStartPosition.X.Offset + delta.X,
+        consoleStartPosition.Y.Scale,
+        consoleStartPosition.Y.Offset + delta.Y
+    )
+
+    ConsoleButton.Position =
+        clampConsolePosition(newPosition)
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if not consoleDragging then
+        return
+    end
+
+    if input ~= consoleActiveInput then
+        return
+    end
+
+    consoleDragging = false
+
+    -- Same VGD behavior:
+    -- tap = action
+    -- drag = move only
+    if not consoleMoved then
+        toggleConsole()
+    end
+
+    consoleActiveInput = nil
+end)
+
+-- =========================================================
+-- CHARACTER CHANGE
+-- =========================================================
 
 player.CharacterAdded:Connect(function()
     animationFinderSeen = {}
-    warn("[VGD ANIMATION FINDER] Character changed; finder remains active.")
 end)
+
+-- =========================================================
+-- START
+-- =========================================================
+
+startAnimationFinder()
