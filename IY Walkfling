@@ -1,0 +1,119 @@
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local walkflinging = false
+local flingThread = nil
+local noclipConnection = nil
+
+local function getRoot(char)
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function setNoclip(enabled)
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
+    end
+    if enabled then
+        noclipConnection = RunService.Stepped:Connect(function()
+            local char = LocalPlayer.Character
+            if not char then return end
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end)
+    end
+end
+
+local function stopWalkFling()
+    walkflinging = false
+    setNoclip(false)
+    flingThread = nil
+end
+
+local function startWalkFling()
+    if walkflinging then return end
+
+    local char = LocalPlayer.Character
+    if not char then
+        LocalPlayer.CharacterAdded:Wait()
+        char = LocalPlayer.Character
+    end
+
+    setNoclip(true)
+    walkflinging = true
+
+    local humanoid = char:FindFirstChildWhichIsA("Humanoid")
+    if humanoid then
+        humanoid.Died:Connect(function()
+            stopWalkFling()
+        end)
+    end
+
+    local root = getRoot(char)
+    if root then
+        pcall(function()
+            root:SetNetworkOwner(LocalPlayer)
+        end)
+    end
+
+    flingThread = task.spawn(function()
+        local movel = 0.1
+        repeat
+            RunService.Heartbeat:Wait()
+
+            local character = LocalPlayer.Character
+            local root = getRoot(character)
+
+            while not (character and character.Parent and root and root.Parent) do
+                RunService.Heartbeat:Wait()
+                character = LocalPlayer.Character
+                root = getRoot(character)
+            end
+
+            local vel = root.Velocity
+            root.Velocity = vel * 10000 + Vector3.new(0, 10000, 0)
+
+            RunService.RenderStepped:Wait()
+
+            if character and character.Parent and root and root.Parent then
+                root.Velocity = vel
+            end
+
+            RunService.Stepped:Wait()
+
+            if character and character.Parent and root and root.Parent then
+                root.Velocity = vel + Vector3.new(0, movel, 0)
+                movel = movel * -1
+            end
+        until walkflinging == false
+    end)
+end
+
+local function toggleWalkFling()
+    if walkflinging then
+        stopWalkFling()
+    else
+        startWalkFling()
+    end
+    return walkflinging
+end
+
+LocalPlayer.CharacterAdded:Connect(function()
+    if walkflinging then
+        task.wait(0.5)
+        if walkflinging then
+            stopWalkFling()
+            startWalkFling()
+        end
+    end
+end)
+
+_G.toggleWalkFling = toggleWalkFling
+_G.stopWalkFling = stopWalkFling
+
+
+startWalkFling()
