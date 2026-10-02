@@ -1,5 +1,6 @@
--- VGD OUTPUT CONSOLE GUI v57
--- V57: Make the error-count glyph pure white; preserve badge size, placement, and surrounding design.
+-- VGD OUTPUT CONSOLE GUI v59
+-- V59: Flash the inner fill of the two-square copy glyph in its severity color for 1.5 seconds; leave its button background unchanged.
+-- V58: Tint the collapsed expand chevron by log severity: warning yellow, error red, info retains muted blue.
 -- V53: Move the smaller new-error badge to the shortcut top-left corner, half inside/outside.
 -- V52: Start with the console panel hidden; open it using the existing floating shortcut.
 -- V51: Append matching live logs in place during search/filter to preserve viewport.
@@ -234,7 +235,8 @@ local function createRow(rec,i,expanded)
   local head=string.format("%s  %s  [%s]  ",mark,rec.time,string.upper(rec.kind))
   local availableWidth=math.max(40,output.AbsoluteSize.X-6-14-20)
   local baseText=escapeRichText(head)..highlightedText(rec.text,query)
-  local collapsedText=baseText..'  <font color="rgb(120,145,171)">›</font>'
+  local expandColor=rec.kind=="Error" and "rgb(255,116,128)" or (rec.kind=="Warning" and "rgb(255,198,91)" or "rgb(120,145,171)")
+  local collapsedText=baseText..'  <font color="'..expandColor..'">›</font>' 
   local measured=TextService:GetTextSize(head..rec.text.."  ›",11,Enum.Font.Code,Vector2.new(availableWidth,120))
   local baseHeight=math.clamp(math.ceil(measured.Y)+6,23,120)
   local main=Instance.new("TextLabel"); main.Name="OriginalLogText"; main.BackgroundTransparency=1; main.BorderSizePixel=0
@@ -300,7 +302,29 @@ local function createRow(rec,i,expanded)
   local frontStroke=Instance.new("UIStroke",frontSheet)
   frontStroke.Color=colorFor(rec.kind)
   frontStroke.Thickness=1
+  local copyGlyphColor=colorFor(rec.kind)
+  local copyFlashGeneration=0
+  local function setCopyGlyphFilled(filled)
+   if filled then
+    backSheet.BackgroundColor3=copyGlyphColor
+    backSheet.BackgroundTransparency=0.12
+    frontSheet.BackgroundColor3=copyGlyphColor
+    frontSheet.BackgroundTransparency=0.12
+   else
+    backSheet.BackgroundTransparency=1
+    frontSheet.BackgroundColor3=row.BackgroundColor3
+    frontSheet.BackgroundTransparency=0
+   end
+  end
   copyOne.Activated:Connect(function()
+   copyFlashGeneration+=1
+   local thisFlash=copyFlashGeneration
+   setCopyGlyphFilled(true)
+   task.delay(1.5,function()
+    if copyOne.Parent and thisFlash==copyFlashGeneration then
+     setCopyGlyphFilled(false)
+    end
+   end)
    local setter=setclipboard or toclipboard
    local payload=string.format("[%s] [%s] %s",rec.time,rec.kind,rec.text)
    if type(setter)=="function" then pcall(setter,payload); footer.Text="Selected log copied when clipboard is supported." else footer.Text="Clipboard unavailable in this environment." end
