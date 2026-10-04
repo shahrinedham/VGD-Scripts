@@ -1305,3 +1305,26 @@ connectManaged(UserInputService.InputEnded, function(input)
 end)
 
 print("[VGD Combat] Standalone v1 loaded. Tap the kick button to play; hold it during playback to stop.")
+
+
+-- Controller API for VGD Hub. Direct execution still starts the standalone GUI.
+local VGDCombatController = {}
+function VGDCombatController.SetEnabled(enabled)
+    enabled = enabled == true
+    if not enabled then
+        runToken += 1
+        cancelRequested = true
+        stopTracks(activeTracks, 0)
+        table.clear(activeTracks)
+        stopPreview()
+        running = false
+        cancelRequested = false
+        if stopButton then stopButton.Visible = false end
+        if loopButton then loopButton.Visible = true end
+        if button then button.Text = "K" end
+    end
+    gui.Enabled = enabled
+    return true
+end
+function VGDCombatController.IsEnabled() return gui.Enabled end
+return VGDCombatController
