@@ -41,8 +41,33 @@ local ANTI_FLING_MAX_ANGULAR_VELOCITY = 60
 local ANTI_FLING_MAX_POSITION_DELTA = 15
 
 local lastAntiFlingScan = 0
+local lastAntiFlingAssemblyRecheck = 0
 local antiFlingLastSafeCFrame = nil
 local antiFlingLastRootPosition = nil
+
+-- Reused query/filter state to avoid per-scan allocations on mobile.
+local antiFlingOverlapParams = nil
+local antiFlingOverlapFilter = {}
+local antiFlingAssemblyScratch = {}
+local antiFlingNDSMaintenanceInterval = 0.25
+local antiFlingAssemblyRecheckInterval = 0.06
+local antiFlingCharacterRefreshInterval = 0.25
+local antiFlingPlayerRefreshInterval = 0.20
+
+-- Adaptive performance / recovery watchdog.  This is intentionally a
+-- soft-recovery system: if AntiFling itself repeatedly consumes too much
+-- frame time, it temporarily disables the protection stack, lets Roblox
+-- breathe, then restores it. A true hard client freeze cannot be recovered
+-- by Lua because no script code can execute while the client is fully frozen.
+local antiFlingWatchdogFrameBudget = 0.035
+local antiFlingWatchdogStrikeLimit = 3
+local antiFlingWatchdogCooldown = 0.50
+local antiFlingWatchdogStrikes = 0
+local antiFlingRecoveryInProgress = false
+local antiFlingLastRecovery = 0
+
+local lastAntiFlingCharacterRefresh = 0
+local lastAntiFlingPlayerRefresh = 0
 
 
 -- =========================================================
@@ -56,6 +81,7 @@ local antiFlingNDSHazards = {}
 local antiFlingNDSPartConnections = {}
 local antiFlingNDSHazardConnections = {}
 local antiFlingNDSPartStates = {}
+local antiFlingLastNDSMaintenance = 0
 
 
 -- =========================================================
@@ -875,6 +901,10 @@ local function maintainTrackedNDSHazards()
         return
     end
 
+    -- Existing hazard descendants are already protected through
+    -- DescendantAdded/ChildAdded/property listeners. The maintenance pass
+    -- only validates the tracked hazard roots instead of repeatedly walking
+    -- every descendant on every RenderStepped.
     for hazard in pairs(
         antiFlingNDSHazards
     ) do
@@ -886,47 +916,17 @@ local function maintainTrackedNDSHazards()
                 hazard
             ] = nil
 
-        elseif isTargetNDSHazard(hazard) then
-
-            if hazard:IsA("BasePart") then
-
-                neutralizeNDSPart(
-                    hazard
-                )
-
-            end
-
-            pcall(function()
-
-                for _, descendant in ipairs(
-                    hazard:GetDescendants()
-                ) do
-
-                    if descendant:IsA("BasePart") then
-
-                        neutralizeNDSPart(
-                            descendant
-                        )
-
-                    elseif descendant:IsA(
-                        "TouchTransmitter"
-                    ) then
-
-                        pcall(function()
-                            descendant:Destroy()
-                        end)
-
-                    end
-
-                end
-
-            end)
-
-        else
+        elseif not isTargetNDSHazard(hazard) then
 
             antiFlingNDSHazards[
                 hazard
             ] = nil
+
+        elseif hazard:IsA("BasePart") then
+
+            neutralizeNDSPart(
+                hazard
+            )
 
         end
 
@@ -1608,6 +1608,10 @@ local function startAntiFlingNoFall()
 
                 local oldvel =
                     root.AssemblyLinearVelocity
+
+                if oldvel.Magnitude <= 0.001 then
+                    return
+                end
 
                 root.AssemblyLinearVelocity =
                     Vector3.zero
@@ -2369,6 +2373,28 @@ local function antiFlingNewPartCheck(part)
 
     end
 
+    local character =
+        player.Character
+
+    if character
+        and part:IsDescendantOf(character) then
+
+        if not antiFlingCharacterParts[part] then
+            local originalGroup
+            pcall(function()
+                originalGroup = part.CollisionGroup
+            end)
+            antiFlingCharacterParts[part] = originalGroup
+        end
+
+        pcall(function()
+            part.CollisionGroup =
+                ANTI_FLING_CHARACTER_GROUP
+        end)
+
+        return
+    end
+
     protectAntiFlingCollisionPart(part)
 
     if part.Anchored then
@@ -2442,7 +2468,6 @@ local function protectLocalCharacter()
         return
     end
 
-    protectAntiFlingCharacter()
 
     local root =
         character:FindFirstChild(
@@ -2562,18 +2587,20 @@ local function scanAntiFlingParts()
         return
     end
 
-    local overlapParams =
-        OverlapParams.new()
+    if not antiFlingOverlapParams then
+        antiFlingOverlapParams =
+            OverlapParams.new()
 
-    overlapParams.FilterType =
-        Enum.RaycastFilterType.Exclude
+        antiFlingOverlapParams.FilterType =
+            Enum.RaycastFilterType.Exclude
 
-    overlapParams.FilterDescendantsInstances = {
-        character
-    }
+        antiFlingOverlapParams.MaxParts =
+            ANTI_FLING_MAX_PARTS
+    end
 
-    overlapParams.MaxParts =
-        ANTI_FLING_MAX_PARTS
+    antiFlingOverlapFilter[1] = character
+    antiFlingOverlapParams.FilterDescendantsInstances =
+        antiFlingOverlapFilter
 
     local nearbyParts
 
@@ -2596,12 +2623,14 @@ local function scanAntiFlingParts()
         return
     end
 
-    local assemblies = {}
+    table.clear(antiFlingAssemblyScratch)
+
+    local assemblies =
+        antiFlingAssemblyScratch
 
     for _, part in ipairs(
         nearbyParts
     ) do
-
         if part
             and part.Parent
             and part:IsA("BasePart")
@@ -2756,7 +2785,7 @@ local function maintainAntiFlingCollisionShield()
     antiFlingGlobalScanCounter =
         antiFlingGlobalScanCounter + 1
 
-    if antiFlingGlobalScanCounter >= 8 then
+    if antiFlingGlobalScanCounter >= 20 then
 
         antiFlingGlobalScanCounter = 0
 
@@ -2766,6 +2795,33 @@ local function maintainAntiFlingCollisionShield()
 
     protectAntiFlingCharacter()
 
+end
+
+local disableAntiFling
+local enableAntiFling
+
+local function requestAntiFlingRecovery()
+    if not antiFling or antiFlingRecoveryInProgress then
+        return
+    end
+
+    local now = os.clock()
+    if now - antiFlingLastRecovery < antiFlingWatchdogCooldown then
+        return
+    end
+
+    antiFlingRecoveryInProgress = true
+    antiFlingLastRecovery = now
+    antiFlingWatchdogStrikes = 0
+
+    -- Fully tear down the current protection state so Roblox gets a clean
+    -- frame window instead of leaving expensive trackers alive.
+    disableAntiFling()
+
+    task.delay(0.20, function()
+        antiFlingRecoveryInProgress = false
+        enableAntiFling()
+    end)
 end
 
 local function updateAntiFling()
@@ -2792,13 +2848,34 @@ local function updateAntiFling()
 
     protectLocalCharacter()
 
+    local now = os.clock()
+
+    if now - lastAntiFlingCharacterRefresh >=
+        antiFlingCharacterRefreshInterval then
+
+        lastAntiFlingCharacterRefresh = now
+        protectAntiFlingCharacter()
+
+    end
+
+    if now - lastAntiFlingPlayerRefresh >=
+        antiFlingPlayerRefreshInterval then
+
+        lastAntiFlingPlayerRefresh = now
+        updatePlayerNoCollision()
+
+    end
+
     maintainAntiFlingCollisionShield()
 
-    updatePlayerNoCollision()
+    if now - (antiFlingLastNDSMaintenance or 0) >=
+        antiFlingNDSMaintenanceInterval then
 
-    maintainTrackedNDSHazards()
+        antiFlingLastNDSMaintenance = now
+        maintainTrackedNDSHazards()
 
-    local now = os.clock()
+    end
+
 
     if now -
         lastAntiFlingScan <
@@ -2811,7 +2888,15 @@ local function updateAntiFling()
     lastAntiFlingScan = now
 
     scanAntiFlingParts()
-    recheckTrackedAntiFlingAssemblies()
+
+    local now = os.clock()
+    if now - lastAntiFlingAssemblyRecheck >=
+        antiFlingAssemblyRecheckInterval then
+
+        lastAntiFlingAssemblyRecheck = now
+        recheckTrackedAntiFlingAssemblies()
+
+    end
 
 end
 
@@ -2820,7 +2905,7 @@ end
 -- ENABLE ANTIFLING
 -- =========================================================
 
-local function enableAntiFling()
+enableAntiFling = function()
 
     if antiFling then
         return
@@ -2829,9 +2914,14 @@ local function enableAntiFling()
     antiFling = true
 
     lastAntiFlingScan = 0
+    lastAntiFlingAssemblyRecheck = 0
+    antiFlingLastNDSMaintenance = 0
+    lastAntiFlingCharacterRefresh = 0
+    lastAntiFlingPlayerRefresh = 0
     antiFlingLastSafeCFrame = nil
     antiFlingLastRootPosition = nil
     antiFlingGlobalScanCounter = 0
+    antiFlingWatchdogStrikes = 0
 
     table.clear(
         antiFlingTrackedAssemblies
@@ -3112,7 +3202,7 @@ end
 -- DISABLE ANTIFLING
 -- =========================================================
 
-local function disableAntiFling()
+disableAntiFling = function()
 
     antiFling = false
 
@@ -3131,7 +3221,15 @@ local function disableAntiFling()
     antiFlingLastRootPosition = nil
 
     lastAntiFlingScan = 0
+    lastAntiFlingAssemblyRecheck = 0
+    antiFlingLastNDSMaintenance = 0
     antiFlingGlobalScanCounter = 0
+    antiFlingWatchdogStrikes = 0
+    lastAntiFlingCharacterRefresh = 0
+    lastAntiFlingPlayerRefresh = 0
+    antiFlingOverlapParams = nil
+    antiFlingOverlapFilter[1] = nil
+    table.clear(antiFlingAssemblyScratch)
 
 end
 
@@ -3143,8 +3241,22 @@ end
 -- =========================================================
 
 RunService.RenderStepped:Connect(function()
-    if antiFling then
+    if antiFling and not antiFlingRecoveryInProgress then
+        local started = os.clock()
         updateAntiFling()
+        local elapsed = os.clock() - started
+
+        if elapsed >= antiFlingWatchdogFrameBudget then
+            antiFlingWatchdogStrikes = antiFlingWatchdogStrikes + 1
+        else
+            -- Require repeated expensive frames rather than reacting to one
+            -- normal scan spike.
+            antiFlingWatchdogStrikes = math.max(0, antiFlingWatchdogStrikes - 1)
+        end
+
+        if antiFlingWatchdogStrikes >= antiFlingWatchdogStrikeLimit then
+            task.spawn(requestAntiFlingRecovery)
+        end
     end
 end)
 
