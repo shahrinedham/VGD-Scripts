@@ -1,4 +1,6 @@
--- VGD OUTPUT CONSOLE GUI v59
+-- VGD OUTPUT CONSOLE GUI v61
+-- V61: Show a clear red CAPTURE LIMIT REACHED indicator at 999 records and update the initialization log to v61.
+-- V60: Raise the capture cap to 999 records and hard-stop capture at the cap to prevent repeated eviction/rebuild lag.
 -- V59: Flash the inner fill of the two-square copy glyph in its severity color for 1.5 seconds; leave its button background unchanged.
 -- V58: Tint the collapsed expand chevron by log severity: warning yellow, error red, info retains muted blue.
 -- V53: Move the smaller new-error badge to the shortcut top-left corner, half inside/outside.
@@ -12,8 +14,9 @@ local TextService = game:GetService("TextService")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 local GUI_NAME = "VGD_OutputConsole_v2"
-local MAX_LINES = 400
+local MAX_LINES = 999
 local records = {}
+local captureLimitReached = false
 local filter = "ALL"
 local query = ""
 local expandedId = nil
@@ -145,6 +148,8 @@ local outputStroke=Instance.new("UIStroke",output); outputStroke.Color=Color3.fr
 local list=Instance.new("UIListLayout",output); list.Padding=UDim.new(0,3); list.SortOrder=Enum.SortOrder.LayoutOrder
 local pad=Instance.new("UIPadding",output); pad.PaddingTop=UDim.new(0,6); pad.PaddingBottom=UDim.new(0,6); pad.PaddingLeft=UDim.new(0,6); pad.PaddingRight=UDim.new(0,6)
 local footer=label(panel,"Footer","CLIENT OUTPUT  •  newest logs appear below",UDim2.new(0,12,1,-20),UDim2.new(1,-24,0,13),Enum.Font.Gotham,9,Color3.fromRGB(125,143,165))
+local footerNormalColor=Color3.fromRGB(125,143,165)
+local footerLimitColor=Color3.fromRGB(255,82,98)
 
 local function kindName(t)
  local raw=tostring(t):gsub("^Enum%.MessageType%.","")
@@ -408,21 +413,14 @@ local function updateCounts()
 end
 local nextRecordId=1
 local function append(message,messageType)
+ if captureLimitReached then return end
  local kind=kindName(messageType)
  if kind=="Error" and not panelOpen then newErrorCount+=1; refreshErrorBadge() end
  local rec={id=nextRecordId,time=os.date("%H:%M:%S"),kind=kind,text=tostring(message)}
  nextRecordId+=1
  records[#records+1]=rec
- local evicted=nil
- if #records>MAX_LINES then evicted=table.remove(records,1) end
- if evicted and expandedId==evicted.id then expandedId=nil; lastTappedId=nil; lastTappedAt=0 end
  updateCounts()
- if evicted then
-  -- Eviction changes the beginning of the visible list; rebuild only for this
-  -- uncommon cap-boundary case. Ordinary live arrivals never tear down rows.
-  render()
-  return
- end
+ if #records>=MAX_LINES then captureLimitReached=true end
 
  if query~="" or filter~="ALL" then
   local visibleRecords=matchingRecords()
@@ -433,7 +431,7 @@ local function append(message,messageType)
   else
    resultCount.Text=(query=="" and "—" or (#visibleRecords==0 and "0/0" or (tostring(selectedMatch).."/"..tostring(#visibleRecords))))
   end
-  footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#visibleRecords,#records)
+  if captureLimitReached then footer.Text=string.format("CAPTURE LIMIT REACHED  •  %d/%d  •  STOPPED",#records,MAX_LINES); footer.TextColor3=footerLimitColor else footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#visibleRecords,#records); footer.TextColor3=footerNormalColor end
   -- Deliberately do not alter CanvasPosition here: the user may be inspecting
   -- an older search match while new matching logs arrive.
   return
@@ -441,7 +439,7 @@ local function append(message,messageType)
 
  createRow(rec,#records,false)
  resultCount.Text="—"
- footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#records,#records)
+ if captureLimitReached then footer.Text=string.format("CAPTURE LIMIT REACHED  •  %d/%d  •  STOPPED",#records,MAX_LINES); footer.TextColor3=footerLimitColor else footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#records,#records); footer.TextColor3=footerNormalColor end
  if autoScroll then
   task.defer(function()
    task.wait()
@@ -493,8 +491,9 @@ end)
 clear.Activated:Connect(function()
  local now=os.clock()
  if now-clearArmedAt<=CLEAR_CONFIRM_WINDOW then
-  table.clear(records); expandedId=nil; selectedMatch=0; clearArmedAt=0; newErrorCount=0; refreshErrorBadge()
+  table.clear(records); expandedId=nil; selectedMatch=0; clearArmedAt=0; newErrorCount=0; captureLimitReached=false; refreshErrorBadge()
   clear.Text="CLEAR"
+  footer.TextColor3=footerNormalColor
   updateCounts(); render()
  else
   clearArmedAt=now
@@ -626,4 +625,4 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 local connection=LogService.MessageOut:Connect(append)
 gui.Destroying:Connect(function() connection:Disconnect() end)
-append("VGD Output Console v21 initialized.",Enum.MessageType.MessageInfo)
+append("VGD Output Console v61 initialized.",Enum.MessageType.MessageInfo)
