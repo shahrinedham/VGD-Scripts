@@ -1,5 +1,5 @@
 --[[
-VGD WallWalk Standalone v48.76.16 POV - experimental segmented loader.
+VGD WallWalk Standalone v48.76.17 POV - experimental segmented loader.
 Derived from WallWalk_Standalone_v48.76.9_POV_Direction_UI_Polish.lua.
 Each top-level function is compiled separately and initialized in source order.
 Top-level state/functions are shared through one environment; function locals remain local.
@@ -8,7 +8,7 @@ This keeps the POV/camera/UI version's behavior while using the chunked loader a
 
 local compiler = loadstring
 if type(compiler) ~= "function" then
-    warn("VGD WallWalk v48.76.16 POV: loadstring is unavailable; no modules were started.")
+    warn("VGD WallWalk v48.76.17 POV: loadstring is unavailable; no modules were started.")
     return
 end
 
@@ -27,7 +27,7 @@ end
 
 local modules = {
     { name = '00_initial_state', source = [=[--[[
-    VGD WallWalk Standalone v48.76.16 POV Chunked Bootstrap
+    VGD WallWalk Standalone v48.76.17 POV Chunked Bootstrap
     Client Gravity Override + Surface-Relative Gravity + Ceiling Stair Lift Fix
 
     Base: v6 GravityController_Rebuild
@@ -4163,7 +4163,7 @@ function createUI()
     title.TextSize = 11
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.TextColor3 = Color3.new(1, 1, 1)
-    title.Text = "WallWalk v48.76.16"
+    title.Text = "WallWalk v48.76.17"
     title.TextTruncate = Enum.TextTruncate.AtEnd
     title.Parent = panel
 
@@ -4411,43 +4411,55 @@ end)]=] },
 for _, module in ipairs(modules) do
     local chunk, compileError = compiler(module.source)
     if not chunk then
-        warn("VGD WallWalk v48.76.16 POV compile failure in " .. module.name .. ": " .. tostring(compileError))
+        warn("VGD WallWalk v48.76.17 POV compile failure in " .. module.name .. ": " .. tostring(compileError))
         return
     end
     if type(setfenv) == "function" then
         local envOk, envError = pcall(setfenv, chunk, sharedEnvironment)
         if not envOk then
-            warn("VGD WallWalk v48.76.16 POV environment failure in " .. module.name .. ": " .. tostring(envError))
+            warn("VGD WallWalk v48.76.17 POV environment failure in " .. module.name .. ": " .. tostring(envError))
             return
         end
     end
     local runOk, runError = pcall(chunk)
     if not runOk then
-        warn("VGD WallWalk v48.76.16 POV runtime failure in " .. module.name .. ": " .. tostring(runError))
+        warn("VGD WallWalk v48.76.17 POV runtime failure in " .. module.name .. ": " .. tostring(runError))
         return
     end
 end
 
-print("VGD WallWalk v48.76.16 POV: all " .. tostring(#modules) .. " source segments loaded.")
+print("VGD WallWalk v48.76.17 POV: all " .. tostring(#modules) .. " source segments loaded.")
 
+-- The controller is returned from the outer bootstrap environment, while the
+-- actual WallWalk state/functions live in sharedEnvironment. Always address
+-- that environment explicitly so Enable/Destroy cannot call nil globals.
 local controller = {}
 function controller.Enable()
-    if destroyed then return false end
-    if not enabled then activateWallWalk() end
+    if sharedEnvironment.destroyed then return false end
+    if not sharedEnvironment.enabled then
+        local fn = sharedEnvironment.activateWallWalk
+        if type(fn) ~= "function" then error("activateWallWalk API is unavailable") end
+        fn()
+    end
     return true
 end
 function controller.Disable()
-    if destroyed then return true end
-    enabled = false
-    restoreNormal()
-    updateUI()
+    if sharedEnvironment.destroyed then return true end
+    sharedEnvironment.enabled = false
+    local restoreFn = sharedEnvironment.restoreNormal
+    if type(restoreFn) ~= "function" then error("restoreNormal API is unavailable") end
+    restoreFn()
+    local updateFn = sharedEnvironment.updateUI
+    if type(updateFn) == "function" then updateFn() end
     return true
 end
 function controller.Destroy()
-    destroyWallWalk()
+    local fn = sharedEnvironment.destroyWallWalk
+    if type(fn) ~= "function" then error("destroyWallWalk API is unavailable") end
+    fn()
     return true
 end
 function controller.IsEnabled()
-    return enabled == true and destroyed ~= true
+    return sharedEnvironment.enabled == true and sharedEnvironment.destroyed ~= true
 end
 return controller
