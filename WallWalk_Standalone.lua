@@ -1,12 +1,42 @@
 --[[
-    VGD WallWalk Standalone v48.58 Continuous Stair Traversal
-    Exact Face Gravity / In-Out Surface Rework + Emote Rebind Fix + Continuous Stair Ownership
+VGD WallWalk Standalone v48.76.16 POV - experimental segmented loader.
+Derived from WallWalk_Standalone_v48.76.9_POV_Direction_UI_Polish.lua.
+Each top-level function is compiled separately and initialized in source order.
+Top-level state/functions are shared through one environment; function locals remain local.
+This keeps the POV/camera/UI version's behavior while using the chunked loader approach.
+]]
+
+local compiler = loadstring
+if type(compiler) ~= "function" then
+    warn("VGD WallWalk v48.76.16 POV: loadstring is unavailable; no modules were started.")
+    return
+end
+
+local baseEnvironment = _G
+if type(getfenv) == "function" then
+    local ok, currentEnvironment = pcall(getfenv)
+    if ok and type(currentEnvironment) == "table" then
+        baseEnvironment = currentEnvironment
+    end
+end
+
+local sharedEnvironment = baseEnvironment
+if type(setfenv) == "function" then
+    sharedEnvironment = setmetatable({}, { __index = baseEnvironment })
+end
+
+local modules = {
+    { name = '00_initial_state', source = [=[--[[
+    VGD WallWalk Standalone v48.76.16 POV Chunked Bootstrap
+    Client Gravity Override + Surface-Relative Gravity + Ceiling Stair Lift Fix
 
     Base: v6 GravityController_Rebuild
 
     v8 goals:
       * Keep the v6 multi-ray surface sensor and VectorForce gravity model.
-      * Keep Workspace.Gravity untouched.
+      * While WallWalk owns wall/ceiling physics, set Workspace.Gravity to 0 locally
+        and apply the saved Roblox gravity strength through the custom VectorForce.
+      * Restore the exact pre-WallWalk Workspace.Gravity value when custom control ends.
       * Keep surface-normal jumping: floor / wall / ceiling all use currentUp.
       * Make joystick/WASD directions intuitive on every surface.
       * Make wall -> ceiling transitions easier by using predictive feelers and
@@ -16,17 +46,20 @@
       * Re-enable WallWalk cleanly after being turned OFF.
 ]]
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
+Players =  game:GetService("Players")
+RunService =  game:GetService("RunService")
+UserInputService =  game:GetService("UserInputService")
+GuiService =  game:GetService("GuiService")
 
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
+-- Initialize shared basis vectors before any state uses UP.
+ZERO = Vector3.zero
+UP = Vector3.yAxis
 
-local CFG = {
+player =  Players.LocalPlayer
+playerGui =  player:WaitForChild("PlayerGui")
+
+CFG =  {
     WalkSpeed = 16,
-    Gravity = workspace.Gravity,
 
     -- Multi-ray surface sensor.
     DownRayLength = 18,
@@ -129,6 +162,12 @@ local CFG = {
     StairStepRiserProbeLength = 2.40,
     StairStepRiserMinDot = 0.62,
     StairStepClearance = 0.08,
+
+    -- Only a genuinely near-vertical face is treated as a riser by the
+    -- first-riser gravity guard. Steeper ramps remain valid surface candidates.
+    StairRiserGravityVerticalDot = 0.25,
+    StairRiserContinuationHeight = 1.30,
+    StairRiserContinuationLength = 1.25,
     StairStepBlendResponse = 20,
     StairStepHoldTime = 0.09,
 
@@ -148,6 +187,43 @@ local CFG = {
     SurfaceSafetySupportDistance = 3.10,
     SurfaceSafetyFanRadius = 0.85,
     SurfaceSafetySupportNormalDot = 0.88,
+
+    -- v48.64: when the owned surface is an upside-down ceiling staircase,
+    -- allow the safety sensor to use a wider near-contact fallback fan when
+    -- the main gravity scan temporarily lands on a riser/edge instead of a
+    -- tread. Flat upside-down surfaces keep the exact same normal path; this
+    -- fallback only runs after the authoritative support result is absent.
+    UpsideDownStairSafetyDot = -0.985,
+    UpsideDownStairSafetyFanRadius = 1.75,
+    UpsideDownStairSafetyProbeLength = 4.25,
+    UpsideDownStairSafetyDistance = 3.25,
+    UpsideDownStairSafetyGrace = 1.50,
+    UpsideDownStairTraversalSafetyHold = 1.50,
+
+    -- Upside-down stair steps need a brief movement component toward -currentUp
+    -- (toward the ceiling). During the short active step ramp, reduce the normal
+    -- custom gravity load and give the requested climb vector more authority.
+    -- This is scoped only to ceiling steps; floor/wall gravity and the first-riser
+    -- guard are unchanged.
+    -- With native Workspace.Gravity suppressed locally, this is now the actual
+    -- fraction of Roblox gravity used during an upside-down stair step. 0.35g
+    -- keeps a gentle pull toward the ceiling without the old native-gravity fight.
+    StairCeilingStepGravityScale = 0.35,
+    StairCeilingStepForceMultiplier = 1.15,
+    StairCeilingStepLiftAcceleration = 360,
+    StairCeilingStepHoldTime = 0.24,
+
+    -- v48.75: ceiling stairs use the same surface-relative stair ramp method
+    -- as v48.65. Geometry detection is separate from movement actuation: the
+    -- target tread supplies rise/run, then the existing custom movement solver
+    -- follows that short ramp toward the next underside tread.
+    StairCeilingStepForwardLead = 0.10,
+    StairCeilingStepDetectRange = 3.20,
+    StairCeilingStepDetectStart = 0.35,
+    StairCeilingStepSupportDistance = 4.50,
+    StairCeilingStepSideProbe = 0.80,
+    StairCeilingProbeLength = 4.50,
+    StairCeilingProbeOffset = 0.12,
 
     -- Motion-based detachment detector.
     -- AwaySpeed/AwayDistance use the currently-owned surface axis (currentUp).
@@ -182,67 +258,75 @@ local CFG = {
     ExactFaceSupportMinDot = 0.45,
     GroundSlopeAngle = 89,
 
-    ToggleWidth = 58,
-    ToggleHeight = 26,
-    PanelWidth = 190,
-    PanelHeight = 50,
+    ToggleWidth = 62,
+    ToggleHeight = 24,
+    CameraUpResponsiveness = 12,
+    PanelWidth = 140,
+    PanelHeight = 102,
 }
 
-local character
-local humanoid
-local root
-local controls
-local rayParams
+character = nil
+humanoid = nil
+root = nil
+controls = nil
+rayParams = nil
 
-local gravityAttachment
-local gravityForce
-local orientationAttachment
-local orientation
+gravityAttachment = nil
+gravityForce = nil
 
-local enabled = true
-local customActive = false
-local controllerPhysicsActive = false
-local currentUp = Vector3.yAxis
-local targetUp = Vector3.yAxis
-local lastDetectedUp = Vector3.yAxis
-local lastSurfaceSeen = 0
+-- While custom WallWalk physics is active, native Workspace.Gravity is locally
+-- suppressed so there is exactly one gravity owner. Keep the latest real Roblox
+-- gravity value here so the custom force can reproduce it on any surface.
+wallWalkGravity =  workspace.Gravity
+workspaceGravitySuppressed =  false
 
-local jumpRequested = false
-local jumpInputHeld = false
-local lastJump = 0
-local jumped = false
-local jumpStartedAt = 0
-local jumpLaunchUp = UP
-local jumpLaunchPosition = nil
-local jumpLaunchPlaneCrossed = false
-local justLanded = false
-local jumpLocked = false
-local jumpRequestLatched = false
-local lastJumpRequestAt = 0
-local surfaceLostAt = 0
-local safetyReleased = false
+orientationAttachment = nil
+orientation = nil
+
+enabled =  true
+customActive =  false
+controllerPhysicsActive =  false
+currentUp =  Vector3.yAxis
+targetUp =  Vector3.yAxis
+lastDetectedUp =  Vector3.yAxis
+lastSurfaceSeen =  0
+
+jumpRequested =  false
+jumpInputHeld =  false
+lastJump =  0
+jumped =  false
+jumpStartedAt =  0
+jumpLaunchUp =  UP
+jumpLaunchPosition =  nil
+jumpLaunchPlaneCrossed =  false
+justLanded =  false
+jumpLocked =  false
+jumpRequestLatched =  false
+lastJumpRequestAt =  0
+surfaceLostAt =  0
+safetyReleased =  false
 
 -- Gravity-transition state. This is only armed by an actual gravity-plane
 -- change detected by updateSurface(). It does NOT alter normal wall/ceiling
 -- support detection or the existing safety timer.
-local gravityTransitionActive = false
-local orientationTransitionUntil = 0
+gravityTransitionActive =  false
+orientationTransitionUntil =  0
 -- Carry the character's SURFACE-PATH direction across a real gravity-side
 -- change. The important part is that this is transported by the same rotation
 -- that changes oldUp -> newUp, rather than simply projected onto the new plane.
 -- That makes a forward wall/ceiling transition behave like walking around a
 -- physical corner: the heading follows the surface instead of becoming random.
-local transitionFacing = nil
-local lastFacingDirection = nil
-local transitionMoveCandidate = nil
+transitionFacing =  nil
+lastFacingDirection =  nil
+transitionMoveCandidate =  nil
 
 -- During a gravity-side handoff, the character should not acquire a large
 -- velocity component AWAY from the newly selected surface. The final physics
 -- diagnostic showed that the remaining launch is a post-solver contact impulse
 --, so limiting AlignOrientation angular speed alone is not sufficient. This
 -- guard removes only excessive outward normal velocity during the 0.32s handoff;
--- tangent movement and normal WallWalk gravity are left untouched.
-local function guardTransitionOutwardVelocity()
+-- tangent movement and normal WallWalk gravity are left untouched.]=] },
+    { name = '01_guardTransitionOutwardVelocity', source = [=[function guardTransitionOutwardVelocity()
     if not root or not customActive or jumped then return end
     if os.clock() >= orientationTransitionUntil then return end
 
@@ -254,78 +338,93 @@ local function guardTransitionOutwardVelocity()
         root.AssemblyLinearVelocity = velocity - currentUp * (outwardSpeed - maxOutward)
     end
 end
-local gravitySwitchBackUp = nil
-local gravitySwitchBackAt = 0
-local safetySupportPoint = nil
-local safetySupportNormal = nil
-local safetySupportDistance = nil
-local safetySupportAt = 0
-local surfaceSupportSeen = false
-local surfaceSupportPoint = nil
-local surfaceSupportNormal = nil
-local surfaceSupportDistance = math.huge
+gravitySwitchBackUp =  nil
+gravitySwitchBackAt =  0
+safetySupportPoint =  nil
+safetySupportNormal =  nil
+safetySupportDistance =  nil
+safetySupportAt =  0
+surfaceSupportSeen =  false
+surfaceSupportPoint =  nil
+surfaceSupportNormal =  nil
+surfaceSupportDistance =  math.huge
 
 -- Motion history used by the safety handoff. We intentionally track position
 -- and world-down speed instead of relying only on ray visibility.
-local safetyPreviousPosition = nil
-local safetyPreviousWorldDownSpeed = 0
-local safetyAwayDistance = 0
-local safetyAwaySpeed = 0
-local safetyWorldFallSpeed = 0
-local safetyWorldFallAcceleration = 0
+safetyPreviousPosition =  nil
+safetyPreviousWorldDownSpeed =  0
+safetyAwayDistance =  0
+safetyAwaySpeed =  0
+safetyWorldFallSpeed =  0
+safetyWorldFallAcceleration =  0
 
-local filteredAdhesionDistance = nil
+filteredAdhesionDistance =  nil
 
-local microStepBlend = 0
-local microStepTargetBlend = 0
-local microStepUntil = 0
-local microStepMove = Vector3.zero
+microStepBlend =  0
+microStepTargetBlend =  0
+microStepUntil =  0
+microStepMove =  Vector3.zero
 
-local stairStepBlend = 0
-local stairStepTargetBlend = 0
-local stairStepUntil = 0
-local stairStepMove = Vector3.zero
+stairStepBlend =  0
+stairStepTargetBlend =  0
+stairStepUntil =  0
+stairStepMove =  Vector3.zero
 
 -- Continuous stair traversal state. The state follows the staircase as
 -- the player moves from one riser to the next instead of locking to one
 -- physical step for a single short timer.
-local stairTraversalActive = false
-local stairTraversalUntil = 0
-local stairTraversalPoint = nil
-local stairTraversalNormal = nil
-local stairTraversalMoveDir = nil
-local stairTraversalTopHeight = nil
+stairTraversalActive =  false
+stairTraversalUntil =  0
+stairTraversalPoint =  nil
+stairTraversalNormal =  nil
+stairTraversalMoveDir =  nil
+stairTraversalTopHeight =  nil
+stairTraversalTopPoint =  nil
 
-local animateScript
-local animateWasDisabled = false
-local animator
-local animationTracks = {Idle = {}, Walk = {}, Run = {}, Jump = {}, Fall = {}}
-local activeLocomotion
-local activeAir
-local activeIdle
-local emoteTrack
-local AnimationClipProvider = game:GetService("AnimationClipProvider")
-local emoteLoopCache = {}
-local emoteTrackConnection
-local emoteHandlerGuardConnection
-local installWallWalkEmoteHandler
-local emoteMenuOpen = false
-local emoteStateBridge = false
-local emoteStateRestoreAt = 0
+animateScript = nil
+animateWasDisabled =  false
+animator = nil
+animationTracks =  {Idle = {}, Walk = {}, Run = {}, Jump = {}, Fall = {}}
+activeLocomotion = nil
+activeAir = nil
+activeIdle = nil
+emoteTrack = nil
+AnimationClipProvider =  game:GetService("AnimationClipProvider")
+emoteLoopCache =  {}
+emoteTrackConnection = nil
+emoteHandlerGuardConnection = nil
+installWallWalkEmoteHandler = nil
+emoteMenuOpen =  false
+emoteStateBridge =  false
+emoteStateRestoreAt =  0
 
-local gui
-local statusLabel
-local toggleButton
-local jumpButton
-local guiConnections = {}
-local lifecycleConnections = {}
-local heartbeatConnection
-local cameraConnection
-local destroyed = false
-local setJumpButtonVisible
+gui = nil
+toggleButton = nil
+cameraPOVButton = nil
+cameraPOVEnabled =  true
+cameraModuleObject = nil
+cameraModuleOriginalUpdate = nil
+cameraModuleOriginalOwnUpdate = nil
+wrappedCameraModuleUpdate = nil
+cameraModuleHookInstalled =  false
+restoreCameraModuleHook = nil
+cameraUpVector =  UP
+cameraUpFrame =  CFrame.identity
+cameraCollisionParams =  RaycastParams.new()
+cameraCollisionParams.FilterType = Enum.RaycastFilterType.Exclude
+cameraCollisionParams.IgnoreWater = true
+cameraCollisionCharacter = nil
+jumpButton = nil
+guiConnections =  {}
+lifecycleConnections =  {}
+heartbeatConnection = nil
+cameraConnection = nil
+destroyed =  false
+GUIControlled = (VGD_WallWalk_GUIControlled == true)
+setJumpButtonVisible = nil
 
 -- Snapshot Roblox-owned state so the X button can leave no WallWalk residue.
-local originalState = {
+originalState =  {
     valid = false,
     animateDisabled = false,
     autoRotate = true,
@@ -344,17 +443,18 @@ local originalState = {
     emoteCaptured = false,
 }
 
-local ZERO = Vector3.zero
-local UP = Vector3.yAxis
-
-local function safeUnit(v, fallback)
+]=] },
+    { name = '02_safeUnit', source = [=[function safeUnit(v, fallback)
+    if typeof(v) ~= "Vector3" then
+        return fallback or UP
+    end
     if v.Magnitude > 1e-5 then
         return v.Unit
     end
-    return fallback
+    return fallback or UP
 end
-
-local function projectOnPlane(v, normal)
+]=] },
+    { name = '03_projectOnPlane', source = [=[function projectOnPlane(v, normal)
     return v - normal * v:Dot(normal)
 end
 
@@ -363,8 +463,8 @@ end
 -- enough for FORWARD transitions: when the old movement direction points
 -- toward the new surface, its projection onto that new plane can collapse or
 -- choose an arbitrary fallback. Rotating the tangent frame preserves the
--- actual path around the corner instead.
-local function transportDirection(oldDirection, oldUp, newUp)
+-- actual path around the corner instead.]=] },
+    { name = '04_transportDirection', source = [=[function transportDirection(oldDirection, oldUp, newUp)
     local direction = safeUnit(oldDirection, Vector3.zAxis)
     local from = safeUnit(oldUp, UP)
     local to = safeUnit(newUp, from)
@@ -393,20 +493,20 @@ local function transportDirection(oldDirection, oldUp, newUp)
     local rotated = CFrame.fromAxisAngle(axis, angle):VectorToWorldSpace(direction)
     return safeUnit(rotated, projectOnPlane(direction, to))
 end
-
-local function stopTrack(track, fade)
+]=] },
+    { name = '05_stopTrack', source = [=[function stopTrack(track, fade)
     if track and track.IsPlaying then
         pcall(function() track:Stop(fade or 0.08) end)
     end
 end
-
-local function stopGroup(group, fade)
+]=] },
+    { name = '06_stopGroup', source = [=[function stopGroup(group, fade)
     for _, track in ipairs(group or {}) do
         stopTrack(track, fade)
     end
 end
-
-local function destroyAnimationTracks()
+]=] },
+    { name = '07_destroyAnimationTracks', source = [=[function destroyAnimationTracks()
     emoteTrack = nil
     for _, group in pairs(animationTracks) do
         for _, track in ipairs(group) do
@@ -421,8 +521,8 @@ local function destroyAnimationTracks()
     activeAir = nil
     activeIdle = nil
 end
-
-local function loadAnimationGroup(container)
+]=] },
+    { name = '08_loadAnimationGroup', source = [=[function loadAnimationGroup(container)
     local result = {}
     if not container or not animator then return result end
 
@@ -439,8 +539,8 @@ local function loadAnimationGroup(container)
     end
     return result
 end
-
-local function loadCharacterAnimations()
+]=] },
+    { name = '09_loadCharacterAnimations', source = [=[function loadCharacterAnimations()
     destroyAnimationTracks()
     if emoteTrackConnection then
         emoteTrackConnection:Disconnect()
@@ -471,10 +571,7 @@ local function loadCharacterAnimations()
     emoteTrackConnection = animator.AnimationPlayed:Connect(function(track)
         if not track then return end
         local priority = track.Priority
-        if priority == Enum.AnimationPriority.Action
-            or priority == Enum.AnimationPriority.Action2
-            or priority == Enum.AnimationPriority.Action3
-            or priority == Enum.AnimationPriority.Action4 then
+        if priority == Enum.AnimationPriority.Action or priority == Enum.AnimationPriority.Action2 or priority == Enum.AnimationPriority.Action3 or priority == Enum.AnimationPriority.Action4 then
             emoteTrack = track
             track.Stopped:Connect(function()
                 if emoteTrack == track then
@@ -484,8 +581,8 @@ local function loadCharacterAnimations()
         end
     end)
 end
-
-local function cancelActiveEmote()
+]=] },
+    { name = '10_cancelActiveEmote', source = [=[function cancelActiveEmote()
     if not emoteTrack then return false end
 
     local track = emoteTrack
@@ -497,8 +594,8 @@ local function cancelActiveEmote()
     end)
     return true
 end
-
-local function updateAnimations(moving, grounded, speed)
+]=] },
+    { name = '11_updateAnimations', source = [=[function updateAnimations(moving, grounded, speed)
     if not animator then return end
 
     -- Movement always cancels an emote. Check this BEFORE the active-emote
@@ -577,8 +674,8 @@ local function updateAnimations(moving, grounded, speed)
     end)
 end
 
-
-function installWallWalkEmoteHandler()
+]=] },
+    { name = '12_installWallWalkEmoteHandler', source = [=[function installWallWalkEmoteHandler()
     if not character or not humanoid then return end
 
     local animate = character:FindFirstChild("Animate")
@@ -778,8 +875,8 @@ function installWallWalkEmoteHandler()
         return true, track
     end
 end
-
-local function getPlayerControls()
+]=] },
+    { name = '13_getPlayerControls', source = [=[function getPlayerControls()
     local scripts = player:FindFirstChildOfClass("PlayerScripts")
     local module = scripts and scripts:FindFirstChild("PlayerModule")
     if not module then return nil end
@@ -790,8 +887,8 @@ local function getPlayerControls()
     local success, result = pcall(function() return playerModule:GetControls() end)
     return success and result or nil
 end
-
-local function getMoveVector()
+]=] },
+    { name = '14_getMoveVector', source = [=[function getMoveVector()
     if controls then
         local ok, value = pcall(function() return controls:GetMoveVector() end)
         if ok and typeof(value) == "Vector3" then
@@ -818,13 +915,13 @@ local function getMoveVector()
 
     return ZERO
 end
-
-local function cast(origin, direction, length)
+]=] },
+    { name = '15_cast', source = [=[function cast(origin, direction, length)
     if not rayParams or direction.Magnitude <= 1e-5 then return nil end
     return workspace:Raycast(origin, direction.Unit * length, rayParams)
 end
-
-local function orientSurfaceNormal(hit, rayDirection)
+]=] },
+    { name = '16_orientSurfaceNormal', source = [=[function orientSurfaceNormal(hit, rayDirection)
     if not hit then return nil end
 
     local normal = safeUnit(hit.Normal, UP)
@@ -840,8 +937,8 @@ local function orientSurfaceNormal(hit, rayDirection)
 
     return normal
 end
-
-local function getExactSupportFace(oldUp, moveVector)
+]=] },
+    { name = '17_getExactSupportFace', source = [=[function getExactSupportFace(oldUp, moveVector)
     if not root or not customActive then return nil, nil, math.huge end
 
     local origin = root.Position
@@ -957,8 +1054,8 @@ end
 -- must NOT become a new gravity plane while the player is walking on the
 -- current floor/wall/ceiling. The dedicated stair solver below already knows
 -- how to climb it; this helper only tells the gravity detector to ignore the
--- riser when a valid walkable top is confirmed ahead.
-local function confirmStairRiser(basePoint, moveDir, side, rise, up)
+-- riser when a valid walkable top is confirmed ahead.]=] },
+    { name = '18_confirmStairRiser', source = [=[function confirmStairRiser(basePoint, moveDir, side, rise, up)
     local heights = {
         0.10,
         math.clamp(rise * 0.55, 0.10, CFG.StairStepRiserProbeHeight),
@@ -974,10 +1071,7 @@ local function confirmStairRiser(basePoint, moveDir, side, rise, up)
                 if n then
                     local facing = (-moveDir):Dot(n)
                     local height = math.abs((hit.Position - basePoint):Dot(up))
-                    if facing >= CFG.StairStepRiserMinDot
-                        and up:Dot(n) < 0.35
-                        and height <= rise + 0.24
-                    then
+                    if facing >= CFG.StairStepRiserMinDot and up:Dot(n) < 0.35 and height <= rise + 0.24 then
                         return true
                     end
                 end
@@ -987,7 +1081,62 @@ local function confirmStairRiser(basePoint, moveDir, side, rise, up)
     return false
 end
 
-local function getStairMoveDirection(up, moveVector)
+-- First-riser gravity guard.
+-- A short stair riser should not be able to become a gravity plane merely
+-- because a probe hits its vertical face. A real wall continues above the
+-- maximum supported step height, so a short high slice through the same face
+-- distinguishes the two. This is independent of stairTraversal state.]=] },
+    { name = '19_hasVerticalWallContinuation', source = [=[function hasVerticalWallContinuation(hit, normal, up, moveDir)
+    if not hit or not normal or not moveDir or moveDir.Magnitude <= 0.05 then
+        return false
+    end
+
+    local floorOrCeiling = math.abs(up:Dot(UP)) > 0.985
+    if not floorOrCeiling then
+        return true
+    end
+
+    local facing = (-moveDir):Dot(normal)
+    if facing < CFG.StairStepRiserMinDot then
+        return false
+    end
+
+    local nearVertical = math.abs(normal:Dot(UP)) < CFG.StairRiserGravityVerticalDot
+    if not nearVertical then
+        return true
+    end
+
+    -- Start slightly outside the hit face and probe the same corridor above
+    -- normal stair height. A full wall still produces a matching vertical hit;
+    -- a one-step riser does not.
+    local highOrigin = hit.Position
+        - moveDir * 0.10
+        + up * CFG.StairRiserContinuationHeight
+
+    local highHit = cast(
+        highOrigin,
+        moveDir,
+        CFG.StairRiserContinuationLength
+    )
+
+    if not highHit then
+        return false
+    end
+
+    local highNormal = orientSurfaceNormal(highHit, moveDir)
+    if not highNormal then
+        return false
+    end
+
+    local highFacing = (-moveDir):Dot(highNormal)
+    if highFacing < CFG.StairStepRiserMinDot then
+        return false
+    end
+
+    return math.abs(highNormal:Dot(UP)) < CFG.TransitionWallDot
+end
+]=] },
+    { name = '20_getStairMoveDirection', source = [=[function getStairMoveDirection(up, moveVector)
     if not moveVector then return nil end
     if moveVector.Magnitude < 0.05 then return nil end
 
@@ -1009,17 +1158,18 @@ local function getStairMoveDirection(up, moveVector)
 
     return move.Unit
 end
-
-local function clearStairTraversal()
+]=] },
+    { name = '21_clearStairTraversal', source = [=[function clearStairTraversal()
     stairTraversalActive = false
     stairTraversalUntil = 0
     stairTraversalPoint = nil
     stairTraversalNormal = nil
     stairTraversalMoveDir = nil
     stairTraversalTopHeight = nil
+    stairTraversalTopPoint = nil
 end
-
-local function detectStairRiserGeometry(oldUp, moveVector)
+]=] },
+    { name = '22_detectStairRiserGeometry', source = [=[function detectStairRiserGeometry(oldUp, moveVector)
     if not root or not humanoid then return false end
 
     local moveDir = getStairMoveDirection(oldUp, moveVector)
@@ -1028,6 +1178,10 @@ local function detectStairRiserGeometry(oldUp, moveVector)
     local side = safeUnit(moveDir:Cross(oldUp), root.CFrame.RightVector)
 
     local maxRise = CFG.StairStepMaxHeight
+    local probeUp = oldUp
+    if oldUp:Dot(UP) < -0.985 then
+        probeUp = -oldUp
+    end
     local probeLength = CFG.StairStepRiserProbeLength + 0.70
     local topProbeLength = CFG.StairStepProbeLength + 0.80
 
@@ -1122,6 +1276,7 @@ local function detectStairRiserGeometry(oldUp, moveVector)
     local bestPoint = nil
     local bestNormal = nil
     local bestTopHeight = nil
+    local bestTopPoint = nil
     local bestScore = math.huge
 
     for _, sideOffset in ipairs(offsets) do
@@ -1130,7 +1285,7 @@ local function detectStairRiserGeometry(oldUp, moveVector)
                 local riserOrigin = basePoint
                     + side * sideOffset
                     + moveDir * forwardStart
-                    + oldUp * heightOffset
+                    + probeUp * heightOffset
 
                 local riserHit = cast(riserOrigin, moveDir, probeLength)
 
@@ -1141,6 +1296,9 @@ local function detectStairRiserGeometry(oldUp, moveVector)
                         local facing = (-moveDir):Dot(riserNormal)
                         local surfaceDot = math.abs(oldUp:Dot(riserNormal))
                         local riserRise = (riserHit.Position - basePoint):Dot(oldUp)
+                        if oldUp:Dot(UP) < -0.985 then
+                            riserRise = -riserRise
+                        end
                         local riserRun = (riserHit.Position - root.Position):Dot(moveDir)
 
                         local facingValid = facing >= CFG.StairStepRiserMinDot
@@ -1156,24 +1314,34 @@ local function detectStairRiserGeometry(oldUp, moveVector)
                             -- the root by a fixed total distance.
                             local topOrigin = riserHit.Position
                                 + moveDir * 0.10
-                                + oldUp * (maxRise + 0.34)
+                                + probeUp * (maxRise + 0.34)
 
-                            local topHit = cast(topOrigin, -oldUp, topProbeLength)
+                            local topHit = cast(topOrigin, -probeUp, topProbeLength)
 
                             if topHit then
-                                local topNormal = orientSurfaceNormal(topHit, -oldUp)
+                                local topNormal = orientSurfaceNormal(topHit, -probeUp)
 
                                 if topNormal then
                                     local topNormalDot = oldUp:Dot(topNormal)
                                     local topHeight = topHit.Position:Dot(oldUp)
                                     local topRise = topHeight - baseHeight
+                                    if oldUp:Dot(UP) < -0.985 then
+                                        topRise = -topRise
+                                    end
                                     local topRun = (topHit.Position - root.Position):Dot(moveDir)
                                     local runAfter = topRun - riserRun
 
                                     local topNormalValid = topNormalDot > 0.955
                                     local topRiseValid = topRise >= CFG.StairStepMinRise
                                         and topRise <= maxRise + 0.15
-                                    local topRunValid = runAfter >= 0.06
+                                    -- The detected stair top must still be AHEAD of the
+                                    -- root. Without this lower bound, a riser that is
+                                    -- already under/behind the character could keep the
+                                    -- gravity detector in stair-ownership mode even
+                                    -- though the movement solver has nothing left to climb.
+                                    -- The first stair can be very close to the R15 root.
+                                    -- Only require the top to be beyond the riser itself.
+                                    local topRunValid = runAfter >= 0.02
                                         and topRun <= CFG.StairTraversalForwardRange + 0.45
 
                                     if topNormalValid and topRiseValid and topRunValid then
@@ -1193,6 +1361,7 @@ local function detectStairRiserGeometry(oldUp, moveVector)
                                                 bestPoint = riserHit.Position
                                                 bestNormal = riserNormal
                                                 bestTopHeight = topHeight
+                                                bestTopPoint = topHit.Position
                                             end
                                         end
                                     end
@@ -1209,10 +1378,10 @@ local function detectStairRiserGeometry(oldUp, moveVector)
         return false
     end
 
-    return true, bestPoint, bestNormal, moveDir, bestTopHeight
+    return true, bestPoint, bestNormal, moveDir, bestTopHeight, bestTopPoint
 end
-
-local function isStairRiserAhead(oldUp, moveVector)
+]=] },
+    { name = '23_isStairRiserAhead', source = [=[function isStairRiserAhead(oldUp, moveVector)
     local now = os.clock()
     local moveDir = getStairMoveDirection(oldUp, moveVector)
 
@@ -1225,7 +1394,7 @@ local function isStairRiserAhead(oldUp, moveVector)
         return false
     end
 
-    local detected, point, normal, detectedMoveDir, topHeight = detectStairRiserGeometry(oldUp, moveVector)
+    local detected, point, normal, detectedMoveDir, topHeight, topPoint = detectStairRiserGeometry(oldUp, moveVector)
 
     if detected then
         stairTraversalActive = true
@@ -1234,6 +1403,7 @@ local function isStairRiserAhead(oldUp, moveVector)
         stairTraversalNormal = normal
         stairTraversalMoveDir = detectedMoveDir
         stairTraversalTopHeight = topHeight
+        stairTraversalTopPoint = topPoint
         return true
     end
 
@@ -1290,8 +1460,8 @@ local function isStairRiserAhead(oldUp, moveVector)
 
     return true
 end
-
-local function isOwnedStairRiserHit(hit, normal, oldUp, moveDir)
+]=] },
+    { name = '24_isOwnedStairRiserHit', source = [=[function isOwnedStairRiserHit(hit, normal, oldUp, moveDir)
     if not hit or not normal or not moveDir then
         return false
     end
@@ -1343,8 +1513,8 @@ local function isOwnedStairRiserHit(hit, normal, oldUp, moveDir)
 
     return true
 end
-
-local function getGravityUp(oldUp, moveVector)
+]=] },
+    { name = '25_getGravityUp', source = [=[function getGravityUp(oldUp, moveVector)
     if not root then return oldUp, false, false, nil, nil, math.huge end
 
     local origin = root.Position
@@ -1365,7 +1535,7 @@ local function getGravityUp(oldUp, moveVector)
     local supportNormal
     local supportDistance = math.huge
 
-    -- v48.58: decide continuous stair ownership BEFORE any gravity-support
+    -- v48.64: keep first-riser filtering independent of continuous stair ownership
     -- rays are added. Every gravity acquisition path below consults the same
     -- traversal state so a riser cannot become the new gravity plane.
     local floorOrCeiling = math.abs(oldUp:Dot(UP)) > 0.985
@@ -1405,6 +1575,16 @@ local function getGravityUp(oldUp, moveVector)
         local normal = orientSurfaceNormal(hit, rayDirection)
         if not normal then return end
 
+        -- Generic down-rays/feeler rays must never turn the first stair riser
+        -- into a gravity candidate while we are on the ordinary floor/ceiling.
+        -- Real walls are acquired through the dedicated transition sensor.
+        local floorOrCeiling = math.abs(oldUp:Dot(UP)) > 0.985
+        local nearVerticalRiser = floorOrCeiling
+            and math.abs(normal:Dot(UP)) < CFG.StairRiserGravityVerticalDot
+        if nearVerticalRiser then
+            return
+        end
+
         if stairMoveDir and isOwnedStairRiserHit(hit, normal, oldUp, stairMoveDir) then
             return
         end
@@ -1418,9 +1598,7 @@ local function getGravityUp(oldUp, moveVector)
         -- could keep the safety timer alive for several seconds after the
         -- character had already moved away because the offset down-rays could
         -- still reach the old wall.
-        if oldUp:Dot(normal) >= CFG.SurfaceSafetySupportNormalDot
-            and perpendicularDistance <= CFG.AdhesionProbeLength
-        then
+        if oldUp:Dot(normal) >= CFG.SurfaceSafetySupportNormalDot and perpendicularDistance <= CFG.AdhesionProbeLength then
             supportSeen = true
             if perpendicularDistance < supportDistance then
                 supportDistance = perpendicularDistance
@@ -1432,8 +1610,8 @@ local function getGravityUp(oldUp, moveVector)
             closestDistance = distance
             closestNormal = normal
         end
-        normalSum += normal * weight
-        hitWeight += weight
+        normalSum = normalSum + normal * weight
+        hitWeight = hitWeight + weight
     end
 
     local center = cast(origin, -oldUp, CFG.DownRayLength)
@@ -1596,6 +1774,16 @@ local function getGravityUp(oldUp, moveVector)
                     local normalDot = math.clamp(oldUp:Dot(hitNormal), -1, 1)
                     local floorOrCeiling = math.abs(oldUp:Dot(UP)) > 0.985
                     local verticalFace = math.abs(hitNormal:Dot(UP)) < CFG.TransitionWallDot
+
+                    -- A nearly-vertical face coming from an ordinary floor or
+                    -- ceiling must continue above normal stair height before it
+                    -- can claim gravity. This is the key first-riser protection.
+                    if floorOrCeiling and math.abs(hitNormal:Dot(UP)) < CFG.StairRiserGravityVerticalDot then
+                        if not hasVerticalWallContinuation(hit, hitNormal, oldUp, moveDir) then
+                            return
+                        end
+                    end
+
                     local isDifferentSurface = normalDot < CFG.TransitionNormalDot
                     if not isDifferentSurface then return end
 
@@ -1659,7 +1847,7 @@ local function getGravityUp(oldUp, moveVector)
                 for _, cluster in ipairs(candidates) do
                     local sampleCount = 0
                     for _ in pairs(cluster.offsets) do
-                        sampleCount += 1
+                        sampleCount = sampleCount + 1
                     end
 
                     local confirmed
@@ -1679,13 +1867,21 @@ local function getGravityUp(oldUp, moveVector)
                     -- character onto the riser. Real walls still pass normally.
                     local stairRiser = false
                     if confirmed and floorOrCeiling and cluster.vertical then
-                        stairRiser = stairRiserAhead
+                        if math.abs(cluster.bestNormal:Dot(UP)) < CFG.StairRiserGravityVerticalDot then
+                            stairRiser = not hasVerticalWallContinuation(
+                                cluster.bestHit,
+                                cluster.bestNormal,
+                                oldUp,
+                                moveDir
+                            )
+                        end
+
+                        if not stairRiser and stairRiserAhead then
+                            stairRiser = true
+                        end
                     end
 
-                    if confirmed and not stairRiser
-                        and (not chosenCluster
-                            or cluster.bestDistance < chosenCluster.bestDistance)
-                    then
+                    if confirmed and not stairRiser and (not chosenCluster or cluster.bestDistance < chosenCluster.bestDistance) then
                         chosenCluster = cluster
                     end
                 end
@@ -1753,8 +1949,8 @@ local function getGravityUp(oldUp, moveVector)
 
     return oldUp, false, supportSeen, supportPoint, supportNormal, supportDistance
 end
-
-local function getGrounded(up)
+]=] },
+    { name = '26_getGrounded', source = [=[function getGrounded(up)
     if not root then return false end
     local hit = cast(root.Position, -up, CFG.GroundProbeLength)
     if not hit then return false end
@@ -1763,8 +1959,8 @@ local function getGrounded(up)
     local slopeLimit = math.cos(math.rad(CFG.GroundSlopeAngle))
     return up:Dot(normal) >= slopeLimit
 end
-
-local function getActualSurfaceContact(up)
+]=] },
+    { name = '27_getActualSurfaceContact', source = [=[function getActualSurfaceContact(up)
     if not root then return false end
 
     -- GroundProbeLength is intentionally long for surface acquisition, but it
@@ -1786,8 +1982,8 @@ end
 
 -- Consistent tangent basis. Roblox PlayerModule's MoveVector uses X for
 -- right/left and negative Z for forward/back, so the mapping below is kept
--- identical on floor, wall and ceiling.
-local function getWorldMove(moveVector, up)
+-- identical on floor, wall and ceiling.]=] },
+    { name = '28_getWorldMove', source = [=[function getWorldMove(moveVector, up)
     if moveVector.Magnitude <= 0.05 then return ZERO end
 
     local camera = workspace.CurrentCamera
@@ -1814,15 +2010,15 @@ local function getWorldMove(moveVector, up)
     if world.Magnitude <= 1e-5 then return ZERO end
     return world.Unit * math.clamp(Vector2.new(moveVector.X, moveVector.Z).Magnitude, 0, 1)
 end
-
-local function getMicroStepRampMove(worldMove, up, dt)
+]=] },
+    { name = '29_getMicroStepRampMove', source = [=[function getMicroStepRampMove(worldMove, up, dt)
     -- The important distinction here is between GRAVITY ownership and the
     -- PATH used to reach the next tiny support face. Gravity remains locked to
     -- `up`; only the commanded locomotion path temporarily follows a short,
     -- low-angle ramp between the current and next support planes.
     if not customActive or not root or not humanoid or worldMove.Magnitude < 0.05 then
         microStepTargetBlend = 0
-        microStepBlend += (microStepTargetBlend - microStepBlend)
+        microStepBlend = microStepBlend + (microStepTargetBlend - microStepBlend)
             * (1 - math.exp(-CFG.MicroStepBlendResponse * dt))
         if microStepBlend < 0.01 then
             microStepMove = ZERO
@@ -1831,6 +2027,10 @@ local function getMicroStepRampMove(worldMove, up, dt)
     end
 
     local moveDir = safeUnit(projectOnPlane(worldMove, up), worldMove.Unit)
+    local probeUp = up
+    if up:Dot(UP) < -0.985 then
+        probeUp = -up
+    end
     local side = safeUnit(moveDir:Cross(up), root.CFrame.RightVector)
     local hip = humanoid.HipHeight > 0 and humanoid.HipHeight or 2
     local supportLength = math.max(CFG.AdhesionProbeLength, hip + 0.75)
@@ -1869,20 +2069,20 @@ local function getMicroStepRampMove(worldMove, up, dt)
                     + moveDir * forwardDistance
                     + side * sideOffset
                     + up * CFG.MicroStepProbeAbove
-                local hit = cast(topOrigin, -up, CFG.MicroStepProbeLength)
+                local hit = cast(topOrigin, -probeUp, CFG.MicroStepProbeLength)
                 if hit then
-                    local normal = orientSurfaceNormal(hit, -up)
+                    local normal = orientSurfaceNormal(hit, -probeUp)
                     if normal and up:Dot(normal) > 0.965 then
                         local topHeight = hit.Position:Dot(up)
                         local rise = topHeight - baseHeight
+                        if up:Dot(UP) < -0.985 then
+                            rise = -rise
+                        end
                         local run = math.max(0.45,
                             (hit.Position - root.Position):Dot(moveDir))
                         local slope = math.deg(math.atan2(math.max(rise, 0), run))
 
-                        if rise >= CFG.MicroStepMinRise
-                            and rise <= CFG.MicroStepMaxHeight
-                            and slope <= CFG.MicroStepMaxSlope
-                        then
+                        if rise >= CFG.MicroStepMinRise and rise <= CFG.MicroStepMaxHeight and slope <= CFG.MicroStepMaxSlope then
                             -- Favor the nearest consistent top face. The small
                             -- lateral penalty keeps a centerline support plane
                             -- preferred without requiring all three rays to hit.
@@ -1899,7 +2099,11 @@ local function getMicroStepRampMove(worldMove, up, dt)
         end
 
         if bestRise and bestRun then
-            local rampVector = moveDir * bestRun + up * bestRise
+            local rampUp = up
+            if up:Dot(UP) < -0.985 then
+                rampUp = -up
+            end
+            local rampVector = moveDir * bestRun + rampUp * bestRise
             local rampDirection = safeUnit(rampVector, moveDir)
             microStepMove = rampDirection
             microStepUntil = os.clock() + CFG.MicroStepHoldTime
@@ -1909,7 +2113,7 @@ local function getMicroStepRampMove(worldMove, up, dt)
         end
     end
 
-    microStepBlend += (microStepTargetBlend - microStepBlend)
+    microStepBlend = microStepBlend + (microStepTargetBlend - microStepBlend)
         * (1 - math.exp(-CFG.MicroStepBlendResponse * dt))
 
     if microStepBlend <= 0.01 then
@@ -1925,122 +2129,259 @@ local function getMicroStepRampMove(worldMove, up, dt)
 
     return adjustedDirection * tangentMagnitude, true
 end
-
-local function decayStairStepBlend(dt)
+]=] },
+    { name = '30_decayStairStepBlend', source = [=[function decayStairStepBlend(dt)
     stairStepTargetBlend = 0
-    stairStepBlend += (stairStepTargetBlend - stairStepBlend)
+    stairStepBlend = stairStepBlend + (stairStepTargetBlend - stairStepBlend)
         * (1 - math.exp(-CFG.StairStepBlendResponse * dt))
     if stairStepBlend <= 0.01 then
         stairStepBlend = 0
         stairStepMove = ZERO
     end
 end
-
-local function getStairStepRampMove(worldMove, up, dt)
-    -- This solver is only a FALLBACK after the original micro-step solver.
-    -- That keeps v48.35's known-good tiny-step behavior untouched.
+]=] },
+    { name = '31_getStairStepRampMove', source = [=[function getStairStepRampMove(worldMove, up, dt)
+    -- v48.75: PHYSICAL ACTUATION IS RESTORED TO THE v48.65 METHOD.
+    -- This function creates a surface-relative ramp direction (run + rise),
+    -- and updateGravityAndMovement turns that direction into the root's movement
+    -- force. The v74 direct underside scan below is only the ceiling TARGET
+    -- detector; it does not replace the proven ramp movement method.
+    -- v48.59: prefer the exact stair top that the gravity detector already
+    -- confirmed this frame. The old v48.58 solver performed a SECOND, slightly
+    -- different stair scan here. That could create a bad state where gravity
+    -- correctly ignored a riser while the movement solver failed to generate a
+    -- usable climb vector. One geometry decision must drive both systems.
     if not customActive or not root or not humanoid or worldMove.Magnitude < 0.05 then
         decayStairStepBlend(dt)
         return worldMove, false
     end
 
     local moveDir = safeUnit(projectOnPlane(worldMove, up), worldMove.Unit)
-    local side = safeUnit(moveDir:Cross(up), root.CFrame.RightVector)
-    local hip = humanoid.HipHeight > 0 and humanoid.HipHeight or 2
-    local supportLength = math.max(CFG.AdhesionProbeLength, hip + 0.75)
+    local probeUp = up
+    if up:Dot(UP) < -0.985 then
+        probeUp = -up
+    end
+    local targetRise
+    local targetRun
+    local useTraversalTarget = false
 
-    -- Establish the current support plane from the same three-point method
-    -- used by the existing micro-step solver. This keeps step height measured
-    -- along WallWalk's CURRENT UP, not world Y, so the exact same detector works
-    -- on floors, walls and ceilings.
-    local baseSamples = {}
-    local offsets = {-CFG.StairStepSideOffset, 0, CFG.StairStepSideOffset}
-    for _, sideOffset in ipairs(offsets) do
-        local hit = cast(root.Position + side * sideOffset, -up, supportLength)
-        if hit then
-            local normal = orientSurfaceNormal(hit, -up)
-            if normal and up:Dot(normal) > 0.92 then
-                table.insert(baseSamples, {height = hit.Position:Dot(up), point = hit.Position})
+    -- v48.70: direct underside-tread scan for ceiling stairs.
+    -- The previous solver depended too heavily on finding the vertical riser
+    -- first. That is fragile for Roblox staircases made from separate blocks,
+    -- especially when the riser is partly hidden by the character/camera.
+    -- For an upside-down staircase, the reliable signal is simpler: cast from
+    -- several points ahead of the root toward the underside and look for a
+    -- tread whose surface is higher than the current ceiling support.
+    -- This is geometry-driven and independent of the walk animation.
+    if up:Dot(UP) <= CFG.UpsideDownStairSafetyDot then
+        local baseHeight = nil
+        if surfaceSupportSeen and surfaceSupportPoint and surfaceSupportNormal and up:Dot(surfaceSupportNormal) > 0.92 then
+            baseHeight = surfaceSupportPoint:Dot(up)
+        end
+
+        if baseHeight then
+            local side = safeUnit(moveDir:Cross(up), root.CFrame.RightVector)
+            local forwardDistances = {0.35, 0.65, 1.00, 1.40, 1.80, 2.20, 2.60}
+            local sideOffsets = {-0.70, 0, 0.70}
+            local bestRise = nil
+            local bestRun = nil
+            local bestScore = math.huge
+
+            for _, forwardDistance in ipairs(forwardDistances) do
+                for _, sideOffset in ipairs(sideOffsets) do
+                    -- IMPORTANT v48.71: for an upside-down staircase the
+                    -- underside is ABOVE the character in the probeUp direction.
+                    -- v48.70 moved the ray origin 1.65 studs toward the ceiling
+                    -- and then cast BACK downward. On the small ceiling stairs
+                    -- in testing this can place the ray origin inside the solid
+                    -- stair block, so Roblox returns no hit. That is why moving
+                    -- toward the stair produced literally no stair response.
+                    -- Start just below the character and cast TOWARD the underside.
+                    local origin = root.Position
+                        + moveDir * forwardDistance
+                        + side * sideOffset
+                        + probeUp * CFG.StairCeilingProbeOffset
+
+                    local hit = cast(origin, probeUp, CFG.StairCeilingProbeLength)
+                    if hit then
+                        local normal = orientSurfaceNormal(hit, probeUp)
+                        if normal and up:Dot(normal) > 0.965 then
+                            local run = (hit.Position - root.Position):Dot(moveDir)
+                            local rise = baseHeight - hit.Position:Dot(up)
+
+                            if rise >= CFG.StairStepMinRise and rise <= CFG.StairStepMaxHeight + 0.15 and run >= CFG.StairStepClearance and run <= CFG.StairTraversalForwardRange + 0.45 then
+                                local slope = math.deg(math.atan2(rise, math.max(run, 0.05)))
+                                if slope <= CFG.StairStepMaxSlope then
+                                    local score = run + math.abs(sideOffset) * 0.08
+                                    if score < bestScore then
+                                        bestScore = score
+                                        bestRise = rise
+                                        bestRun = run
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            if bestRise and bestRun then
+                targetRise = bestRise
+                targetRun = bestRun
+                useTraversalTarget = true
             end
         end
     end
 
-    if #baseSamples == 0 then
-        decayStairStepBlend(dt)
-        return worldMove, false
+    if not useTraversalTarget and stairTraversalActive and stairTraversalTopPoint and stairTraversalMoveDir then
+        local directionDot = moveDir:Dot(stairTraversalMoveDir)
+        if directionDot >= CFG.StairTraversalMoveDot then
+            local topOffset = stairTraversalTopPoint - root.Position
+            local rise = topOffset:Dot(up)
+            if up:Dot(UP) < -0.985 then
+                rise = -rise
+            end
+            local run = topOffset:Dot(moveDir)
+
+            if rise >= CFG.StairStepMinRise and rise <= CFG.StairStepMaxHeight + 0.15 and run >= CFG.StairStepClearance and run <= CFG.StairTraversalForwardRange + 0.45 then
+                targetRise = rise
+                targetRun = run
+                useTraversalTarget = true
+            end
+        end
     end
 
-    table.sort(baseSamples, function(a, b) return a.height < b.height end)
-    local baseSample = baseSamples[math.ceil(#baseSamples / 2)]
-    local baseHeight = baseSample.height
-    local basePoint = root.Position
-        - up * (root.Position:Dot(up) - baseHeight)
+    -- Fallback scan: if the shared ownership target has already been reached,
+    -- look for the NEXT top. This keeps continuous stairs moving instead of
+    -- waiting for the ownership timer to expire before acquiring another step.
+    if not useTraversalTarget then
+        local side = safeUnit(moveDir:Cross(up), root.CFrame.RightVector)
+        local hip = humanoid.HipHeight > 0 and humanoid.HipHeight or 2
+        local supportLength = math.max(CFG.AdhesionProbeLength, hip + 0.75)
 
-    local bestRise
-    local bestRun
-    local bestScore = math.huge
-
-    local lookaheads = {
-        math.clamp(CFG.StairStepLookahead * 0.45, 0.45, CFG.StairStepLookahead),
-        math.clamp(CFG.StairStepLookahead * 0.72, 0.60, CFG.StairStepLookahead),
-        CFG.StairStepLookahead,
-    }
-
-    for _, forwardDistance in ipairs(lookaheads) do
+        local baseSamples = {}
+        local offsets = {-CFG.StairStepSideOffset, 0, CFG.StairStepSideOffset}
         for _, sideOffset in ipairs(offsets) do
-            local probeOrigin = root.Position
-                + moveDir * forwardDistance
-                + side * sideOffset
-                + up * CFG.StairStepProbeAbove
-
-            local hit = cast(probeOrigin, -up, CFG.StairStepProbeLength)
+            local hit = cast(root.Position + side * sideOffset, -up, supportLength)
             if hit then
                 local normal = orientSurfaceNormal(hit, -up)
-                if normal and up:Dot(normal) > 0.965 then
-                    local topHeight = hit.Position:Dot(up)
-                    local rise = topHeight - baseHeight
-                    local run = (hit.Position - root.Position):Dot(moveDir)
-                    local slope = math.deg(math.atan2(math.max(rise, 0), math.max(run, 0.05)))
+                if normal and up:Dot(normal) > 0.92 then
+                    table.insert(baseSamples, {height = hit.Position:Dot(up), point = hit.Position})
+                end
+            end
+        end
 
-                    if rise >= CFG.StairStepMinRise
-                        and rise <= CFG.StairStepMaxHeight
-                        and run >= CFG.StairStepClearance
-                        and run <= CFG.StairStepLookahead + 0.20
-                        and slope <= CFG.StairStepMaxSlope
-                    then
-                        -- Confirm this is a DISCRETE riser. A smooth ramp should
-                        -- not be claimed by the stair solver; the old micro-step
-                        -- path remains responsible for low-angle continuous ramps.
-                        local hasRiser = confirmStairRiser(basePoint, moveDir, side, rise, up)
+        if #baseSamples == 0 then
+            decayStairStepBlend(dt)
+            return worldMove, false
+        end
 
-                        if hasRiser then
-                            -- Prefer the nearest confirmed stair top. A small
-                            -- side penalty keeps centerline stairs favored while
-                            -- still allowing narrow/off-center steps.
-                            local score = run + math.abs(sideOffset) * 0.10
-                            if score < bestScore then
-                                bestScore = score
-                                bestRise = rise
-                                bestRun = run
+        table.sort(baseSamples, function(a, b) return a.height < b.height end)
+        local baseSample = baseSamples[math.ceil(#baseSamples / 2)]
+        local baseHeight = baseSample.height
+        local basePoint = root.Position
+            - up * (root.Position:Dot(up) - baseHeight)
+
+        local bestRise
+        local bestRun
+        local bestScore = math.huge
+
+        local lookaheads = {
+            math.clamp(CFG.StairStepLookahead * 0.45, 0.45, CFG.StairStepLookahead),
+            math.clamp(CFG.StairStepLookahead * 0.72, 0.60, CFG.StairStepLookahead),
+            CFG.StairStepLookahead,
+        }
+
+        for _, forwardDistance in ipairs(lookaheads) do
+            for _, sideOffset in ipairs(offsets) do
+                local probeOrigin = root.Position
+                    + moveDir * forwardDistance
+                    + side * sideOffset
+                    + probeUp * CFG.StairStepProbeAbove
+
+                local hit = cast(probeOrigin, -probeUp, CFG.StairStepProbeLength)
+                if hit then
+                    local normal = orientSurfaceNormal(hit, -probeUp)
+                    if normal and up:Dot(normal) > 0.965 then
+                        local topHeight = hit.Position:Dot(up)
+                        local rise = topHeight - baseHeight
+                        if up:Dot(UP) < -0.985 then
+                            rise = -rise
+                        end
+                        local run = (hit.Position - root.Position):Dot(moveDir)
+                        local slope = math.deg(math.atan2(math.max(rise, 0), math.max(run, 0.05)))
+
+                        if rise >= CFG.StairStepMinRise and rise <= CFG.StairStepMaxHeight and run >= CFG.StairStepClearance and run <= CFG.StairStepLookahead + 0.20 and slope <= CFG.StairStepMaxSlope then
+                            local riserHeight = math.clamp(
+                                math.min(rise * 0.55, CFG.StairStepRiserProbeHeight),
+                                0.08,
+                                CFG.StairStepRiserProbeHeight
+                            )
+                            local riserOrigin = basePoint
+                                + moveDir * 0.10
+                                + side * sideOffset
+                                + probeUp * riserHeight
+
+                            local riserHit = cast(
+                                riserOrigin,
+                                moveDir,
+                                math.max(CFG.StairStepRiserProbeLength, run + 0.35)
+                            )
+
+                            local hasRiser = false
+                            if riserHit then
+                                local riserNormal = orientSurfaceNormal(riserHit, moveDir)
+                                if riserNormal then
+                                    local facingIntoRiser = (-moveDir):Dot(riserNormal)
+                                    hasRiser = facingIntoRiser >= CFG.StairStepRiserMinDot
+                                        and up:Dot(riserNormal) < 0.35
+                                        and math.abs((riserHit.Position - basePoint):Dot(up))
+                                            <= rise + 0.22
+                                end
+                            end
+
+                            if hasRiser then
+                                local score = run + math.abs(sideOffset) * 0.10
+                                if score < bestScore then
+                                    bestScore = score
+                                    bestRise = rise
+                                    bestRun = run
+                                end
                             end
                         end
                     end
                 end
             end
         end
+
+        if bestRise and bestRun then
+            targetRise = bestRise
+            targetRun = bestRun
+        end
     end
 
-    if bestRise and bestRun then
-        local rampVector = moveDir * bestRun + up * bestRise
+    if targetRise and targetRun then
+        -- The ramp is a movement command in the current surface tangent frame.
+        -- Keep its magnitude equal to the player's requested horizontal speed,
+        -- while adding only the amount of currentUp motion required to clear
+        -- this particular riser.
+        local rampUp = up
+        if up:Dot(UP) < -0.985 then
+            rampUp = -up
+        end
+        local rampVector = moveDir * targetRun + rampUp * targetRise
         local rampDirection = safeUnit(rampVector, moveDir)
         stairStepMove = rampDirection
-        stairStepUntil = os.clock() + CFG.StairStepHoldTime
+        local stepHold = currentUp:Dot(UP) <= CFG.UpsideDownStairSafetyDot
+            and CFG.StairCeilingStepHoldTime
+            or CFG.StairStepHoldTime
+        stairStepUntil = os.clock() + stepHold
         stairStepTargetBlend = 1
     elseif os.clock() >= stairStepUntil then
         stairStepTargetBlend = 0
     end
 
-    stairStepBlend += (stairStepTargetBlend - stairStepBlend)
+    stairStepBlend = stairStepBlend + (stairStepTargetBlend - stairStepBlend)
         * (1 - math.exp(-CFG.StairStepBlendResponse * dt))
 
     if stairStepBlend <= 0.01 then
@@ -2056,8 +2397,8 @@ local function getStairStepRampMove(worldMove, up, dt)
 
     return adjustedDirection * tangentMagnitude, true
 end
-
-local function createControllers()
+]=] },
+    { name = '32_createControllers', source = [=[function createControllers()
     if gravityForce then gravityForce:Destroy() end
     if gravityAttachment then gravityAttachment:Destroy() end
     if orientation then orientation:Destroy() end
@@ -2094,12 +2435,43 @@ local function createControllers()
     orientation.Enabled = false
     orientation.Parent = root
 end
-
-local function isFloorUp(up)
+]=] },
+    { name = '33_isFloorUp', source = [=[function isFloorUp(up)
     return up:Dot(UP) > 0.985
 end
+]=] },
+    { name = '34_suppressNativeWorkspaceGravity', source = [=[function suppressNativeWorkspaceGravity()
+    if not workspaceGravitySuppressed then
+        wallWalkGravity = workspace.Gravity
+        workspaceGravitySuppressed = true
+    elseif workspace.Gravity ~= 0 then
+        -- If the experience changes its gravity while WallWalk is active,
+        -- adopt that new local value and suppress it again. This keeps the
+        -- custom system synchronized with the game's current gravity setting.
+        wallWalkGravity = workspace.Gravity
+    end
 
-local function setControllerMode(useCustomPhysics)
+    if workspace.Gravity ~= 0 then
+        pcall(function()
+            workspace.Gravity = 0
+        end)
+    end
+end
+]=] },
+    { name = '35_restoreNativeWorkspaceGravity', source = [=[function restoreNativeWorkspaceGravity()
+    if not workspaceGravitySuppressed then
+        return
+    end
+
+    local gravityToRestore = tonumber(wallWalkGravity) or 0
+    workspaceGravitySuppressed = false
+
+    pcall(function()
+        workspace.Gravity = gravityToRestore
+    end)
+end
+]=] },
+    { name = '36_setControllerMode', source = [=[function setControllerMode(useCustomPhysics)
     if not humanoid then return end
     if controllerPhysicsActive == useCustomPhysics then
         -- Keep the constraint enable state synchronized without repeatedly
@@ -2145,8 +2517,8 @@ local function setControllerMode(useCustomPhysics)
         end)
     end
 end
-
-local function enterCustom(up)
+]=] },
+    { name = '37_enterCustom', source = [=[function enterCustom(up)
     targetUp = safeUnit(up, currentUp)
     if not customActive then
         filteredAdhesionDistance = nil
@@ -2171,6 +2543,11 @@ local function enterCustom(up)
     -- the Humanoid once a real non-floor surface has been detected.
     customActive = true
 
+    -- Remove native world gravity from the local simulation before the custom
+    -- VectorForce becomes authoritative. The saved value is the actual Roblox
+    -- gravity strength we will reproduce along currentUp.
+    suppressNativeWorkspaceGravity()
+
     if animateScript then
         animateWasDisabled = animateScript.Disabled
     end
@@ -2191,9 +2568,10 @@ local function enterCustom(up)
     if gravityForce then gravityForce.Enabled = true end
     if orientation then orientation.Enabled = true end
 end
-
-local function leaveCustom(forceFreefall)
+]=] },
+    { name = '38_leaveCustom', source = [=[function leaveCustom(forceFreefall)
     customActive = false
+    restoreNativeWorkspaceGravity()
     filteredAdhesionDistance = nil
     microStepBlend = 0
     microStepTargetBlend = 0
@@ -2238,13 +2616,13 @@ local function leaveCustom(forceFreefall)
         end)
     end
 end
-
-local function resetGravitySwitchBackState()
+]=] },
+    { name = '39_resetGravitySwitchBackState', source = [=[function resetGravitySwitchBackState()
     gravitySwitchBackUp = nil
     gravitySwitchBackAt = 0
 end
-
-local function resetSafeSurfaceState()
+]=] },
+    { name = '40_resetSafeSurfaceState', source = [=[function resetSafeSurfaceState()
     surfaceLostAt = 0
     gravityTransitionActive = false
     orientationTransitionUntil = 0
@@ -2266,8 +2644,8 @@ end
 
 -- Gravity-side anti-flip guard. A real side switch happens immediately,
 -- but for 0.1s we refuse ONLY the previously-owned side. This does not delay
--- the new side and does not block switching to a third side.
-local function isGravitySwitchBackBlocked(candidateUp, now)
+-- the new side and does not block switching to a third side.]=] },
+    { name = '41_isGravitySwitchBackBlocked', source = [=[function isGravitySwitchBackBlocked(candidateUp, now)
     if not gravitySwitchBackUp then
         return false
     end
@@ -2279,8 +2657,8 @@ local function isGravitySwitchBackBlocked(candidateUp, now)
     local candidate = safeUnit(candidateUp, currentUp)
     return candidate:Dot(gravitySwitchBackUp) >= CFG.GravitySwitchBackDot
 end
-
-local function commitGravitySide(newUp)
+]=] },
+    { name = '42_commitGravitySide', source = [=[function commitGravitySide(newUp)
     local oldUp = safeUnit(currentUp, UP)
     local committedUp = safeUnit(newUp, oldUp)
 
@@ -2328,8 +2706,8 @@ local function commitGravitySide(newUp)
     currentUp = committedUp
     return committedUp
 end
-
-local function updateSurface(dt, moveVector)
+]=] },
+    { name = '43_updateSurface', source = [=[function updateSurface(dt, moveVector)
     if not root then return end
 
     -- Once the safety handoff has returned control to Roblox gravity, do not
@@ -2383,10 +2761,7 @@ local function updateSurface(dt, moveVector)
     -- Arm the transition guard BEFORE the existing ownership logic. This is
     -- intentionally the only new input to the safety system; all normal
     -- support detection remains exactly the v48.27 path.
-    if customActive and surfaceCandidate and not microSurfaceChange
-        and (strongChange or meaningfulChange)
-        and not switchBackBlocked
-    then
+    if customActive and surfaceCandidate and not microSurfaceChange and (strongChange or meaningfulChange) and not switchBackBlocked then
         gravityTransitionActive = true
     end
 
@@ -2395,9 +2770,7 @@ local function updateSurface(dt, moveVector)
         -- controller is ON. Roblox must keep native walking/jumping here.
         -- We only take over when the sensor sees a genuinely different surface.
         local nonFloor = detected:Dot(UP) < 0.985
-        if surfaceCandidate and nonFloor and (strongChange or meaningfulChange)
-            and not switchBackBlocked
-        then
+        if surfaceCandidate and nonFloor and (strongChange or meaningfulChange) and not switchBackBlocked then
             enterCustom(detected)
             commitGravitySide(detected)
         elseif not grounded then
@@ -2414,9 +2787,7 @@ local function updateSurface(dt, moveVector)
         -- hand the Humanoid back to Roblox. Do this BEFORE the generic
         -- surfaceCandidate branch so a floor normal cannot keep the custom
         -- controller alive indefinitely.
-        if detected:Dot(UP) > 0.985 and currentUp:Dot(UP) < 0.985
-            and not switchBackBlocked
-        then
+        if detected:Dot(UP) > 0.985 and currentUp:Dot(UP) < 0.985 and not switchBackBlocked then
             commitGravitySide(UP)
             leaveCustom()
             return
@@ -2461,8 +2832,8 @@ local function updateSurface(dt, moveVector)
         currentUp = safeUnit(currentUp:Lerp(targetUp, blend), currentUp)
     end
 end
-
-local function getSafetySupport()
+]=] },
+    { name = '44_getSafetySupport', source = [=[function getSafetySupport()
     if not root then return false, nil, nil, math.huge end
 
     local origin = root.Position
@@ -2509,9 +2880,7 @@ local function getSafetySupport()
             local normal = orientSurfaceNormal(hit, -up)
             if normal and up:Dot(normal) >= CFG.SurfaceSafetySupportNormalDot then
                 local distance = math.abs((probeOrigin - hit.Position):Dot(normal))
-                if distance <= CFG.SurfaceSafetySupportDistance
-                    and distance < bestDistance
-                then
+                if distance <= CFG.SurfaceSafetySupportDistance and distance < bestDistance then
                     bestHit = hit
                     bestNormal = normal
                     bestDistance = distance
@@ -2526,8 +2895,8 @@ local function getSafetySupport()
 
     return true, bestHit.Position, bestNormal, bestDistance
 end
-
-local function checkSurfaceSafety(dt, moveVector)
+]=] },
+    { name = '45_checkSurfaceSafety', source = [=[function checkSurfaceSafety(dt, moveVector)
     if not customActive or not root or isFloorUp(currentUp) then
         resetSafeSurfaceState()
         return false
@@ -2538,16 +2907,112 @@ local function checkSurfaceSafety(dt, moveVector)
     local now = os.clock()
     local up = safeUnit(currentUp, UP)
 
-    -- v48.25: use the support result produced by the SAME multi-ray surface
-    -- scan that updateSurface() just ran. Do not run a separate fan here.
-    -- The scan already distinguishes a currently-owned face from distant
-    -- transition candidates by requiring an aligned hit inside the adhesion
-    -- envelope. This keeps stable wall/ceiling support alive without letting
-    -- a long look-ahead ray extend the handoff timer.
+    -- v48.25: start with the support result produced by the SAME multi-ray
+    -- surface scan that updateSurface() just ran. Do not replace that result
+    -- with a generic look-ahead sensor.
     local supportSeen = surfaceSupportSeen
     local supportPoint = surfaceSupportPoint
     local supportNormal = surfaceSupportNormal
     local supportDistance = surfaceSupportDistance
+
+    -- v48.66: a confirmed ceiling stair is valid support even when the root
+    -- support rays momentarily land on the narrow riser/edge. This is the key
+    -- fix for the smaller-tread staircase: geometry can be temporarily absent
+    -- from every support ray without meaning that the character detached.
+    if not supportSeen and up:Dot(UP) <= CFG.UpsideDownStairSafetyDot and stairTraversalActive and stairTraversalNormal then
+        local traversalStartedAt = stairTraversalUntil - CFG.StairTraversalHoldTime
+        local traversalAge = now - traversalStartedAt
+        local movingIntoStair = false
+
+        if moveVector and moveVector.Magnitude > 0.05 and stairTraversalMoveDir then
+            local moveDir = safeUnit(projectOnPlane(moveVector, up), stairTraversalMoveDir)
+            movingIntoStair = moveDir:Dot(safeUnit(stairTraversalMoveDir, moveDir)) >= 0.55
+        end
+
+        -- A confirmed stair-riser detection is itself proof that the player is
+        -- still interacting with the staircase. Small ceiling treads can leave
+        -- every support ray on an edge for several frames, so requiring a
+        -- cached tread point here was still enough to trip safety in v48.66.
+        -- While actively moving into the confirmed stair, keep the surface
+        -- ownership alive for the bounded stair-traversal window. After that
+        -- window the normal fall safety timer is allowed to take over.
+        if traversalAge <= CFG.UpsideDownStairTraversalSafetyHold and movingIntoStair then
+            supportSeen = true
+            supportPoint = stairTraversalPoint or root.Position
+            supportNormal = stairTraversalNormal
+            supportDistance = 0
+        end
+    end
+
+    -- v48.65 UPSIDE-DOWN STAIR SUPPORT BRIDGE:
+    -- The ceiling stair can temporarily expose a riser while the next tread is
+    -- still physically close. Do not require the center ray to see the tread.
+    -- Search a wider tangent fan and keep the last confirmed ceiling support for
+    -- a very short grace window when the character is still close to it.
+    if up:Dot(UP) <= CFG.UpsideDownStairSafetyDot and stairTraversalActive then
+        local tangentA = projectOnPlane(root.CFrame.RightVector, up)
+        tangentA = safeUnit(tangentA, Vector3.xAxis)
+        local tangentB = safeUnit(tangentA:Cross(up), root.CFrame.LookVector)
+        tangentB = safeUnit(projectOnPlane(tangentB, up), Vector3.zAxis)
+
+        local fanRadius = CFG.UpsideDownStairSafetyFanRadius
+        local offsets = {
+            ZERO,
+            tangentA * fanRadius,
+            -tangentA * fanRadius,
+            tangentB * fanRadius,
+            -tangentB * fanRadius,
+            tangentA * (fanRadius * 0.55),
+            -tangentA * (fanRadius * 0.55),
+            tangentB * (fanRadius * 0.55),
+            -tangentB * (fanRadius * 0.55),
+        }
+
+        local bestFallbackHit
+        local bestFallbackNormal
+        local bestFallbackDistance = math.huge
+
+        for _, offset in ipairs(offsets) do
+            local probeOrigin = root.Position + offset
+            local hit = cast(probeOrigin, -up, CFG.UpsideDownStairSafetyProbeLength)
+
+            if hit then
+                local normal = orientSurfaceNormal(hit, -up)
+                if normal then
+                    local supportDot = up:Dot(normal)
+                    if supportDot >= CFG.SurfaceSafetySupportNormalDot then
+                        local distance = math.abs((probeOrigin - hit.Position):Dot(normal))
+                        if distance <= CFG.UpsideDownStairSafetyDistance and distance < bestFallbackDistance then
+                            bestFallbackHit = hit
+                            bestFallbackNormal = normal
+                            bestFallbackDistance = distance
+                        end
+                    end
+                end
+            end
+        end
+
+        if bestFallbackHit then
+            supportSeen = true
+            supportPoint = bestFallbackHit.Position
+            supportNormal = bestFallbackNormal
+            supportDistance = bestFallbackDistance
+        end
+
+        -- If every fan ray is on a stair edge, preserve the last real ceiling
+        -- support briefly. This is deliberately short and distance-limited, so
+        -- an actual fall still reaches the normal safety handoff.
+        if not supportSeen and safetySupportPoint and safetySupportNormal then
+            local separation = (root.Position - safetySupportPoint):Dot(safetySupportNormal)
+            local supportAge = now - safetySupportAt
+            if separation <= CFG.SurfaceSafetyAwayDistance + 0.35 and supportAge <= CFG.UpsideDownStairSafetyGrace then
+                supportSeen = true
+                supportPoint = safetySupportPoint
+                supportNormal = safetySupportNormal
+                supportDistance = math.max(0, separation)
+            end
+        end
+    end
 
     -- If the player is actively moving away from the last owned face, do not
     -- wait for the angled multi-ray scan to stop seeing that face. This is the
@@ -2574,10 +3039,7 @@ local function checkSurfaceSafety(dt, moveVector)
         -- The transition is complete only when the normal support sensor sees
         -- the currently-owned gravity plane again. This keeps the guard from
         -- becoming a permanent grace state.
-        if gravityTransitionActive
-            and supportNormal
-            and up:Dot(safeUnit(supportNormal, up)) >= CFG.SurfaceSafetySupportNormalDot
-        then
+        if gravityTransitionActive and supportNormal and up:Dot(safeUnit(supportNormal, up)) >= CFG.SurfaceSafetySupportNormalDot then
             gravityTransitionActive = false
         end
 
@@ -2647,7 +3109,15 @@ local function checkSurfaceSafety(dt, moveVector)
         return false
     end
 
-    if now - surfaceLostAt < CFG.SurfaceSafetyDelay then
+    local safetyDelay = CFG.SurfaceSafetyDelay
+    if up:Dot(UP) <= CFG.UpsideDownStairSafetyDot and stairTraversalActive then
+        -- Ceiling stairs need a longer continuous-loss window because a narrow
+        -- tread can disappear from the probes while the root is physically
+        -- crossing the riser. This is still a hard timeout, not permanent grace.
+        safetyDelay = math.max(safetyDelay, CFG.UpsideDownStairTraversalSafetyHold)
+    end
+
+    if now - surfaceLostAt < safetyDelay then
         return false
     end
 
@@ -2675,28 +3145,78 @@ local function checkSurfaceSafety(dt, moveVector)
     leaveCustom(true)
     return true
 end
-
-local function updateGravityAndMovement(dt, worldMove, microStepActive)
+]=] },
+    { name = '46_updateGravityAndMovement', source = [=[function updateGravityAndMovement(dt, worldMove, microStepActive)
     if not root or not gravityForce or not customActive then return end
 
     local mass = root.AssemblyMass
     if mass <= 0 then return end
 
-    local gravity = CFG.Gravity
+    -- Keep native Workspace.Gravity at zero while custom physics is active.
+    -- If another local script/game update changes it, capture the new value and
+    -- suppress it again before calculating this frame's custom gravity.
+    suppressNativeWorkspaceGravity()
+
+    local gravity = wallWalkGravity
     local velocity = root.AssemblyLinearVelocity
     local normalVelocity = velocity:Dot(currentUp)
     local tangentVelocity = velocity - normalVelocity * currentUp
     local desired = CFG.WalkSpeed * worldMove
     local delta = desired - tangentVelocity
 
-    local force = gravity * mass * (UP - currentUp)
+    -- The ceiling staircase has a short active ramp window. Native gravity is
+    -- already zero here, so the scale below is the REAL custom gravity fraction
+    -- instead of a compensation value fighting Roblox's world gravity.
+    -- Keep these as simple Luau statements. Some mobile/executor parsers are
+    -- stricter about multiline boolean/and-or expressions than the Luau parser.
+    local ceilingStepActive = false
+    if currentUp:Dot(UP) <= CFG.UpsideDownStairSafetyDot then
+        if stairStepBlend > 0.01 then
+            if stairStepTargetBlend > 0.01 then
+                ceilingStepActive = true
+            end
+        end
+    end
+
+    local gravityScale = 1
+    if ceilingStepActive then
+        gravityScale = CFG.StairCeilingStepGravityScale
+    end
+
+    local walkForce = CFG.WalkForce
+    if ceilingStepActive then
+        walkForce = CFG.WalkForce * CFG.StairCeilingStepForceMultiplier
+    end
+
+    -- Exact surface-relative copy of Roblox gravity. Because native gravity is
+    -- suppressed locally, there is no UP-currentUp compensation term needed.
+    -- currentUp points away from the support surface, so -currentUp is gravity
+    -- toward that surface on floor, wall and ceiling alike.
+    local force = -currentUp * (gravity * mass * gravityScale)
+
+    -- The v48.74 ceiling-step lift direction was correct; v48.75 retained the
+    -- ramp geometry but the actuation block tested/pushed +currentUp, which is
+    -- the wrong side for an upside-down stair. Reuse the proven lift direction
+    -- here so the root can clear the riser independently of foot-animation height.
+    if ceilingStepActive and stairStepMove.Magnitude > 0.05 then
+        local stepDirection = safeUnit(stairStepMove, worldMove)
+        local liftDirection = -currentUp
+        local stepNormalComponent = math.max(0, stepDirection:Dot(liftDirection))
+
+        if stepNormalComponent > 0.01 then
+            local smoothBlend = math.max(stairStepBlend, 0.35)
+            local liftAcceleration = CFG.StairCeilingStepLiftAcceleration * stepNormalComponent * smoothBlend
+            local liftForce = liftDirection * (liftAcceleration * mass)
+            force = force + liftForce
+        end
+    end
 
     if delta.Magnitude > 0.001 then
         -- Apply acceleration-like steering instead of an oversized per-frame
         -- force. This makes starts/stops feel much closer to Roblox movement.
         local acceleration = math.min(CFG.MaxWalkForce / math.max(mass, 1),
-            CFG.WalkForce * delta.Magnitude)
-        force += delta.Unit * acceleration * mass
+            walkForce * delta.Magnitude)
+        force = force + delta.Unit * acceleration * mass
     end
 
     local hit = cast(root.Position, -currentUp, CFG.AdhesionProbeLength)
@@ -2717,7 +3237,7 @@ local function updateGravityAndMovement(dt, worldMove, microStepActive)
             local distanceDelta = distance - filteredAdhesionDistance
             if math.abs(distanceDelta) <= CFG.MicroSurfaceDistance then
                 local alpha = 1 - math.exp(-CFG.MicroAdhesionResponse * dt)
-                filteredAdhesionDistance += distanceDelta * alpha
+                filteredAdhesionDistance = filteredAdhesionDistance + distanceDelta * alpha
             else
                 filteredAdhesionDistance = distance
             end
@@ -2735,7 +3255,7 @@ local function updateGravityAndMovement(dt, worldMove, microStepActive)
                 -24,
                 24
             )
-            force += -currentUp * correction * mass
+            force = force + -currentUp * correction * mass
         end
     else
         filteredAdhesionDistance = nil
@@ -2743,8 +3263,8 @@ local function updateGravityAndMovement(dt, worldMove, microStepActive)
 
     gravityForce.Force = force
 end
-
-local function updateOrientation(worldMove)
+]=] },
+    { name = '47_updateOrientation', source = [=[function updateOrientation(worldMove)
     if not orientation or not customActive or not root then return end
 
     local facing
@@ -2791,11 +3311,272 @@ local function updateOrientation(worldMove)
     orientation.CFrame = CFrame.fromMatrix(Vector3.zero, right, currentUp, -correctedForward)
 end
 
-local cameraBaseCFrame
-local cameraBaseUp
-local cameraOffsetY = 0
+cameraOffsetY =  0
+]=] },
+    { name = '48_getRotationBetweenUpVectors', source = [=[function getRotationBetweenUpVectors(fromUp, toUp, axisHint)
+    local from = safeUnit(fromUp, UP)
+    local to = safeUnit(toUp, UP)
+    local dot = math.clamp(from:Dot(to), -1, 1)
+    if dot > 0.999999 then
+        return CFrame.identity
+    end
 
-local function updateCameraStabilization(dt)
+    local axis = from:Cross(to)
+    if axis.Magnitude < 1e-5 then
+        -- A 180-degree turn has no unique cross-product axis. Use the camera's
+        -- right axis, projected off the current up vector, for a stable result.
+        axis = projectOnPlane(axisHint or Vector3.xAxis, from)
+        if axis.Magnitude < 1e-5 then
+            axis = projectOnPlane(Vector3.zAxis, from)
+        end
+    end
+    axis = safeUnit(axis, Vector3.xAxis)
+    return CFrame.fromAxisAngle(axis, math.acos(dot))
+end
+]=] },
+    { name = '49_applyCameraModuleUpTransform', source = [=[function getCameraTargetUp()
+    if cameraPOVEnabled and not destroyed and enabled and customActive then
+        return safeUnit(currentUp, UP)
+    end
+    return UP
+end
+
+-- CameraModule's classic controller calculates yaw/pitch in Roblox's ordinary
+-- world-up frame. Before it processes touch input, temporarily remove the
+-- gravity camera frame from the previous rendered CFrame. CameraModule then
+-- sees the same coordinate space it expects on a normal floor.
+function prepareCameraModuleUpTransform()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    if camera.CameraType ~= Enum.CameraType.Custom then return end
+    if not cameraUpFrame then cameraUpFrame = CFrame.identity end
+
+    local focus = camera.Focus
+    local relativePose = focus:ToObjectSpace(camera.CFrame)
+    local neutralPose = cameraUpFrame:Inverse() * relativePose
+    camera.CFrame = focus * neutralPose
+end
+
+-- Apply gravity orientation AFTER Roblox has processed its normal camera input.
+-- The input controller and its own cached state remain in the standard frame;
+-- only the final rendered orbit is gravity-rotated.
+function applyCameraModuleUpTransform(cameraModule, dt)
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    if camera.CameraType ~= Enum.CameraType.Custom then return end
+    if not cameraUpFrame then cameraUpFrame = CFrame.identity end
+
+    local gravityPOVActive = cameraPOVEnabled and not destroyed and enabled and customActive
+    local targetUp = getCameraTargetUp()
+    dt = math.clamp(tonumber(dt) or (1 / 60), 0, 0.1)
+
+    if gravityPOVActive then
+        local fullTurn = getRotationBetweenUpVectors(
+            cameraUpVector,
+            targetUp,
+            camera.CFrame.RightVector
+        )
+        local _, fullAngle = fullTurn:ToAxisAngle()
+        local stepRotation = fullTurn
+
+        if math.abs(fullAngle) > math.rad(0.06) then
+            local alpha = 1 - math.exp(-CFG.CameraUpResponsiveness * dt)
+            stepRotation = CFrame.identity:Lerp(fullTurn, alpha)
+        end
+
+        local nextUp = safeUnit(stepRotation:VectorToWorldSpace(cameraUpVector), targetUp)
+        local remainingTurn = getRotationBetweenUpVectors(
+            nextUp,
+            targetUp,
+            camera.CFrame.RightVector
+        )
+        local _, remainingAngle = remainingTurn:ToAxisAngle()
+        if math.abs(remainingAngle) < math.rad(0.2) then
+            stepRotation = remainingTurn * stepRotation
+            nextUp = targetUp
+        end
+
+        -- Accumulate turns along the actual surface path. This preserves a
+        -- continuous gravity frame across wall and ceiling transitions.
+        cameraUpFrame = stepRotation * cameraUpFrame
+        cameraUpVector = safeUnit(cameraUpFrame:VectorToWorldSpace(UP), nextUp)
+    else
+        -- POV off, normal floor, disabled, or destroyed: smoothly return the
+        -- COMPLETE frame to identity, not just its up axis. Otherwise a hidden
+        -- residual twist can keep changing the camera's heading after returning
+        -- to ordinary gravity.
+        local _, frameAngle = cameraUpFrame:ToAxisAngle()
+        if math.abs(frameAngle) > math.rad(0.06) then
+            local alpha = 1 - math.exp(-CFG.CameraUpResponsiveness * dt)
+            cameraUpFrame = cameraUpFrame:Lerp(CFrame.identity, alpha)
+        else
+            cameraUpFrame = CFrame.identity
+        end
+        cameraUpVector = safeUnit(cameraUpFrame:VectorToWorldSpace(UP), UP)
+    end
+
+    local focus = camera.Focus
+    local relativePose = focus:ToObjectSpace(camera.CFrame)
+    local adjustedCFrame = focus * (cameraUpFrame * relativePose)
+
+    -- CameraModule's occlusion pass ran in the standard frame. Check the
+    -- gravity-rotated orbit too, and move it inward if the new path hits geometry.
+    if cameraCollisionCharacter ~= character then
+        cameraCollisionCharacter = character
+        cameraCollisionParams.FilterDescendantsInstances = character and {character} or {}
+    end
+    local cameraRay = adjustedCFrame.Position - focus.Position
+    if cameraRay.Magnitude > 0.05 then
+        local hit = workspace:Raycast(focus.Position, cameraRay, cameraCollisionParams)
+        if hit then
+            local safeDistance = math.max(0.05, (hit.Position - focus.Position).Magnitude - 0.25)
+            if safeDistance < cameraRay.Magnitude then
+                local safePosition = focus.Position + cameraRay.Unit * safeDistance
+                adjustedCFrame = adjustedCFrame + (safePosition - adjustedCFrame.Position)
+            end
+        end
+    end
+
+    camera.CFrame = adjustedCFrame
+
+    local _, finalFrameAngle = cameraUpFrame:ToAxisAngle()
+    if (destroyed or not enabled) and not customActive
+        and cameraUpVector:Dot(UP) > 0.99999
+        and math.abs(finalFrameAngle) < math.rad(0.25)
+    then
+        cameraUpVector = UP
+        cameraUpFrame = CFrame.identity
+        if restoreCameraModuleHook then
+            restoreCameraModuleHook()
+        end
+    end
+end]=] },
+    { name = '50_getPlayerCameraModule', source = [=[function getPlayerCameraModule()
+    local scripts = player:FindFirstChildOfClass("PlayerScripts")
+    local playerModuleScript = scripts and scripts:FindFirstChild("PlayerModule")
+    if not playerModuleScript then return nil end
+
+    local ok, playerModule = pcall(require, playerModuleScript)
+    if not ok or not playerModule then return nil end
+
+    if type(playerModule.GetCameras) == "function" then
+        local camerasOK, cameras = pcall(function()
+            return playerModule:GetCameras()
+        end)
+        if camerasOK and cameras then
+            return cameras
+        end
+    end
+
+    return playerModule.cameras
+end
+
+-- Older v48.76.4/v48.76.5 builds replaced CameraModule.Update directly.
+-- If one of those wrappers survived a script re-execution, recover its captured
+-- original method when the executor exposes debug.getupvalue. This avoids two
+-- independent gravity transforms being applied to the same camera.
+function removeLegacyCameraModuleWrapper()
+    local cameras = getPlayerCameraModule()
+    if not cameras then return end
+    local currentUpdate = cameras.Update
+    if type(currentUpdate) ~= "function" then return end
+
+    local debugLibrary = debug
+    if type(debugLibrary) ~= "table" then return end
+    local getUpvalue = debugLibrary.getupvalue
+    if type(getUpvalue) ~= "function" then return end
+
+    local originalUpdate = nil
+    local foundWallWalkTransform = false
+    for index = 1, 40 do
+        local ok, upvalueName, upvalueValue = pcall(getUpvalue, currentUpdate, index)
+        if not ok or upvalueName == nil then break end
+        if upvalueName == "cameraModuleOriginalUpdate" and type(upvalueValue) == "function" then
+            originalUpdate = upvalueValue
+        end
+        if upvalueName == "applyCameraModuleUpTransform" then
+            foundWallWalkTransform = true
+        end
+    end
+
+    if originalUpdate and foundWallWalkTransform then
+        pcall(function()
+            if cameras.Update == currentUpdate then
+                cameras.Update = originalUpdate
+            end
+        end)
+    end
+end
+
+restoreCameraModuleHook = function()
+    pcall(function()
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_PreCamera_48_76_16")
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_PostCamera_48_76_16")
+    end)
+
+    cameraModuleHookInstalled = false
+    cameraModuleObject = nil
+    cameraModuleOriginalUpdate = nil
+    cameraModuleOriginalOwnUpdate = nil
+    wrappedCameraModuleUpdate = nil
+    cameraUpVector = UP
+    cameraUpFrame = CFrame.identity
+end]=] },
+    { name = '51_installCameraModuleHook', source = [=[function installCameraModuleHook()
+    if cameraModuleHookInstalled then
+        return true
+    end
+
+    -- Remove this script's previous render-step hooks from older versions.
+    -- This prevents an old post-camera transform from fighting this one when
+    -- the user executes the updated standalone without rejoining the game.
+    removeLegacyCameraModuleWrapper()
+
+    pcall(function()
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_Camera_48_76_9")
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_Camera_48_76_10")
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_Camera_48_76_8")
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_PreCamera_48_76_11")
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_PostCamera_48_76_11")
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_PreCamera_48_76_16")
+        RunService:UnbindFromRenderStep("VGDWallWalkPOV_PostCamera_48_76_16")
+    end)
+
+    local preOK, preError = pcall(function()
+        RunService:BindToRenderStep(
+            "VGDWallWalkPOV_PreCamera_48_76_16",
+            Enum.RenderPriority.Camera.Value - 1,
+            function()
+                prepareCameraModuleUpTransform()
+            end
+        )
+    end)
+    if not preOK then
+        warn("VGD WallWalk POV: failed to bind pre-camera update: " .. tostring(preError))
+        return false
+    end
+
+    local postOK, postError = pcall(function()
+        RunService:BindToRenderStep(
+            "VGDWallWalkPOV_PostCamera_48_76_16",
+            Enum.RenderPriority.Camera.Value + 1,
+            function(dt)
+                applyCameraModuleUpTransform(nil, dt)
+            end
+        )
+    end)
+    if not postOK then
+        pcall(function()
+            RunService:UnbindFromRenderStep("VGDWallWalkPOV_PreCamera_48_76_16")
+        end)
+        warn("VGD WallWalk POV: failed to bind post-camera update: " .. tostring(postError))
+        return false
+    end
+
+    cameraModuleHookInstalled = true
+    return true
+end]=] },
+    { name = '52_updateCameraStabilization', source = [=[function updateCameraStabilization(dt)
     if destroyed then return end
     local camera = workspace.CurrentCamera
     if not camera or not humanoid or not root then return end
@@ -2803,7 +3584,6 @@ local function updateCameraStabilization(dt)
     -- Never replace Roblox's camera controller. We only remove tiny vertical
     -- physics chatter while WallWalk is active on the normal floor.
     if not enabled or not customActive or currentUp:Dot(Vector3.yAxis) < 0.985 then
-        cameraBaseCFrame = nil
         cameraOffsetY = 0
         return
     end
@@ -2811,29 +3591,27 @@ local function updateCameraStabilization(dt)
     local normalSpeed = root.AssemblyLinearVelocity:Dot(currentUp)
     local targetOffset = math.clamp(normalSpeed * 0.018, -0.22, 0.22)
     local alpha = 1 - math.exp(-12 * dt)
-    cameraOffsetY += (targetOffset - cameraOffsetY) * alpha
+    cameraOffsetY = cameraOffsetY + (targetOffset - cameraOffsetY) * alpha
 
     -- CameraOffset is applied by Roblox's normal camera scripts, so this
     -- keeps mouse/joystick orbit, zoom, occlusion and camera collision intact.
     humanoid.CameraOffset = Vector3.new(0, -cameraOffsetY, 0)
 end
-
-local function resetCameraStabilization()
+]=] },
+    { name = '53_resetCameraStabilization', source = [=[function resetCameraStabilization()
     cameraOffsetY = 0
     if humanoid then
         humanoid.CameraOffset = Vector3.zero
     end
-    cameraBaseCFrame = nil
-    cameraBaseUp = nil
 end
-
-local function setEmoteStateBridge(active)
+]=] },
+    { name = '54_setEmoteStateBridge', source = [=[function setEmoteStateBridge(active)
     -- Emotes are handled through Animate.PlayEmote below.
     -- Never leave WallWalk Physics just because the emote wheel is open.
     emoteStateBridge = false
 end
-
-local function updateEmoteStateBridge()
+]=] },
+    { name = '55_updateEmoteStateBridge', source = [=[function updateEmoteStateBridge()
     -- Intentionally a no-op. WallWalk must remain in custom Physics while
     -- the Roblox emote menu is open; switching to Running makes the normal
     -- world controller fight the custom wall/ceiling gravity.
@@ -2841,8 +3619,8 @@ local function updateEmoteStateBridge()
     emoteStateRestoreAt = 0
     emoteStateBridge = false
 end
-
-local function enforceRagdollProtection()
+]=] },
+    { name = '56_enforceRagdollProtection', source = [=[function enforceRagdollProtection()
     if not humanoid then return end
 
     -- WallWalk may use the Humanoid Physics state internally, but Ragdoll and
@@ -2861,8 +3639,8 @@ local function enforceRagdollProtection()
         end)
     end
 end
-
-local function getJumpSurfaceSupport(up)
+]=] },
+    { name = '57_getJumpSurfaceSupport', source = [=[function getJumpSurfaceSupport(up)
     if not root then return false end
     if getActualSurfaceContact(up) then return true end
 
@@ -2875,8 +3653,8 @@ local function getJumpSurfaceSupport(up)
     local normal = orientSurfaceNormal(hit, -up)
     return normal and up:Dot(normal) >= 0.80
 end
-
-local function requestJump()
+]=] },
+    { name = '58_requestJump', source = [=[function requestJump()
     if not enabled then return end
 
     -- JumpRequest can fire more than once for one physical press (especially
@@ -2890,8 +3668,8 @@ local function requestJump()
     if customActive and jumpLocked then return end
     jumpRequested = true
 end
-
-local function performJump()
+]=] },
+    { name = '59_performJump', source = [=[function performJump()
     if not customActive or not root or not humanoid then return end
     if os.clock() - lastJump < CFG.JumpCooldown then return end
     if jumpLocked then return end
@@ -2917,8 +3695,8 @@ local function performJump()
 
     root.AssemblyLinearVelocity = tangent + currentUp * jumpSpeed
 end
-
-local function captureOriginalCharacterState()
+]=] },
+    { name = '60_captureOriginalCharacterState', source = [=[function captureOriginalCharacterState()
     if not humanoid then return end
 
     originalState.valid = true
@@ -2955,8 +3733,8 @@ local function captureOriginalCharacterState()
         end
     end
 end
-
-local function restoreOriginalCharacterState()
+]=] },
+    { name = '61_restoreOriginalCharacterState', source = [=[function restoreOriginalCharacterState()
     if not originalState.valid or not humanoid then return end
 
     if animateScript then
@@ -2987,8 +3765,8 @@ local function restoreOriginalCharacterState()
         pcall(function() playEmote.OnInvoke = originalState.emoteOnInvoke end)
     end
 end
-
-local function restoreNormal()
+]=] },
+    { name = '62_restoreNormal', source = [=[function restoreNormal()
     resetCameraStabilization()
     setJumpButtonVisible(false)
     leaveCustom()
@@ -3023,14 +3801,15 @@ local function restoreNormal()
         restoreOriginalCharacterState()
     end
 end
-
-local function activateWallWalk()
+]=] },
+    { name = '63_activateWallWalk', source = [=[function activateWallWalk()
     if not character or not humanoid or not root then return end
 
     enabled = true
     safetyReleased = false
     setJumpButtonVisible(UserInputService.TouchEnabled)
     controls = controls or getPlayerControls()
+    installCameraModuleHook()
     if controls then pcall(function() controls:Enable() end) end
 
     currentUp = UP
@@ -3080,8 +3859,12 @@ local function activateWallWalk()
         animateScript.Disabled = false
     end
 end
-
-local function setupCharacter(newCharacter)
+]=] },
+    { name = '64_setupCharacter', source = [=[function setupCharacter(newCharacter)
+    -- A respawn can replace the old character while WallWalk is still on a
+    -- wall/ceiling. Restore the client's native gravity before adopting the new
+    -- character so a stale zero-gravity state cannot leak across respawns.
+    restoreNativeWorkspaceGravity()
     character = newCharacter
     humanoid = character:WaitForChild("Humanoid")
     root = character:WaitForChild("HumanoidRootPart")
@@ -3164,8 +3947,8 @@ local function setupCharacter(newCharacter)
         restoreNormal()
     end
 end
-
-local function update(dt)
+]=] },
+    { name = '65_update', source = [=[function update(dt)
     if destroyed then return end
     if not enabled or not character or not humanoid or not root or humanoid.Health <= 0 then return end
 
@@ -3220,10 +4003,11 @@ local function update(dt)
     local worldMove = getWorldMove(moveVector, currentUp)
     local movementMove, microStepActive = getMicroStepRampMove(worldMove, currentUp, dt)
 
-    -- Only invoke the new stair solver when the original micro-step solver is
-    -- not already handling the geometry. This is the key regression guard:
-    -- v48.35's established micro-step path remains authoritative for tiny
-    -- seams/bumps and low ramps.
+    -- v48.75: CEILING STAIR MOVEMENT USES THE PROVEN v48.65 RAMP METHOD.
+    -- The stair geometry is surface-relative: on a ceiling, the ramp's lift
+    -- component points toward -currentUp (toward the underside). The resulting
+    -- direction is fed through the SAME custom movement-force path used by v48.65.
+    -- No separate position constraint, no animation-driven step, and no separate root teleporter.
     if not microStepActive then
         movementMove, microStepActive = getStairStepRampMove(movementMove, currentUp, dt)
     else
@@ -3255,5 +4039,415 @@ local function update(dt)
         -- Keep the jump state until the character is descending and the
         -- current surface is positively supporting it. This prevents both
         -- infinite jumps and a permanent wall-jump lock.
-        if landedNow and normalVel
-Preview truncated for large file
+        if landedNow and normalVelocity <= 1.5 and os.clock() - jumpStartedAt > 0.08 then
+            jumped = false
+            jumpLaunchUp = UP
+            jumpLaunchPosition = nil
+            jumpLaunchPlaneCrossed = false
+            jumpLocked = false
+            justLanded = true
+            if normalVelocity < 0 then
+                root.AssemblyLinearVelocity =
+                    root.AssemblyLinearVelocity - currentUp * normalVelocity
+            end
+        end
+    end
+
+    if isFloorUp(currentUp) then
+        -- Native Roblox floor movement owns the character here. The custom
+        -- controller only takes over after a real wall/ceiling transition.
+        setControllerMode(false)
+    else
+        setControllerMode(true)
+        updateGravityAndMovement(dt, movementMove, microStepActive)
+        updateOrientation(movementMove)
+    end
+
+    local tangentSpeed = projectOnPlane(root.AssemblyLinearVelocity, currentUp).Magnitude
+    local grounded = getGrounded(currentUp)
+    if customActive then
+        updateAnimations(worldMove.Magnitude > 0.05, grounded, tangentSpeed)
+    end
+end
+]=] },
+    { name = '66_disconnectGuiConnections', source = [=[function disconnectGuiConnections()
+    for _, c in ipairs(guiConnections) do
+        if c then c:Disconnect() end
+    end
+    table.clear(guiConnections)
+end
+
+setJumpButtonVisible = function(visible)
+    if jumpButton and jumpButton.Parent then
+        jumpButton.Visible = visible
+    end
+end
+]=] },
+    { name = '67_updateJumpButtonLayout', source = [=[function updateJumpButtonLayout()
+    if not jumpButton or not jumpButton.Parent then return end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+    local small = math.min(viewport.X, viewport.Y) <= 500
+    local size = small and 70 or 120
+    jumpButton.Size = UDim2.fromOffset(size, size)
+    jumpButton.Position = small
+        and UDim2.new(1, -(size * 1.5 - 10), 1, -size - 20)
+        or UDim2.new(1, -(size * 1.5 - 10), 1, -size * 1.75)
+end
+
+updateUI = nil
+]=] },
+    { name = '68_createUI', source = [=[function destroyWallWalk()
+    if destroyed then return end
+    destroyed = true
+    enabled = false
+    restoreNormal()
+    resetCameraStabilization()
+    restoreOriginalCharacterState()
+
+    for _, c in ipairs(guiConnections) do
+        if c then c:Disconnect() end
+    end
+    table.clear(guiConnections)
+    for _, c in ipairs(lifecycleConnections) do
+        if c then c:Disconnect() end
+    end
+    table.clear(lifecycleConnections)
+    if transitionGuardConnection then transitionGuardConnection:Disconnect(); transitionGuardConnection = nil end
+    if heartbeatConnection then heartbeatConnection:Disconnect(); heartbeatConnection = nil end
+    if emoteHandlerGuardConnection then emoteHandlerGuardConnection:Disconnect(); emoteHandlerGuardConnection = nil end
+    if emoteTrackConnection then emoteTrackConnection:Disconnect(); emoteTrackConnection = nil end
+    if cameraConnection then cameraConnection:Disconnect(); cameraConnection = nil end
+    if gravityForce then gravityForce:Destroy(); gravityForce = nil end
+    if gravityAttachment then gravityAttachment:Destroy(); gravityAttachment = nil end
+    if orientation then orientation:Destroy(); orientation = nil end
+    if orientationAttachment then orientationAttachment:Destroy(); orientationAttachment = nil end
+    if gui then gui:Destroy(); gui = nil end
+end
+
+function createUI()
+    if gui then gui:Destroy() end
+    disconnectGuiConnections()
+
+    gui = Instance.new("ScreenGui")
+    gui.Name = "VGD_WallWalk_Standalone"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+    gui.DisplayOrder = 1000000
+    gui.Parent = playerGui
+
+    local panel = Instance.new("Frame")
+    panel.Size = UDim2.fromOffset(CFG.PanelWidth, CFG.PanelHeight)
+    panel.Position = UDim2.new(1, -(CFG.PanelWidth + 3), 0.5, -(CFG.PanelHeight / 2))
+    panel.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
+    panel.BackgroundTransparency = 0.08
+    panel.BorderSizePixel = 0
+    panel.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = panel
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(0, 170, 255)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.15
+    stroke.Parent = panel
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(11, 6)
+    title.Size = UDim2.new(1, -40, 0, 17)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 11
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = Color3.new(1, 1, 1)
+    title.Text = "WallWalk v48.76.16"
+    title.TextTruncate = Enum.TextTruncate.AtEnd
+    title.Parent = panel
+
+    local headerLine = Instance.new("Frame")
+    headerLine.Name = "HeaderDivider"
+    headerLine.Position = UDim2.fromOffset(11, 26)
+    headerLine.Size = UDim2.new(1, -22, 0, 1)
+    headerLine.BackgroundColor3 = Color3.fromRGB(64, 82, 102)
+    headerLine.BackgroundTransparency = 0.35
+    headerLine.BorderSizePixel = 0
+    headerLine.Parent = panel
+
+    -- Compact two-column control area:
+    -- left = gravity indicator, right = ON/OFF + POV.
+    -- Keep generous padding so the two-line indicator is vertically centered
+    -- rather than sitting against the bottom-left corner.
+    local gravityLabel = Instance.new("TextLabel")
+    gravityLabel.Name = "GravityIndicator"
+    gravityLabel.BackgroundTransparency = 1
+    gravityLabel.Position = UDim2.fromOffset(10, 32)
+    gravityLabel.Size = UDim2.new(0, 66, 0, 56)
+    gravityLabel.Font = Enum.Font.Gotham
+    gravityLabel.TextSize = 11
+    gravityLabel.TextXAlignment = Enum.TextXAlignment.Left
+    gravityLabel.TextYAlignment = Enum.TextYAlignment.Center
+    gravityLabel.TextWrapped = false
+    gravityLabel.TextColor3 = Color3.fromRGB(170, 180, 195)
+    gravityLabel.Text = "Gravity\nFloor"
+    gravityLabel.Parent = panel
+
+    toggleButton = Instance.new("TextButton")
+    toggleButton.Name = "WallWalkToggle"
+    toggleButton.Size = UDim2.fromOffset(CFG.ToggleWidth, CFG.ToggleHeight)
+    toggleButton.Position = UDim2.new(1, -(CFG.ToggleWidth + 9), 0, 33)
+    toggleButton.BackgroundColor3 = Color3.fromRGB(20, 120, 180)
+    toggleButton.TextColor3 = Color3.new(1, 1, 1)
+    toggleButton.Font = Enum.Font.GothamBold
+    toggleButton.TextSize = 11
+    toggleButton.Text = "ON"
+    toggleButton.BorderSizePixel = 0
+    toggleButton.Parent = panel
+
+    local buttonCorner = Instance.new("UICorner")
+    buttonCorner.CornerRadius = UDim.new(0, 6)
+    buttonCorner.Parent = toggleButton
+
+    cameraPOVButton = Instance.new("TextButton")
+    cameraPOVButton.Name = "CameraPOVToggle"
+    cameraPOVButton.Size = UDim2.fromOffset(CFG.ToggleWidth, CFG.ToggleHeight)
+    cameraPOVButton.Position = UDim2.new(1, -(CFG.ToggleWidth + 9), 0, 62)
+    cameraPOVButton.BackgroundColor3 = Color3.fromRGB(20, 120, 180)
+    cameraPOVButton.TextColor3 = Color3.new(1, 1, 1)
+    cameraPOVButton.Font = Enum.Font.GothamBold
+    cameraPOVButton.TextSize = 10
+    cameraPOVButton.Text = "POV ON"
+    cameraPOVButton.BorderSizePixel = 0
+    cameraPOVButton.Parent = panel
+
+    local cameraButtonCorner = Instance.new("UICorner")
+    cameraButtonCorner.CornerRadius = UDim.new(0, 6)
+    cameraButtonCorner.Parent = cameraPOVButton
+
+    local closeButton = Instance.new("TextButton")
+    closeButton.Name = GUIControlled and "WallWalkHubChevron" or "DestroyButton"
+    closeButton.Size = GUIControlled and UDim2.fromOffset(24, 24) or UDim2.fromOffset(20, 20)
+    if GUIControlled then
+        closeButton.AnchorPoint = Vector2.new(0.5, 0.5)
+        closeButton.Position = UDim2.new(1, -15, 0.5, -(CFG.PanelHeight / 2) + 14)
+    else
+        closeButton.Position = UDim2.new(1, -25, 0, 4)
+    end
+    closeButton.BackgroundColor3 = Color3.fromRGB(18, 26, 34)
+    closeButton.BackgroundTransparency = GUIControlled and 0.04 or 1
+    closeButton.BorderSizePixel = 0
+    closeButton.Text = GUIControlled and "<" or "×"
+    closeButton.TextColor3 = Color3.fromRGB(235, 247, 255)
+    closeButton.Font = Enum.Font.GothamBold
+    closeButton.TextSize = GUIControlled and 16 or 17
+    closeButton.AutoButtonColor = not GUIControlled
+    closeButton.ZIndex = 50
+    closeButton.Parent = GUIControlled and gui or panel
+
+    if GUIControlled then
+        local hubChevronCorner = Instance.new("UICorner")
+        hubChevronCorner.CornerRadius = UDim.new(0, 8)
+        hubChevronCorner.Parent = closeButton
+        local hubChevronStroke = Instance.new("UIStroke")
+        hubChevronStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        hubChevronStroke.Color = Color3.fromRGB(48, 139, 218)
+        hubChevronStroke.Thickness = 1
+        hubChevronStroke.Transparency = 0.48
+        hubChevronStroke.Parent = closeButton
+        closeButton.Activated:Connect(function()
+            panel.Visible = not panel.Visible
+        end)
+    else
+        -- Direct standalone mode keeps the persistent lower mini shortcut.
+        local shortcutButton = Instance.new("TextButton")
+        shortcutButton.Name = "WallWalkShortcut"
+        shortcutButton.Size = UDim2.fromOffset(24, 24)
+        shortcutButton.AnchorPoint = Vector2.new(0.5, 0.5)
+        shortcutButton.Position = UDim2.new(1, -15, 0.5, (CFG.PanelHeight / 2) + 12)
+        shortcutButton.BackgroundColor3 = Color3.fromRGB(18, 26, 34)
+        shortcutButton.BackgroundTransparency = 0.04
+        shortcutButton.BorderSizePixel = 0
+        shortcutButton.AutoButtonColor = false
+        shortcutButton.Text = "<"
+        shortcutButton.TextColor3 = Color3.fromRGB(235, 247, 255)
+        shortcutButton.Font = Enum.Font.GothamBold
+        shortcutButton.TextSize = 16
+        shortcutButton.ZIndex = 50
+        shortcutButton.Parent = gui
+
+        local shortcutCorner = Instance.new("UICorner")
+        shortcutCorner.CornerRadius = UDim.new(0, 8)
+        shortcutCorner.Parent = shortcutButton
+        local shortcutStroke = Instance.new("UIStroke")
+        shortcutStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        shortcutStroke.Color = Color3.fromRGB(48, 139, 218)
+        shortcutStroke.Thickness = 1
+        shortcutStroke.Transparency = 0.48
+        shortcutStroke.Parent = shortcutButton
+        shortcutButton.Activated:Connect(function()
+            panel.Visible = not panel.Visible
+        end)
+    end
+
+    toggleButton.Activated:Connect(function()
+        if enabled then
+            enabled = false
+            restoreNormal()
+        else
+            activateWallWalk()
+        end
+    end)
+
+    cameraPOVButton.Activated:Connect(function()
+        cameraPOVEnabled = not cameraPOVEnabled
+        if cameraPOVEnabled and enabled then
+            installCameraModuleHook()
+        end
+        updateUI()
+    end)
+
+    if not GUIControlled then
+        closeButton.Activated:Connect(destroyWallWalk)
+    end
+
+    if UserInputService.TouchEnabled then
+        jumpButton = Instance.new("ImageButton")
+        jumpButton.Name = "WallWalkJumpButton"
+        jumpButton.BackgroundTransparency = 1
+        jumpButton.BorderSizePixel = 0
+        jumpButton.AutoButtonColor = false
+        jumpButton.Active = true
+        jumpButton.Image = "rbxasset://textures/ui/Input/TouchControlsSheetV2.png"
+        jumpButton.ImageRectOffset = Vector2.new(1, 146)
+        jumpButton.ImageRectSize = Vector2.new(144, 144)
+        jumpButton.ZIndex = 100
+        jumpButton.Visible = enabled
+        jumpButton.Parent = gui
+        jumpButton.Activated:Connect(requestJump)
+        updateJumpButtonLayout()
+
+        table.insert(guiConnections, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(updateJumpButtonLayout))
+        if workspace.CurrentCamera then
+            table.insert(guiConnections, workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateJumpButtonLayout))
+        end
+    end
+
+end
+]=] },
+    { name = '69_getSurfaceName', source = [=[function getSurfaceName()
+    if not customActive then return "Floor" end
+    if currentUp.Y > 0.82 then return "Floor" end
+    if currentUp.Y < -0.82 then return "Ceiling" end
+    if math.abs(currentUp.X) > math.abs(currentUp.Z) then
+        return currentUp.X > 0 and "Right Wall" or "Left Wall"
+    end
+    return currentUp.Z > 0 and "Back Wall" or "Front Wall"
+end
+]=] },
+    { name = '70_updateUI', source = [=[function updateUI()
+    if toggleButton then
+        toggleButton.Text = enabled and "ON" or "OFF"
+        toggleButton.BackgroundColor3 = enabled
+            and Color3.fromRGB(20, 120, 180)
+            or Color3.fromRGB(60, 65, 72)
+    end
+
+    local gravityLabel = gui and gui:FindFirstChild("GravityIndicator", true)
+    if gravityLabel then
+        gravityLabel.Text = "Gravity\n" .. getSurfaceName()
+    end
+
+    if cameraPOVButton then
+        cameraPOVButton.Text = cameraPOVEnabled and "POV ON" or "POV OFF"
+        cameraPOVButton.BackgroundColor3 = cameraPOVEnabled
+            and Color3.fromRGB(20, 120, 180)
+            or Color3.fromRGB(60, 65, 72)
+    end
+end
+
+createUI()
+updateUI()
+
+if player.Character then
+    setupCharacter(player.Character)
+end
+
+table.insert(lifecycleConnections, player.CharacterAdded:Connect(function(newCharacter)
+    task.defer(function() setupCharacter(newCharacter) end)
+end))
+
+table.insert(lifecycleConnections, UserInputService.JumpRequest:Connect(function()
+    if enabled then requestJump() end
+end))
+
+table.insert(lifecycleConnections, UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.Space and enabled then requestJump() end
+end))
+
+-- PostSimulation is intentionally used for the transition impulse guard: it
+-- runs after the physics solver has produced any contact impulse, so the guard
+-- can remove only the newly-created outward launch before the next frame's
+-- safety detector sees it.
+transitionGuardConnection = nil
+if RunService.PostSimulation then
+    transitionGuardConnection = RunService.PostSimulation:Connect(function()
+        if destroyed then return end
+        guardTransitionOutwardVelocity()
+    end)
+end
+
+heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+    if destroyed then return end
+    guardTransitionOutwardVelocity()
+    update(dt)
+    updateCameraStabilization(dt)
+    updateUI()
+end)]=] },
+}
+
+for _, module in ipairs(modules) do
+    local chunk, compileError = compiler(module.source)
+    if not chunk then
+        warn("VGD WallWalk v48.76.16 POV compile failure in " .. module.name .. ": " .. tostring(compileError))
+        return
+    end
+    if type(setfenv) == "function" then
+        local envOk, envError = pcall(setfenv, chunk, sharedEnvironment)
+        if not envOk then
+            warn("VGD WallWalk v48.76.16 POV environment failure in " .. module.name .. ": " .. tostring(envError))
+            return
+        end
+    end
+    local runOk, runError = pcall(chunk)
+    if not runOk then
+        warn("VGD WallWalk v48.76.16 POV runtime failure in " .. module.name .. ": " .. tostring(runError))
+        return
+    end
+end
+
+print("VGD WallWalk v48.76.16 POV: all " .. tostring(#modules) .. " source segments loaded.")
+
+local controller = {}
+function controller.Enable()
+    if destroyed then return false end
+    if not enabled then activateWallWalk() end
+    return true
+end
+function controller.Disable()
+    if destroyed then return true end
+    enabled = false
+    restoreNormal()
+    updateUI()
+    return true
+end
+function controller.Destroy()
+    destroyWallWalk()
+    return true
+end
+function controller.IsEnabled()
+    return enabled == true and destroyed ~= true
+end
+return controller
