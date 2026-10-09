@@ -1,5 +1,5 @@
 --[[
-VGD WallWalk Standalone v48.76.17 POV - experimental segmented loader.
+VGD WallWalk Standalone v48.76.19 POV - experimental segmented loader.
 Derived from WallWalk_Standalone_v48.76.9_POV_Direction_UI_Polish.lua.
 Each top-level function is compiled separately and initialized in source order.
 Top-level state/functions are shared through one environment; function locals remain local.
@@ -8,7 +8,7 @@ This keeps the POV/camera/UI version's behavior while using the chunked loader a
 
 local compiler = loadstring
 if type(compiler) ~= "function" then
-    warn("VGD WallWalk v48.76.17 POV: loadstring is unavailable; no modules were started.")
+    warn("VGD WallWalk v48.76.19 POV: loadstring is unavailable; no modules were started.")
     return
 end
 
@@ -27,7 +27,7 @@ end
 
 local modules = {
     { name = '00_initial_state', source = [=[--[[
-    VGD WallWalk Standalone v48.76.17 POV Chunked Bootstrap
+    VGD WallWalk Standalone v48.76.19 POV Chunked Bootstrap
     Client Gravity Override + Surface-Relative Gravity + Ceiling Stair Lift Fix
 
     Base: v6 GravityController_Rebuild
@@ -4163,7 +4163,7 @@ function createUI()
     title.TextSize = 11
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.TextColor3 = Color3.new(1, 1, 1)
-    title.Text = "WallWalk v48.76.17"
+    title.Text = "WallWalk v48.76.19"
     title.TextTruncate = Enum.TextTruncate.AtEnd
     title.Parent = panel
 
@@ -4227,69 +4227,34 @@ function createUI()
     cameraButtonCorner.Parent = cameraPOVButton
 
     local closeButton = Instance.new("TextButton")
-    closeButton.Name = GUIControlled and "WallWalkHubChevron" or "DestroyButton"
-    closeButton.Size = GUIControlled and UDim2.fromOffset(24, 24) or UDim2.fromOffset(20, 20)
-    if GUIControlled then
-        closeButton.AnchorPoint = Vector2.new(0.5, 0.5)
-        closeButton.Position = UDim2.new(1, -15, 0.5, -(CFG.PanelHeight / 2) + 14)
-    else
-        closeButton.Position = UDim2.new(1, -25, 0, 4)
-    end
+    closeButton.Name = "WallWalkChevron"
+    closeButton.Size = UDim2.fromOffset(20, 20)
+    closeButton.Position = UDim2.new(1, -28, 0.5, -(CFG.PanelHeight / 2) + 4)
     closeButton.BackgroundColor3 = Color3.fromRGB(18, 26, 34)
-    closeButton.BackgroundTransparency = GUIControlled and 0.04 or 1
+    closeButton.BackgroundTransparency = 0.04
     closeButton.BorderSizePixel = 0
-    closeButton.Text = GUIControlled and "<" or "×"
+    closeButton.Text = "<"
     closeButton.TextColor3 = Color3.fromRGB(235, 247, 255)
     closeButton.Font = Enum.Font.GothamBold
-    closeButton.TextSize = GUIControlled and 16 or 17
-    closeButton.AutoButtonColor = not GUIControlled
+    closeButton.TextSize = 14
+    closeButton.AutoButtonColor = false
     closeButton.ZIndex = 50
-    closeButton.Parent = GUIControlled and gui or panel
+    -- Keep the chevron outside the panel so it remains visible when the panel is hidden.
+    closeButton.Parent = gui
 
-    if GUIControlled then
-        local hubChevronCorner = Instance.new("UICorner")
-        hubChevronCorner.CornerRadius = UDim.new(0, 8)
-        hubChevronCorner.Parent = closeButton
-        local hubChevronStroke = Instance.new("UIStroke")
-        hubChevronStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-        hubChevronStroke.Color = Color3.fromRGB(48, 139, 218)
-        hubChevronStroke.Thickness = 1
-        hubChevronStroke.Transparency = 0.48
-        hubChevronStroke.Parent = closeButton
-        closeButton.Activated:Connect(function()
-            panel.Visible = not panel.Visible
-        end)
-    else
-        -- Direct standalone mode keeps the persistent lower mini shortcut.
-        local shortcutButton = Instance.new("TextButton")
-        shortcutButton.Name = "WallWalkShortcut"
-        shortcutButton.Size = UDim2.fromOffset(24, 24)
-        shortcutButton.AnchorPoint = Vector2.new(0.5, 0.5)
-        shortcutButton.Position = UDim2.new(1, -15, 0.5, (CFG.PanelHeight / 2) + 12)
-        shortcutButton.BackgroundColor3 = Color3.fromRGB(18, 26, 34)
-        shortcutButton.BackgroundTransparency = 0.04
-        shortcutButton.BorderSizePixel = 0
-        shortcutButton.AutoButtonColor = false
-        shortcutButton.Text = "<"
-        shortcutButton.TextColor3 = Color3.fromRGB(235, 247, 255)
-        shortcutButton.Font = Enum.Font.GothamBold
-        shortcutButton.TextSize = 16
-        shortcutButton.ZIndex = 50
-        shortcutButton.Parent = gui
-
-        local shortcutCorner = Instance.new("UICorner")
-        shortcutCorner.CornerRadius = UDim.new(0, 8)
-        shortcutCorner.Parent = shortcutButton
-        local shortcutStroke = Instance.new("UIStroke")
-        shortcutStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-        shortcutStroke.Color = Color3.fromRGB(48, 139, 218)
-        shortcutStroke.Thickness = 1
-        shortcutStroke.Transparency = 0.48
-        shortcutStroke.Parent = shortcutButton
-        shortcutButton.Activated:Connect(function()
-            panel.Visible = not panel.Visible
-        end)
-    end
+    local hubChevronCorner = Instance.new("UICorner")
+    hubChevronCorner.CornerRadius = UDim.new(0, 6)
+    hubChevronCorner.Parent = closeButton
+    local hubChevronStroke = Instance.new("UIStroke")
+    hubChevronStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    hubChevronStroke.Color = Color3.fromRGB(48, 139, 218)
+    hubChevronStroke.Thickness = 1
+    hubChevronStroke.Transparency = 0.48
+    hubChevronStroke.Parent = closeButton
+    closeButton.Activated:Connect(function()
+        panel.Visible = not panel.Visible
+        closeButton.Visible = true
+    end)
 
     toggleButton.Activated:Connect(function()
         if enabled then
@@ -4308,9 +4273,6 @@ function createUI()
         updateUI()
     end)
 
-    if not GUIControlled then
-        closeButton.Activated:Connect(destroyWallWalk)
-    end
 
     if UserInputService.TouchEnabled then
         jumpButton = Instance.new("ImageButton")
@@ -4411,24 +4373,24 @@ end)]=] },
 for _, module in ipairs(modules) do
     local chunk, compileError = compiler(module.source)
     if not chunk then
-        warn("VGD WallWalk v48.76.17 POV compile failure in " .. module.name .. ": " .. tostring(compileError))
+        warn("VGD WallWalk v48.76.19 POV compile failure in " .. module.name .. ": " .. tostring(compileError))
         return
     end
     if type(setfenv) == "function" then
         local envOk, envError = pcall(setfenv, chunk, sharedEnvironment)
         if not envOk then
-            warn("VGD WallWalk v48.76.17 POV environment failure in " .. module.name .. ": " .. tostring(envError))
+            warn("VGD WallWalk v48.76.19 POV environment failure in " .. module.name .. ": " .. tostring(envError))
             return
         end
     end
     local runOk, runError = pcall(chunk)
     if not runOk then
-        warn("VGD WallWalk v48.76.17 POV runtime failure in " .. module.name .. ": " .. tostring(runError))
+        warn("VGD WallWalk v48.76.19 POV runtime failure in " .. module.name .. ": " .. tostring(runError))
         return
     end
 end
 
-print("VGD WallWalk v48.76.17 POV: all " .. tostring(#modules) .. " source segments loaded.")
+print("VGD WallWalk v48.76.19 POV: all " .. tostring(#modules) .. " source segments loaded.")
 
 -- The controller is returned from the outer bootstrap environment, while the
 -- actual WallWalk state/functions live in sharedEnvironment. Always address
@@ -4436,6 +4398,7 @@ print("VGD WallWalk v48.76.17 POV: all " .. tostring(#modules) .. " source segme
 local controller = {}
 function controller.Enable()
     if sharedEnvironment.destroyed then return false end
+    if sharedEnvironment.gui then sharedEnvironment.gui.Enabled = true end
     if not sharedEnvironment.enabled then
         local fn = sharedEnvironment.activateWallWalk
         if type(fn) ~= "function" then error("activateWallWalk API is unavailable") end
@@ -4451,6 +4414,12 @@ function controller.Disable()
     restoreFn()
     local updateFn = sharedEnvironment.updateUI
     if type(updateFn) == "function" then updateFn() end
+    if sharedEnvironment.gui then sharedEnvironment.gui.Enabled = false end
+    return true
+end
+function controller.SetVisible(visible)
+    if sharedEnvironment.destroyed then return false end
+    if sharedEnvironment.gui then sharedEnvironment.gui.Enabled = visible == true end
     return true
 end
 function controller.Destroy()
