@@ -1,4 +1,10 @@
--- VGD OUTPUT CONSOLE GUI v61
+-- VGD OUTPUT CONSOLE GUI v67
+-- V67: Follow the actual scrollable content bottom after canvas/layout updates, using AbsoluteCanvasSize and a short settle pass.
+-- V66: Restore Follow mode by coalescing bottom-scroll updates and following newly appended records that match the active view.
+-- V65: Keep rows visible during synchronous rebinds and map record indexes to stable pool slots, updating only rows whose slot receives a new record.
+-- V64: Apply recycled-row text, severity colors, selection, and icon styling while hidden; reveal only after the row is fully rebound.
+-- V63: Use a reusable row-object pool with 30-row buffers above and below the viewport to reduce fast-scroll blanking.
+-- V62: Virtualize visible log rows so up to 9999 records can be retained without creating thousands of live GUI rows.
 -- V61: Show a clear red CAPTURE LIMIT REACHED indicator at 999 records and update the initialization log to v61.
 -- V60: Raise the capture cap to 999 records and hard-stop capture at the cap to prevent repeated eviction/rebuild lag.
 -- V59: Flash the inner fill of the two-square copy glyph in its severity color for 1.5 seconds; leave its button background unchanged.
@@ -14,7 +20,7 @@ local TextService = game:GetService("TextService")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 local GUI_NAME = "VGD_OutputConsole_v2"
-local MAX_LINES = 999
+local MAX_LINES = 9999
 local records = {}
 local captureLimitReached = false
 local filter = "ALL"
@@ -22,6 +28,14 @@ local query = ""
 local expandedId = nil
 local preserveScrollOnce = false
 local rowWidgets = {}
+local rowPool = {}
+local ROW_BUFFER_COUNT = 30
+local visibleRecords = {}
+local recordOffsets = {}
+local recordHeights = {}
+local virtualFirst = 0
+local virtualLast = 0
+local virtualRefreshQueued = false
 local lastTappedId = nil
 local lastTappedAt = 0
 local DOUBLE_TAP_WINDOW = 0.45
@@ -143,10 +157,10 @@ local follow=button("AutoScroll","FOLLOW ON",UDim2.new(0.73,0,0,86),UDim2.new(0.
 follow.TextSize=9
 
 local output=Instance.new("ScrollingFrame")
-output.Name="LogList"; output.Position=UDim2.new(0,9,0,115); output.Size=UDim2.new(1,-18,1,-143); output.BackgroundColor3=Color3.fromRGB(10,14,20); output.BorderSizePixel=0; output.ScrollBarThickness=4; output.ScrollBarImageColor3=Color3.fromRGB(74,115,155); output.CanvasSize=UDim2.new(0,0,0,0); output.AutomaticCanvasSize=Enum.AutomaticSize.Y; output.ScrollingDirection=Enum.ScrollingDirection.Y; output.Parent=panel; Instance.new("UICorner",output).CornerRadius=UDim.new(0,8)
+output.Name="LogList"; output.Position=UDim2.new(0,9,0,115); output.Size=UDim2.new(1,-18,1,-143); output.BackgroundColor3=Color3.fromRGB(10,14,20); output.BorderSizePixel=0; output.ScrollBarThickness=4; output.ScrollBarImageColor3=Color3.fromRGB(74,115,155); output.CanvasSize=UDim2.new(0,0,0,0); output.AutomaticCanvasSize=Enum.AutomaticSize.None; output.ScrollingDirection=Enum.ScrollingDirection.Y; output.Parent=panel; Instance.new("UICorner",output).CornerRadius=UDim.new(0,8)
 local outputStroke=Instance.new("UIStroke",output); outputStroke.Color=Color3.fromRGB(42,68,94); outputStroke.Transparency=0.68; outputStroke.Thickness=1
-local list=Instance.new("UIListLayout",output); list.Padding=UDim.new(0,3); list.SortOrder=Enum.SortOrder.LayoutOrder
-local pad=Instance.new("UIPadding",output); pad.PaddingTop=UDim.new(0,6); pad.PaddingBottom=UDim.new(0,6); pad.PaddingLeft=UDim.new(0,6); pad.PaddingRight=UDim.new(0,6)
+local list=nil -- Rows are positioned from cached offsets; no UIListLayout is used in virtual mode.
+local pad=Instance.new("UIPadding",output); pad.PaddingTop=UDim.new(0,0); pad.PaddingBottom=UDim.new(0,0); pad.PaddingLeft=UDim.new(0,0); pad.PaddingRight=UDim.new(0,0)
 local footer=label(panel,"Footer","CLIENT OUTPUT  •  newest logs appear below",UDim2.new(0,12,1,-20),UDim2.new(1,-24,0,13),Enum.Font.Gotham,9,Color3.fromRGB(125,143,165))
 local footerNormalColor=Color3.fromRGB(125,143,165)
 local footerLimitColor=Color3.fromRGB(255,82,98)
@@ -182,37 +196,62 @@ local function highlightedText(value,needle)
  end
  return table.concat(parts)
 end
+local function recordMatches(rec)
+ return (filter=="ALL" or rec.kind==filter or (filter=="Message" and rec.kind=="Info")) and (query=="" or string.find(string.lower(rec.text),query,1,true)~=nil)
+end
 local function matchingRecords()
  local result={}
  for _,rec in ipairs(records) do
-  if (filter=="ALL" or rec.kind==filter or (filter=="Message" and rec.kind=="Info")) and (query=="" or string.find(string.lower(rec.text),query,1,true)~=nil) then result[#result+1]=rec end
+  if recordMatches(rec) then result[#result+1]=rec end
  end
  return result
 end
+local function getRecordBaseHeight(rec)
+ local head=string.format("%s  %s  [%s]  ",rec.kind=="Error" and "✖" or (rec.kind=="Warning" and "⚠" or "●"),rec.time,string.upper(rec.kind))
+ local availableWidth=math.max(40,output.AbsoluteSize.X-6-14-20)
+ local measured=TextService:GetTextSize(head..rec.text.."  ›",11,Enum.Font.Code,Vector2.new(availableWidth,120))
+ return math.clamp(math.ceil(measured.Y)+6,23,120)
+end
+local function rebuildVirtualMetrics()
+ table.clear(recordOffsets)
+ table.clear(recordHeights)
+ local y=6
+ for i,rec in ipairs(visibleRecords) do
+  recordOffsets[i]=y
+  local h=getRecordBaseHeight(rec)
+  if expandedId==rec.id then h=math.clamp(h+4+26+3,23,120) end
+  recordHeights[i]=h
+  y+=h+3
+ end
+ output.CanvasSize=UDim2.new(0,0,0,math.max(output.AbsoluteSize.Y,y+3))
+end
+local render
+local renderVisibleRows
 local navigationGeneration=0
 local function scrollToRecord(rec)
  if not rec then return end
  navigationGeneration+=1
  local generation=navigationGeneration
+ local index=nil
+ for i,item in ipairs(visibleRecords) do if item.id==rec.id then index=i; break end end
+ if not index then return end
+ local y=recordOffsets[index] or 6
+ local h=recordHeights[index] or 23
+ local viewTop=output.CanvasPosition.Y
+ local viewBottom=viewTop+output.AbsoluteSize.Y
+ local nextY=viewTop
+ if y<viewTop then nextY=y-8
+ elseif y+h>viewBottom then nextY=y+h-output.AbsoluteSize.Y+8 end
+ local maxY=math.max(0,output.CanvasSize.Y.Offset-output.AbsoluteSize.Y)
+ output.CanvasPosition=Vector2.new(0,math.clamp(nextY,0,maxY))
  task.defer(function()
   task.wait()
   if generation~=navigationGeneration then return end
-  local target=rowWidgets[rec.id]
-  if not target or not target.row or target.row.Parent~=output then return end
-  local row=target.row
-  local top=row.AbsolutePosition.Y-output.AbsolutePosition.Y+output.CanvasPosition.Y
-  local bottom=top+row.AbsoluteSize.Y
-  local viewTop=output.CanvasPosition.Y
-  local viewBottom=viewTop+output.AbsoluteSize.Y
-  local nextY=viewTop
-  if top<viewTop then nextY=top-8
-  elseif bottom>viewBottom then nextY=bottom-output.AbsoluteSize.Y+8 end
-  local maxY=math.max(0,output.AbsoluteCanvasSize.Y-output.AbsoluteSize.Y)
-  output.CanvasPosition=Vector2.new(0,math.clamp(nextY,0,maxY))
+  renderVisibleRows(true)
  end)
 end
 local function refreshSearchSelection()
- local visible=matchingRecords()
+ local visible=visibleRecords
  for i,rec in ipairs(visible) do
   local w=rowWidgets[rec.id]
   if w then
@@ -220,196 +259,383 @@ local function refreshSearchSelection()
    local selected=(query~="" and i==selectedMatch)
    row.BackgroundColor3=selected and (rec.kind=="Error" and Color3.fromRGB(83,34,43) or (rec.kind=="Warning" and Color3.fromRGB(83,62,28) or Color3.fromRGB(28,67,57))) or (rec.kind=="Error" and Color3.fromRGB(48,25,33) or (rec.kind=="Warning" and Color3.fromRGB(47,39,25) or Color3.fromRGB(19,27,38)))
    row.BackgroundTransparency=selected and 0 or 0.12
-   local stroke=row:FindFirstChild("SearchSelectionIndicator")
-   if selected and not stroke then
-    stroke=Instance.new("UIStroke")
-    stroke.Name="SearchSelectionIndicator"
+   local stroke=w.selectionStroke
+   if stroke then
     stroke.Color=colorFor(rec.kind)
-    stroke.Thickness=2
-    stroke.Transparency=0
-    stroke.Parent=row
-   elseif not selected and stroke then stroke:Destroy() end
+    stroke.Enabled=selected
+   end
   end
  end
  resultCount.Text=(query=="" and "—" or (#visible==0 and "0/0" or (tostring(selectedMatch).."/"..tostring(#visible))))
 end
-local function createRow(rec,i,expanded)
-  local row=Instance.new("TextButton"); row.Name="Log_"..rec.id; row:SetAttribute("RecordId",rec.id); row.AutoButtonColor=false; row.BackgroundColor3=(rec.kind=="Error" and Color3.fromRGB(48,25,33)) or (rec.kind=="Warning" and Color3.fromRGB(47,39,25)) or Color3.fromRGB(19,27,38); row.BackgroundTransparency=0.12; row.Size=UDim2.new(1,-4,0,23); row.AutomaticSize=Enum.AutomaticSize.None; row.Text=""; row.TextTransparency=1
-  Instance.new("UICorner",row).CornerRadius=UDim.new(0,5)
-  local mark=rec.kind=="Error" and "✖" or (rec.kind=="Warning" and "⚠" or "●")
-  local head=string.format("%s  %s  [%s]  ",mark,rec.time,string.upper(rec.kind))
-  local availableWidth=math.max(40,output.AbsoluteSize.X-6-14-20)
-  local baseText=escapeRichText(head)..highlightedText(rec.text,query)
-  local expandColor=rec.kind=="Error" and "rgb(255,116,128)" or (rec.kind=="Warning" and "rgb(255,198,91)" or "rgb(120,145,171)")
-  local collapsedText=baseText..'  <font color="'..expandColor..'">›</font>' 
-  local measured=TextService:GetTextSize(head..rec.text.."  ›",11,Enum.Font.Code,Vector2.new(availableWidth,120))
-  local baseHeight=math.clamp(math.ceil(measured.Y)+6,23,120)
-  local main=Instance.new("TextLabel"); main.Name="OriginalLogText"; main.BackgroundTransparency=1; main.BorderSizePixel=0
-  main.Position=UDim2.new(0,7,0,0); main.Size=UDim2.new(1,-34,0,baseHeight)
-  main.Font=Enum.Font.Code; main.TextSize=11; main.TextWrapped=true; main.TextXAlignment=Enum.TextXAlignment.Left; main.TextYAlignment=Enum.TextYAlignment.Center
-  main.TextColor3=colorFor(rec.kind); main.RichText=true; main.Text=expanded and baseText or collapsedText; main.Parent=row
-  local detailText="DETAILS  •  Tap to collapse\nStack trace: not supplied by LogService.MessageOut"
-  local detail=Instance.new("TextLabel"); detail.Name="ExpandedDetails"; detail.BackgroundTransparency=1; detail.BorderSizePixel=0
-  detail.Font=Enum.Font.Code; detail.TextSize=11; detail.TextColor3=colorFor(rec.kind)
-  detail.TextXAlignment=Enum.TextXAlignment.Left; detail.TextYAlignment=Enum.TextYAlignment.Top
-  detail.TextWrapped=true; detail.Text=detailText; detail.RichText=false
-  detail.Position=UDim2.new(0,7,0,baseHeight+4); detail.Size=UDim2.new(1,-34,0,26); detail.ZIndex=row.ZIndex+1; detail.Visible=expanded; detail.Parent=row
-  if expanded then
-   row.Size=UDim2.new(1,-4,0,math.clamp(baseHeight+4+26+3,23,120))
+local function createRowWidget()
+ local w={}
+ local row=Instance.new("TextButton")
+ row.Name="VirtualLogRow"
+ row.AutoButtonColor=false
+ row.BackgroundTransparency=0.12
+ row.Size=UDim2.new(1,-4,0,23)
+ row.AutomaticSize=Enum.AutomaticSize.None
+ row.Text=""
+ row.TextTransparency=1
+ row.Visible=false
+ row.Parent=output
+ Instance.new("UICorner",row).CornerRadius=UDim.new(0,5)
+
+ local main=Instance.new("TextLabel")
+ main.Name="OriginalLogText"
+ main.BackgroundTransparency=1
+ main.BorderSizePixel=0
+ main.Position=UDim2.new(0,7,0,0)
+ main.Size=UDim2.new(1,-34,0,23)
+ main.Font=Enum.Font.Code
+ main.TextSize=11
+ main.TextWrapped=true
+ main.TextXAlignment=Enum.TextXAlignment.Left
+ main.TextYAlignment=Enum.TextYAlignment.Center
+ main.RichText=true
+ main.Parent=row
+
+ local detail=Instance.new("TextLabel")
+ detail.Name="ExpandedDetails"
+ detail.BackgroundTransparency=1
+ detail.BorderSizePixel=0
+ detail.Font=Enum.Font.Code
+ detail.TextSize=11
+ detail.TextXAlignment=Enum.TextXAlignment.Left
+ detail.TextYAlignment=Enum.TextYAlignment.Top
+ detail.TextWrapped=true
+ detail.RichText=false
+ detail.Text="DETAILS  •  Tap to collapse\nStack trace: not supplied by LogService.MessageOut"
+ detail.Position=UDim2.new(0,7,0,27)
+ detail.Size=UDim2.new(1,-34,0,26)
+ detail.ZIndex=row.ZIndex+1
+ detail.Visible=false
+ detail.Parent=row
+
+ local selectionStroke=Instance.new("UIStroke")
+ selectionStroke.Name="SearchSelectionIndicator"
+ selectionStroke.Thickness=2
+ selectionStroke.Transparency=0
+ selectionStroke.Enabled=false
+ selectionStroke.Parent=row
+
+ local copyOne=Instance.new("TextButton")
+ copyOne.Name="CopyThisLog"
+ copyOne.Text=""
+ copyOne.Size=UDim2.new(0,13,0,13)
+ copyOne.AnchorPoint=Vector2.new(1,0.5)
+ copyOne.Position=UDim2.new(1,-7,0.5,0)
+ copyOne.BackgroundTransparency=0.35
+ copyOne.AutoButtonColor=true
+ copyOne.ZIndex=row.ZIndex+1
+ copyOne.Parent=row
+ Instance.new("UICorner",copyOne).CornerRadius=UDim.new(0,4)
+
+ local backSheet=Instance.new("Frame")
+ backSheet.Name="CopyBackSheet"
+ backSheet.Size=UDim2.new(0,5,0,6)
+ backSheet.Position=UDim2.new(0,5,0,3)
+ backSheet.BackgroundTransparency=1
+ backSheet.BorderSizePixel=0
+ backSheet.ZIndex=copyOne.ZIndex+1
+ backSheet.Parent=copyOne
+ local backStroke=Instance.new("UIStroke",backSheet)
+ backStroke.Thickness=1
+
+ local frontSheet=Instance.new("Frame")
+ frontSheet.Name="CopyFrontSheet"
+ frontSheet.Size=UDim2.new(0,5,0,6)
+ frontSheet.Position=UDim2.new(0,3,0,5)
+ frontSheet.BorderSizePixel=0
+ frontSheet.ZIndex=copyOne.ZIndex+2
+ frontSheet.Parent=copyOne
+ local frontStroke=Instance.new("UIStroke",frontSheet)
+ frontStroke.Thickness=1
+
+ w.row=row
+ w.main=main
+ w.detail=detail
+ w.selectionStroke=selectionStroke
+ w.copyOne=copyOne
+ w.backSheet=backSheet
+ w.frontSheet=frontSheet
+ w.backStroke=backStroke
+ w.frontStroke=frontStroke
+ w.copyFlashGeneration=0
+ w.rec=nil
+
+ copyOne.Activated:Connect(function()
+  local rec=w.rec
+  if not rec then return end
+  w.copyFlashGeneration+=1
+  local thisFlash=w.copyFlashGeneration
+  local glyphColor=colorFor(rec.kind)
+  backSheet.BackgroundColor3=glyphColor
+  backSheet.BackgroundTransparency=0.12
+  frontSheet.BackgroundColor3=glyphColor
+  frontSheet.BackgroundTransparency=0.12
+  local setter=setclipboard or toclipboard
+  local payload=string.format("[%s] [%s] %s",rec.time,rec.kind,rec.text)
+  if type(setter)=="function" then
+   pcall(setter,payload)
+   footer.Text="Selected log copied when clipboard is supported."
   else
-   row.Size=UDim2.new(1,-4,0,baseHeight)
+   footer.Text="Clipboard unavailable in this environment."
   end
-  if i==selectedMatch and query~="" then
-   local categoryColor=colorFor(rec.kind)
-   row.BackgroundColor3=rec.kind=="Error" and Color3.fromRGB(83,34,43) or (rec.kind=="Warning" and Color3.fromRGB(83,62,28) or Color3.fromRGB(28,67,57))
-   row.BackgroundTransparency=0
-   local selectedStroke=Instance.new("UIStroke",row)
-   selectedStroke.Name="SearchSelectionIndicator"
-   selectedStroke.Color=categoryColor
-   selectedStroke.Transparency=0
-   selectedStroke.Thickness=2
-  end
-  row.LayoutOrder=i; row.Parent=output
-  rowWidgets[rec.id]={row=row,main=main,detail=detail,baseHeight=baseHeight,baseText=baseText,collapsedText=collapsedText}
-  local copyOne=Instance.new("TextButton")
-  copyOne.Name="CopyThisLog"
-  copyOne.Text=""
-  copyOne.Size=UDim2.new(0,13,0,13)
-  copyOne.AnchorPoint=Vector2.new(1,0.5)
-  copyOne.Position=UDim2.new(1,-7,0.5,0)
-  copyOne.BackgroundColor3=row.BackgroundColor3
-  copyOne.BackgroundTransparency=0.35
-  copyOne.AutoButtonColor=true
-  copyOne.ZIndex=row.ZIndex+1
-  copyOne.Parent=row
-  Instance.new("UICorner",copyOne).CornerRadius=UDim.new(0,4)
-  -- Draw a tiny copy symbol from UI shapes instead of a font glyph (which
-  -- rendered as an unknown square on the user's device).
-  local backSheet=Instance.new("Frame")
-  backSheet.Name="CopyBackSheet"
-  backSheet.Size=UDim2.new(0,5,0,6)
-  backSheet.Position=UDim2.new(0,5,0,3)
-  backSheet.BackgroundTransparency=1
-  backSheet.BorderSizePixel=0
-  backSheet.ZIndex=copyOne.ZIndex+1
-  backSheet.Parent=copyOne
-  local backStroke=Instance.new("UIStroke",backSheet)
-  backStroke.Color=colorFor(rec.kind)
-  backStroke.Thickness=1
-  local frontSheet=Instance.new("Frame")
-  frontSheet.Name="CopyFrontSheet"
-  frontSheet.Size=UDim2.new(0,5,0,6)
-  frontSheet.Position=UDim2.new(0,3,0,5)
-  frontSheet.BackgroundColor3=row.BackgroundColor3
-  frontSheet.BorderSizePixel=0
-  frontSheet.ZIndex=copyOne.ZIndex+2
-  frontSheet.Parent=copyOne
-  local frontStroke=Instance.new("UIStroke",frontSheet)
-  frontStroke.Color=colorFor(rec.kind)
-  frontStroke.Thickness=1
-  local copyGlyphColor=colorFor(rec.kind)
-  local copyFlashGeneration=0
-  local function setCopyGlyphFilled(filled)
-   if filled then
-    backSheet.BackgroundColor3=copyGlyphColor
-    backSheet.BackgroundTransparency=0.12
-    frontSheet.BackgroundColor3=copyGlyphColor
-    frontSheet.BackgroundTransparency=0.12
-   else
-    backSheet.BackgroundTransparency=1
-    frontSheet.BackgroundColor3=row.BackgroundColor3
-    frontSheet.BackgroundTransparency=0
-   end
-  end
-  copyOne.Activated:Connect(function()
-   copyFlashGeneration+=1
-   local thisFlash=copyFlashGeneration
-   setCopyGlyphFilled(true)
-   task.delay(1.5,function()
-    if copyOne.Parent and thisFlash==copyFlashGeneration then
-     setCopyGlyphFilled(false)
-    end
-   end)
-   local setter=setclipboard or toclipboard
-   local payload=string.format("[%s] [%s] %s",rec.time,rec.kind,rec.text)
-   if type(setter)=="function" then pcall(setter,payload); footer.Text="Selected log copied when clipboard is supported." else footer.Text="Clipboard unavailable in this environment." end
+  task.delay(1.5,function()
+   if thisFlash~=w.copyFlashGeneration then return end
+   backSheet.BackgroundTransparency=1
+   frontSheet.BackgroundColor3=w.row.BackgroundColor3
+   frontSheet.BackgroundTransparency=0
   end)
-  row.Activated:Connect(function()
-   if expandedId==rec.id then
-    -- An already-expanded entry collapses on a single tap.
-    expandedId=nil
-    lastTappedId=nil
-    lastTappedAt=0
-    local w=rowWidgets[rec.id]; if w then w.main.Text=w.collapsedText; w.detail.Visible=false; w.row.Size=UDim2.new(1,-4,0,w.baseHeight) end
-    return
-   end
-   local now=os.clock()
-   if lastTappedId==rec.id and (now-lastTappedAt)<=DOUBLE_TAP_WINDOW then
-    -- A collapsed entry expands only after a second tap on the same row.
-    if expandedId and expandedId~=rec.id then
-     local previous=rowWidgets[expandedId]
-     if previous then previous.main.Text=previous.collapsedText; previous.detail.Visible=false; previous.row.Size=UDim2.new(1,-4,0,previous.baseHeight) end
-    end
-    expandedId=rec.id
-    lastTappedId=nil
-    lastTappedAt=0
-    local w=rowWidgets[rec.id]; if w then w.main.Text=w.baseText; w.detail.Visible=true; w.row.Size=UDim2.new(1,-4,0,math.clamp(w.baseHeight+4+26+3,23,120)) end
-   else
-    lastTappedId=rec.id
-    lastTappedAt=now
-   end
-  end)
+ end)
+
+ row.Activated:Connect(function()
+  local rec=w.rec
+  if not rec then return end
+  if expandedId==rec.id then
+   expandedId=nil
+   lastTappedId=nil
+   lastTappedAt=0
+   preserveScrollOnce=true
+   render()
+   return
+  end
+  local now=os.clock()
+  if lastTappedId==rec.id and (now-lastTappedAt)<=DOUBLE_TAP_WINDOW then
+   expandedId=rec.id
+   lastTappedId=nil
+   lastTappedAt=0
+   preserveScrollOnce=true
+   render()
+  else
+   lastTappedId=rec.id
+   lastTappedAt=now
+  end
+ end)
+
+ return w
 end
-local function render()
+
+local function createRow(rec,i,expanded,slot)
+ local w=rowPool[slot]
+ if not w then
+  w=createRowWidget()
+  rowPool[slot]=w
+ end
+ w.rec=rec
+ local row=w.row
+ -- Existing pooled rows stay visible during synchronous property updates.
+ -- New rows start hidden in createRowWidget and are revealed after binding.
+ local main=w.main
+ local detail=w.detail
+ local copyOne=w.copyOne
+ local backSheet=w.backSheet
+ local frontSheet=w.frontSheet
+ local kindColor=colorFor(rec.kind)
+ local normalColor=(rec.kind=="Error" and Color3.fromRGB(48,25,33)) or (rec.kind=="Warning" and Color3.fromRGB(47,39,25)) or Color3.fromRGB(19,27,38)
+ local selected=(query~="" and i==selectedMatch)
+ local selectedColor=(rec.kind=="Error" and Color3.fromRGB(83,34,43)) or (rec.kind=="Warning" and Color3.fromRGB(83,62,28)) or Color3.fromRGB(28,67,57)
+ local mark=rec.kind=="Error" and "✖" or (rec.kind=="Warning" and "⚠" or "●")
+ local head=string.format("%s  %s  [%s]  ",mark,rec.time,string.upper(rec.kind))
+ local baseText=escapeRichText(head)..highlightedText(rec.text,query)
+ local expandColor=rec.kind=="Error" and "rgb(255,116,128)" or (rec.kind=="Warning" and "rgb(255,198,91)" or "rgb(120,145,171)")
+ local collapsedText=baseText..'  <font color="'..expandColor..'">›</font>'
+ local baseHeight=getRecordBaseHeight(rec)
+ local isExpanded=expanded and expandedId==rec.id
+ local rowHeight=baseHeight
+ if isExpanded then rowHeight=math.clamp(baseHeight+4+26+3,23,120) end
+
+ row.Name="Log_"..rec.id
+ row:SetAttribute("RecordId",rec.id)
+ row.BackgroundColor3=selected and selectedColor or normalColor
+ row.BackgroundTransparency=selected and 0 or 0.12
+ row.Position=UDim2.new(0,6,0,recordOffsets[i] or 6)
+ row.Size=UDim2.new(1,-4,0,rowHeight)
+
+ main.Size=UDim2.new(1,-34,0,baseHeight)
+ main.TextColor3=kindColor
+ main.Text=isExpanded and baseText or collapsedText
+ detail.Position=UDim2.new(0,7,0,baseHeight+4)
+ detail.TextColor3=kindColor
+ detail.Visible=isExpanded
+
+ w.selectionStroke.Color=kindColor
+ w.selectionStroke.Enabled=selected
+ copyOne.BackgroundColor3=row.BackgroundColor3
+ w.backStroke.Color=kindColor
+ w.frontStroke.Color=kindColor
+ w.copyGlyphColor=kindColor
+ -- Invalidate any delayed copy-flash callback from the record previously
+ -- assigned to this pooled widget, then reset the glyph for the new record.
+ w.copyFlashGeneration+=1
+ backSheet.BackgroundTransparency=1
+ frontSheet.BackgroundColor3=row.BackgroundColor3
+ frontSheet.BackgroundTransparency=0
+
+ w.baseHeight=baseHeight
+ w.baseText=baseText
+ w.collapsedText=collapsedText
+ rowWidgets[rec.id]=w
+ -- Reveal only after all record-specific visual state is ready.
+ row.Visible=true
+end
+renderVisibleRows=function(force)
+ if not panel or not panel.Parent then return end
+ local top=output.CanvasPosition.Y
+ local bottom=top+output.AbsoluteSize.Y
+ local count=#visibleRecords
+ if count==0 then
+  table.clear(rowWidgets)
+  virtualFirst=0
+  virtualLast=0
+  for _,w in ipairs(rowPool) do
+   w.rec=nil
+   w.row.Visible=false
+  end
+  return
+ end
+
+ -- Binary-search the rows intersecting the viewport, then add a 30-row
+ -- pre-render buffer on both sides. Buffer size is measured in records, not pixels.
+ local low=1
+ local high=count
+ while low<=high do
+  local mid=math.floor((low+high)/2)
+  if (recordOffsets[mid]+(recordHeights[mid] or 23))<top then
+   low=mid+1
+  else
+   high=mid-1
+  end
+ end
+ local visibleFirst=math.max(1,low)
+ low=visibleFirst
+ high=count
+ while low<=high do
+  local mid=math.floor((low+high)/2)
+  if (recordOffsets[mid] or 0)<=bottom then
+   low=mid+1
+  else
+   high=mid-1
+  end
+ end
+ local visibleLast=math.min(count,math.max(visibleFirst,high+1))
+ local first=math.max(1,visibleFirst-ROW_BUFFER_COUNT)
+ local last=math.min(count,visibleLast+ROW_BUFFER_COUNT)
+ if not force and first==virtualFirst and last==virtualLast then return end
+ virtualFirst=first
+ virtualLast=last
+
+ table.clear(rowWidgets)
+ local requiredPoolSize=last-first+1
+ local poolSize=math.max(#rowPool,requiredPoolSize)
+ while #rowPool<poolSize do
+  rowPool[#rowPool+1]=createRowWidget()
+ end
+
+ local activeSlots={}
+ for i=first,last do
+  local rec=visibleRecords[i]
+  if rec then
+   local slot=((i-1)%poolSize)+1
+   activeSlots[slot]=true
+   createRow(rec,i,expandedId==rec.id,slot)
+  end
+ end
+
+ for slot,w in ipairs(rowPool) do
+  if not activeSlots[slot] then
+   w.rec=nil
+   w.row.Visible=false
+  end
+ end
+ refreshSearchSelection()
+end
+render=function()
  renderGeneration+=1
  local thisRender=renderGeneration
  local savedCanvasPosition=output.CanvasPosition
- table.clear(rowWidgets)
- -- While searching/filtering, incoming logs must not force the list to the top or bottom.
- -- Preserve the user's current viewport; explicit match navigation still scrolls via scrollToRecord.
  local keepScroll=preserveScrollOnce or query~="" or filter~="ALL"
  preserveScrollOnce=false
- for _,child in ipairs(output:GetChildren()) do if child:IsA("GuiObject") and child~=list and child~=pad and child~=outputStroke then child:Destroy() end end
- local visibleRecords=matchingRecords()
+ visibleRecords=matchingRecords()
  if #visibleRecords==0 then selectedMatch=0 else selectedMatch=math.clamp(selectedMatch,1,#visibleRecords) end
  resultCount.Text=(query=="" and "—" or (#visibleRecords==0 and "0/0" or (tostring(selectedMatch).."/"..tostring(#visibleRecords))))
- for i,rec in ipairs(visibleRecords) do
-  createRow(rec,i,expandedId==rec.id)
- end
- footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#visibleRecords,#records)
+ rebuildVirtualMetrics()
+ virtualFirst=0
+ virtualLast=0
  local navigationId=pendingScrollRecordId
  pendingScrollRecordId=nil
  if navigationId then
-  task.defer(function()
-   task.wait()
-   task.wait()
-   if thisRender~=renderGeneration then return end
-   local target=rowWidgets[navigationId]
-   if target and target.row and target.row.Parent==output then
-    local y=target.row.AbsolutePosition.Y-output.AbsolutePosition.Y+output.CanvasPosition.Y
-    local maxY=math.max(0,output.AbsoluteCanvasSize.Y-output.AbsoluteSize.Y)
-    output.CanvasPosition=Vector2.new(0,math.clamp(y-8,0,maxY))
+  for i,rec in ipairs(visibleRecords) do
+   if rec.id==navigationId then
+    local y=recordOffsets[i] or 6
+    output.CanvasPosition=Vector2.new(0,math.clamp(y-8,0,math.max(0,output.CanvasSize.Y.Offset-output.AbsoluteSize.Y)))
+    break
    end
-  end)
+  end
  elseif keepScroll then
-  task.defer(function()
-   task.wait()
-   if thisRender~=renderGeneration then return end
-   local maxY=math.max(0,output.AbsoluteCanvasSize.Y-output.AbsoluteSize.Y)
-   output.CanvasPosition=Vector2.new(0,math.clamp(savedCanvasPosition.Y,0,maxY))
-  end)
+  output.CanvasPosition=Vector2.new(0,math.clamp(savedCanvasPosition.Y,0,math.max(0,output.CanvasSize.Y.Offset-output.AbsoluteSize.Y)))
  elseif autoScroll then
-  task.defer(function()
-   task.wait()
-   if thisRender~=renderGeneration then return end
-   output.CanvasPosition=Vector2.new(0,math.max(0,output.AbsoluteCanvasSize.Y-output.AbsoluteSize.Y))
-  end)
+  output.CanvasPosition=Vector2.new(0,math.max(0,output.CanvasSize.Y.Offset-output.AbsoluteSize.Y))
+ else
+  output.CanvasPosition=Vector2.new(0,math.clamp(savedCanvasPosition.Y,0,math.max(0,output.CanvasSize.Y.Offset-output.AbsoluteSize.Y)))
  end
+ footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#visibleRecords,#records)
+ if captureLimitReached then footer.Text=string.format("CAPTURE LIMIT REACHED  •  %d/%d  •  STOPPED",#records,MAX_LINES); footer.TextColor3=footerLimitColor else footer.TextColor3=footerNormalColor end
+ task.defer(function()
+  task.wait()
+  if thisRender~=renderGeneration then return end
+  renderVisibleRows(true)
+ end)
 end
+local followUpdateQueued=false
+local function scheduleFollowToBottom()
+ if followUpdateQueued then return end
+ followUpdateQueued=true
+ task.defer(function()
+  -- Let the canvas size and row layout settle before measuring the bottom.
+  task.wait()
+  task.wait()
+  if not autoScroll or not output.Parent then
+   followUpdateQueued=false
+   return
+  end
+
+  -- AbsoluteCanvasSize reflects the actual scrollable content, including layouts.
+  local contentHeight=output.AbsoluteCanvasSize.Y
+  local viewportHeight=output.AbsoluteWindowSize.Y
+  local maxY=math.max(0,contentHeight-viewportHeight)
+  output.CanvasPosition=Vector2.new(0,maxY)
+  renderVisibleRows(true)
+
+  -- A second pass catches canvas-size changes caused by the row/layout refresh.
+  task.wait()
+  if autoScroll and output.Parent then
+   contentHeight=output.AbsoluteCanvasSize.Y
+   viewportHeight=output.AbsoluteWindowSize.Y
+   maxY=math.max(0,contentHeight-viewportHeight)
+   output.CanvasPosition=Vector2.new(0,maxY)
+   renderVisibleRows(true)
+  end
+  followUpdateQueued=false
+ end)
+end
+output:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+ if virtualRefreshQueued then return end
+ virtualRefreshQueued=true
+ task.defer(function()
+  virtualRefreshQueued=false
+  renderVisibleRows(false)
+ end)
+end)
+output:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+ if #visibleRecords>0 then render() end
+end)
+local warningCount=0
+local errorCount=0
 local function updateCounts()
- local w,e=0,0
- for _,r in ipairs(records) do if r.kind=="Warning" then w+=1 elseif r.kind=="Error" then e+=1 end end
- total.Text="TOTAL "..#records; warns.Text="WARN "..w; errors.Text="ERROR "..e
+ total.Text="TOTAL "..#records; warns.Text="WARN "..warningCount; errors.Text="ERROR "..errorCount
 end
 local nextRecordId=1
 local function append(message,messageType)
@@ -419,32 +645,30 @@ local function append(message,messageType)
  local rec={id=nextRecordId,time=os.date("%H:%M:%S"),kind=kind,text=tostring(message)}
  nextRecordId+=1
  records[#records+1]=rec
+ if kind=="Warning" then warningCount+=1 elseif kind=="Error" then errorCount+=1 end
  updateCounts()
  if #records>=MAX_LINES then captureLimitReached=true end
 
- if query~="" or filter~="ALL" then
-  local visibleRecords=matchingRecords()
-  if visibleRecords[#visibleRecords]==rec then
-   if selectedMatch==0 then selectedMatch=1 end
-   createRow(rec,#visibleRecords,false)
-   refreshSearchSelection()
-  else
-   resultCount.Text=(query=="" and "—" or (#visibleRecords==0 and "0/0" or (tostring(selectedMatch).."/"..tostring(#visibleRecords))))
-  end
-  if captureLimitReached then footer.Text=string.format("CAPTURE LIMIT REACHED  •  %d/%d  •  STOPPED",#records,MAX_LINES); footer.TextColor3=footerLimitColor else footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#visibleRecords,#records); footer.TextColor3=footerNormalColor end
-  -- Deliberately do not alter CanvasPosition here: the user may be inspecting
-  -- an older search match while new matching logs arrive.
-  return
+ -- Incrementally extend the virtual list; don't rescan/rebuild all 9999 records for each new log.
+ local addedToVisibleRecords=false
+ if recordMatches(rec) then
+  addedToVisibleRecords=true
+  local i=#visibleRecords+1
+  visibleRecords[i]=rec
+  recordOffsets[i]=i==1 and 6 or ((recordOffsets[i-1] or 6)+(recordHeights[i-1] or 23)+3)
+  recordHeights[i]=expandedId==rec.id and math.clamp(getRecordBaseHeight(rec)+33,23,120) or getRecordBaseHeight(rec)
+  output.CanvasSize=UDim2.new(0,0,0,math.max(output.AbsoluteSize.Y,(recordOffsets[i] or 6)+(recordHeights[i] or 23)+9))
+  resultCount.Text=(query=="" and "—" or (tostring(selectedMatch).."/"..tostring(#visibleRecords)))
+  if query~="" and selectedMatch==0 then selectedMatch=1 end
+  if query=="" then resultCount.Text="—" end
  end
-
- createRow(rec,#records,false)
- resultCount.Text="—"
- if captureLimitReached then footer.Text=string.format("CAPTURE LIMIT REACHED  •  %d/%d  •  STOPPED",#records,MAX_LINES); footer.TextColor3=footerLimitColor else footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#records,#records); footer.TextColor3=footerNormalColor end
- if autoScroll then
-  task.defer(function()
-   task.wait()
-   output.CanvasPosition=Vector2.new(0,math.max(0,output.AbsoluteCanvasSize.Y-output.AbsoluteSize.Y))
-  end)
+ if captureLimitReached then footer.Text=string.format("CAPTURE LIMIT REACHED  •  %d/%d  •  STOPPED",#records,MAX_LINES); footer.TextColor3=footerLimitColor else footer.Text=string.format("CLIENT OUTPUT  •  %d shown / %d captured",#visibleRecords,#records); footer.TextColor3=footerNormalColor end
+ if autoScroll and addedToVisibleRecords then
+  -- Follow new matching records even while a severity filter or search is active.
+  -- Coalescing keeps bursts from scheduling one bottom-scroll task per message.
+  scheduleFollowToBottom()
+ else
+  renderVisibleRows(false)
  end
 end
 search:GetPropertyChangedSignal("Text"):Connect(function()
@@ -491,7 +715,7 @@ end)
 clear.Activated:Connect(function()
  local now=os.clock()
  if now-clearArmedAt<=CLEAR_CONFIRM_WINDOW then
-  table.clear(records); expandedId=nil; selectedMatch=0; clearArmedAt=0; newErrorCount=0; captureLimitReached=false; refreshErrorBadge()
+  table.clear(records); table.clear(visibleRecords); table.clear(recordOffsets); table.clear(recordHeights); expandedId=nil; selectedMatch=0; clearArmedAt=0; newErrorCount=0; warningCount=0; errorCount=0; captureLimitReached=false; refreshErrorBadge()
   clear.Text="CLEAR"
   footer.TextColor3=footerNormalColor
   updateCounts(); render()
@@ -508,7 +732,7 @@ follow.Activated:Connect(function()
  autoScroll=not autoScroll
  follow.Text=autoScroll and "FOLLOW ON" or "PAUSED"
  follow.BackgroundColor3=autoScroll and Color3.fromRGB(36,111,83) or Color3.fromRGB(65,74,89)
- if autoScroll then output.CanvasPosition=Vector2.new(0,math.max(0,output.AbsoluteCanvasSize.Y-output.AbsoluteSize.Y)) end
+ if autoScroll then scheduleFollowToBottom() end
 end)
 
 -- Compact C shortcut using the same drag/input pattern as v1.
@@ -625,4 +849,4 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 local connection=LogService.MessageOut:Connect(append)
 gui.Destroying:Connect(function() connection:Disconnect() end)
-append("VGD Output Console v61 initialized.",Enum.MessageType.MessageInfo)
+append("VGD Output Console v67 initialized.",Enum.MessageType.MessageInfo)
