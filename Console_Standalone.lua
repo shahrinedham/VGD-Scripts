@@ -1,5 +1,5 @@
--- VGD OUTPUT CONSOLE GUI v67
--- V67: Follow the actual scrollable content bottom after canvas/layout updates, using AbsoluteCanvasSize and a short settle pass.
+-- VGD OUTPUT CONSOLE GUI v69
+-- V69: Preserve v68 flicker fixes and inset log rows so the ScrollingFrame does not clip their right rounded corners.
 -- V66: Restore Follow mode by coalescing bottom-scroll updates and following newly appended records that match the active view.
 -- V65: Keep rows visible during synchronous rebinds and map record indexes to stable pool slots, updating only rows whose slot receives a new record.
 -- V64: Apply recycled-row text, severity colors, selection, and icon styling while hidden; reveal only after the row is fully rebound.
@@ -35,7 +35,6 @@ local recordOffsets = {}
 local recordHeights = {}
 local virtualFirst = 0
 local virtualLast = 0
-local virtualRefreshQueued = false
 local lastTappedId = nil
 local lastTappedAt = 0
 local DOUBLE_TAP_WINDOW = 0.45
@@ -274,7 +273,7 @@ local function createRowWidget()
  row.Name="VirtualLogRow"
  row.AutoButtonColor=false
  row.BackgroundTransparency=0.12
- row.Size=UDim2.new(1,-4,0,23)
+ row.Size=UDim2.new(1,-12,0,23)
  row.AutomaticSize=Enum.AutomaticSize.None
  row.Text=""
  row.TextTransparency=1
@@ -452,7 +451,7 @@ local function createRow(rec,i,expanded,slot)
  row.BackgroundColor3=selected and selectedColor or normalColor
  row.BackgroundTransparency=selected and 0 or 0.12
  row.Position=UDim2.new(0,6,0,recordOffsets[i] or 6)
- row.Size=UDim2.new(1,-4,0,rowHeight)
+ row.Size=UDim2.new(1,-12,0,rowHeight)
 
  main.Size=UDim2.new(1,-34,0,baseHeight)
  main.TextColor3=kindColor
@@ -540,7 +539,13 @@ renderVisibleRows=function(force)
   if rec then
    local slot=((i-1)%poolSize)+1
    activeSlots[slot]=true
-   createRow(rec,i,expandedId==rec.id,slot)
+   local pooled=rowPool[slot]
+   if not force and pooled and pooled.rec==rec then
+    -- This slot already displays the correct record; keep its visuals untouched.
+    rowWidgets[rec.id]=pooled
+   else
+    createRow(rec,i,expandedId==rec.id,slot)
+   end
   end
  end
 
@@ -607,7 +612,7 @@ local function scheduleFollowToBottom()
   local viewportHeight=output.AbsoluteWindowSize.Y
   local maxY=math.max(0,contentHeight-viewportHeight)
   output.CanvasPosition=Vector2.new(0,maxY)
-  renderVisibleRows(true)
+  renderVisibleRows(false)
 
   -- A second pass catches canvas-size changes caused by the row/layout refresh.
   task.wait()
@@ -616,18 +621,14 @@ local function scheduleFollowToBottom()
    viewportHeight=output.AbsoluteWindowSize.Y
    maxY=math.max(0,contentHeight-viewportHeight)
    output.CanvasPosition=Vector2.new(0,maxY)
-   renderVisibleRows(true)
+   renderVisibleRows(false)
   end
   followUpdateQueued=false
  end)
 end
 output:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
- if virtualRefreshQueued then return end
- virtualRefreshQueued=true
- task.defer(function()
-  virtualRefreshQueued=false
-  renderVisibleRows(false)
- end)
+ -- Refresh immediately after scrolling so recycled rows do not remain stale for a deferred frame.
+ renderVisibleRows(false)
 end)
 output:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
  if #visibleRecords>0 then render() end
@@ -849,4 +850,4 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 local connection=LogService.MessageOut:Connect(append)
 gui.Destroying:Connect(function() connection:Disconnect() end)
-append("VGD Output Console v67 initialized.",Enum.MessageType.MessageInfo)
+append("VGD Output Console v69 initialized.",Enum.MessageType.MessageInfo)
