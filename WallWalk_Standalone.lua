@@ -1,14 +1,14 @@
 --[[
-VGD WallWalk Standalone v48.76.19 POV - experimental segmented loader.
-Derived from WallWalk_Standalone_v48.76.9_POV_Direction_UI_Polish.lua.
+VGD WallWalk Standalone v48.76.113 Idle-to-Locomotion Crossfade Polish.
+Source parent: v48.76.112_Floor_Edge_Underside_Near_Miss_Reacquire. Canonical historical rollback baseline remains v48.76.82.
+This candidate preserves all v48.76.112 transition logic and changes only grounded idle/locomotion animation handoff timing: idle fades out over the same 0.20s used to fade Walk/Run in, and Walk/Run fade out over 0.20s as idle fades in. Gravity, transitions, support detection, movement forces, and animation assets are unchanged. Static validation only; Roblox runtime still needs testing.
 Each top-level function is compiled separately and initialized in source order.
 Top-level state/functions are shared through one environment; function locals remain local.
-This keeps the POV/camera/UI version's behavior while using the chunked loader approach.
 ]]
 
 local compiler = loadstring
 if type(compiler) ~= "function" then
-    warn("VGD WallWalk v48.76.19 POV: loadstring is unavailable; no modules were started.")
+    warn("VGD WallWalk v48.76.113: loadstring is unavailable; no modules were started.")
     return
 end
 
@@ -27,7 +27,7 @@ end
 
 local modules = {
     { name = '00_initial_state', source = [=[--[[
-    VGD WallWalk Standalone v48.76.19 POV Chunked Bootstrap
+    VGD WallWalk Standalone v48.76.105 Walk/Run Animation + Diagnostic Integrity Bootstrap
     Client Gravity Override + Surface-Relative Gravity + Ceiling Stair Lift Fix
 
     Base: v6 GravityController_Rebuild
@@ -239,9 +239,109 @@ CFG =  {
     -- Dedicated movement-facing transition sensor. The old feeler system was
     -- excellent for corners but too indirect for the first floor -> wall
     -- handoff. These rays deliberately look where the player is moving.
-    TransitionProbeLength = 5.5,
+    TransitionProbeLength = 6.5,
     TransitionProbeHeight = 1.15,
     TransitionProbeSide = 1.05,
+
+    -- v48.76.30: edge wall acquisition is based on the physical radial fan,
+    -- not the current movement direction. A real adjacent wall must be vertical,
+    -- below the current support plane, close to the character, and corroborated
+    -- by distinct down-fan rays. Stair detection remains an exclusion.
+    RadialEdgeWallMaxDistance = 6.25,
+    RadialEdgeWallMinDrop = 0.25,
+    RadialEdgeWallNormalDot = 0.94,
+    RadialEdgeWallMinSamples = 3,
+    -- Preserve independent ray evidence briefly across frames at running speed.
+    RadialEdgeWallEvidenceWindow = 0.36,
+
+    -- A fan-ray point may be several studs below the character even when the
+    -- wall itself is beside the torso. Confirm the wall plane with fixed-range
+    -- probes at the character's current height band before using the shared gap.
+    EdgeTransitionPendingLifetime = 0.85,
+    EdgeTransitionProbeOffsets = {-1.35, -0.60, 0.15, 0.80},
+    EdgeTransitionContactSpeedLead = 0.02,
+    EdgeTransitionContactSpeedLeadMax = 0.45,
+    -- Edge and movement-facing transitions have separate pending ownership.
+    -- A horizontal target near a wall edge is scanned independently from the
+    -- forward-facing transition probes, then must pass a direction/contact gate.
+    EdgeHorizontalProbeLength = 5.50,
+    -- Preserve the established contact threshold for ordinary transitions.
+    -- Floor returns measure body clearance from the actual floor plane plus the
+    -- tangent distance from the hit to the projected body footprint; root height
+    -- is diagnostic only and cannot veto a real body-to-floor contact.
+    VerticalSurfaceContactGap = 0.25,
+    -- An angled floor ray may hit slightly ahead of the body footprint. Keep
+    -- true body-to-plane clearance strict, but forgive this tangent-only offset.
+    FloorContactTangentAllowance = 0.50,
+    -- Do not let the source floor reclaim gravity immediately after floor->wall.
+    -- Release only after target support is stable AND the source floor was cleared,
+    -- or at the bounded timeout. Directed contact can still authorize a real return.
+    FloorToWallReturnLockMaxTime = 1.80,
+    FloorToWallReturnLockReleaseProgress = 2.75,
+    -- A single safety-fan frame is not enough to complete a gravity handoff.
+    TransitionSupportConfirmTime = 0.12,
+    TransitionReturnGuardTime = 0.20,
+    -- Speed lead is bounded and applies only to edge contact geometry; ordinary
+    -- forward transitions still use their fixed plane-clearance threshold.
+    EdgeHorizontalContactLeadMax = 1.20,
+    -- Bounded progressive lead for ceiling/underside edge transitions.
+    EdgeUndersideFastContactLeadMax = 2.25,
+    -- Direction-confirmed floor-edge -> wall-underside reacquisition limits.
+    FloorEdgeUndersideMinContactLead = 0.75,
+    FloorEdgeUndersideFastContactLeadMax = 2.55,
+    -- A rare undirected near-miss may still have an independent wall-plane ray.
+    -- Give that case a small extra gap cap only when the candidate point is close.
+    FloorEdgeUndersideUndirectedNearMissPointLimit = 4.25,
+    FloorEdgeUndersideUndirectedNearMissLeadMax = 2.70,
+    -- Separate, slightly larger reach for wall-edge -> ceiling underside only.
+    WallEdgeCeilingFastContactLeadMax = 3.00,
+    -- Approach-only floor edge range. This tracks a directional floor candidate
+    -- before/after support loss; it never permits a gravity switch at this range.
+    EdgeFloorApproachDistance = 9.00,
+    EdgeFloorApproachProbeLength = 9.00,
+    EdgeFloorApproachMaxHold = 1.50,
+    EdgeFloorApproachCandidateLifetime = 1.60,
+    -- After wall support is explicitly lost, a nearby world-up floor can be the
+    -- safe gravity destination even when tangential movement points away from it.
+    -- Keep this exception bounded by root distance and real body/tangent geometry.
+    WallEdgeFloorLostSupportPointLead = 1.75,
+    WallEdgeFloorLostSupportSurfaceGap = 2.75,
+    WallEdgeFloorLostSupportPlaneGap = 2.25,
+    WallEdgeFloorLostSupportTangentExtra = 0.15,
+    EdgeFloorApproachInputDot = 0.20,
+    EdgeFloorApproachVelocityDot = 0.15,
+    EdgeFloorApproachMinVelocity = 0.75,
+    TransitionSupportGrace = 0.65,
+    -- These routes can be accepted with speed-based edge lead before the full
+    -- character body reaches the target plane. Keep the claim bounded but allow
+    -- the body to rotate/contact before the normal fall-safety timer takes over.
+    FloorEdgeWallHandoffGrace = 1.75,
+    WallToCeilingHandoffGrace = 1.75,
+    CeilingToWallHandoffGrace = 1.75,
+    -- Wall-edge -> ceiling needs longer to acquire underside support after the
+    -- gravity snap: the valid ceiling ray can be farther from the root plane.
+    WallEdgeCeilingHandoffGrace = 1.75,
+    WallEdgeCeilingHandoffMaxDistance = 6.50,
+    -- Only a validated wall-edge -> ceiling handoff may use this
+    -- extended root probe while it is the active ceiling entry path. Match the
+    -- v42-style 5-stud candidate reach so the root can acquire the same plane.
+    LegacyWallEdgeCeilingSupportDistance = 5.00,
+    LegacyWallEdgeCeilingSourceWallClearProgress = 0.75,
+    -- Briefly suppress only the wall used as the source of an edge-to-floor handoff.
+    LegacyWallEdgeFloorSourceWallHoldTime = 0.55,
+    -- Do not interpret the movement held during the wall-to-floor landing as a
+    -- new request to climb back onto that same wall. Only after this brief settle
+    -- interval can neutral/away input arm a fresh, deliberate return.
+    LegacyWallEdgeFloorSourceWallFreshIntentDelay = 0.12,
+    LegacyWallEdgeFloorSourceWallClearProgress = 0.60,
+    -- Keep the source ceiling from stealing gravity back during a forward
+    -- ceiling -> wall handoff. Release only after real wall contact and enough
+    -- movement away from the source ceiling, or let ordinary safety recover.
+    CeilingToWallLockMaxTime = 1.80,
+    CeilingToWallLockReleaseProgress = 2.75,
+    CeilingToWallLockSupportDistance = 2.25,
+    TransitionHandoffMaxDistance = 5.25,
+
     TransitionNormalDot = 0.82,
     TransitionWallDot = 0.78,
     -- Floor/ceiling -> wall ownership requires multi-sample confirmation.
@@ -305,11 +405,70 @@ jumpRequestLatched =  false
 lastJumpRequestAt =  0
 surfaceLostAt =  0
 safetyReleased =  false
+ceilingApproachHoldStartedAt = 0
+ceilingApproachHoldExpired = false
+ceilingApproachHoldInstance = nil
+ceilingApproachHoldPoint = nil
+ceilingApproachHoldNormal = nil
+nativeFloorHandoffInProgress = false
 
 -- Gravity-transition state. This is only armed by an actual gravity-plane
 -- change detected by updateSurface(). It does NOT alter normal wall/ceiling
 -- support detection or the existing safety timer.
 gravityTransitionActive =  false
+-- Recent radial wall hits survive a few frames so fast movement does not need
+-- three separate fan rays to hit the wall in one exact frame.
+radialEdgeMemory = nil
+edgeTransitionPending = nil
+forwardTransitionPending = nil
+-- Set by getGravityUp for the exact detector that supplied the accepted target.
+-- The coordinator consumes this metadata only when a real gravity side commits.
+transitionCandidateRoute = nil
+transitionCandidateHit = nil
+transitionCandidateNormal = nil
+transitionCandidateSupportGap = false
+transitionClaim = nil
+-- True only after the v42-style wall-edge -> ceiling route commits.
+-- It lets that one route finish attachment with its observed root gap.
+legacyEdgeCeilingSupportActive = false
+ceilingContactSupportReachActive = false
+legacyEdgeCeilingSourceWallHoldActive = false
+legacyEdgeCeilingHandoffPending = false
+legacyEdgeCeilingSourceUp = nil
+legacyEdgeCeilingHandoffPosition = nil
+legacyEdgeCeilingStartedAt = 0
+-- Active only after the isolated wall-edge -> floor route commits.
+legacyEdgeFloorSourceWallActive = false
+legacyEdgeFloorSourceUp = nil
+legacyEdgeFloorHandoffPosition = nil
+legacyEdgeFloorStartedAt = 0
+legacyEdgeFloorSourceWallIntentReleased = false
+legacyEdgeFloorSourceWallInputDot = 0
+-- The legacy detector route remains "forward"/"edge" for compatibility.
+-- This separate key names the exact transition controller that accepted it.
+transitionResolvedRoute = nil
+transitionRouteStates = {}
+-- v48.76.102 keeps the v48.76.99 source-wall hold fix; this build adds speed-based Walk/Run selection and diagnostic clarity.
+transitionCandidateAuditSequence = 0
+transitionCandidateAuditCurrent = nil
+transitionCandidateAuditLatest = nil
+transitionCandidateAuditByRoute = {}
+transitionCandidateAuditBySequence = {}
+transitionCandidateAuditHistoryLimit = 128
+transitionCandidateAuditHistoryCount = 0
+transitionCandidateAuditPruneCursor = 1
+transitionCandidateAuditErrorCount = 0
+transitionCandidateAuditStats = {
+    offered = 0,
+    authorized = 0,
+    rejected = 0,
+    unmanaged = 0,
+    committed = 0,
+    completed = 0,
+    claimReplacements = 0,
+    expired = 0,
+    aborted = 0,
+}
 orientationTransitionUntil =  0
 -- Carry the character's SURFACE-PATH direction across a real gravity-side
 -- change. The important part is that this is transported by the same rotation
@@ -326,6 +485,793 @@ transitionMoveCandidate =  nil
 --, so limiting AlignOrientation angular speed alone is not sufficient. This
 -- guard removes only excessive outward normal velocity during the 0.32s handoff;
 -- tangent movement and normal WallWalk gravity are left untouched.]=] },
+    { name = '00a_wallTransitionDiagnostics', source = [=[
+wwWallDiagLastAt = wwWallDiagLastAt or {}
+wwTransitionPhaseLogAt = wwTransitionPhaseLogAt or {}
+
+function wwDescribeSurfaceOrientation(up)
+    if typeof(up) ~= "Vector3" then return "Unknown" end
+    if up.Y > 0.82 then return "Floor" end
+    if up.Y < -0.82 then return "Ceiling" end
+    if math.abs(up.X) > math.abs(up.Z) then
+        return up.X > 0 and "Right Wall" or "Left Wall"
+    end
+    return up.Z > 0 and "Back Wall" or "Front Wall"
+end
+
+function wwWallDiagDue(eventName, interval)
+    local last = wwWallDiagLastAt[eventName] or 0
+    return os.clock() - last >= (interval or 0.5)
+end
+
+function wwWallDiag(eventName, detail, interval)
+    local now = os.clock()
+    local last = wwWallDiagLastAt[eventName] or 0
+    if now - last < (interval or 0.5) then return end
+    wwWallDiagLastAt[eventName] = now
+    print("[WW DIAG v48.76.113] " .. tostring(eventName) .. " | t=" .. string.format("%.2f", now) .. " | " .. tostring(detail or ""))
+end
+
+function wwWallDiagCheckFloorApproach(oldUp, hit, moveDir, distance, moveVector)
+    local approach = isWallFloorApproach(oldUp, hit, moveDir)
+    wwWallDiag(
+        approach and "WALL_FLOOR_CANDIDATE_AHEAD" or "WALL_FLOOR_CANDIDATE_REJECTED",
+        "dist=" .. string.format("%.2f", distance)
+            .. ", posY=" .. string.format("%.2f", root.Position.Y)
+            .. ", moveMag=" .. string.format("%.2f", moveVector and moveVector.Magnitude or 0),
+        0.45
+    )
+    return approach
+end
+
+-- Forensic-only wall-edge trace state. This records observations and already-computed
+-- gate results; it does not feed any transition decision.
+wwEdgeForensicScan = nil
+wwEdgeForensicFloorGateInfo = {}
+legacyEdgeFloorQualificationReason = nil
+
+function wwEdgeForensicVector(value)
+    if typeof(value) ~= "Vector3" then return "n/a" end
+    return string.format("%.3f,%.3f,%.3f", value.X, value.Y, value.Z)
+end
+
+function wwEdgeForensicInstancePath(instance)
+    if not instance then return "none" end
+    local ok, path = pcall(function() return instance:GetFullName() end)
+    if ok and path then return tostring(path) end
+    return tostring(instance)
+end
+
+function wwBeginEdgeForensicScan(oldUp, moveVector, currentSupportSeen, worldMove, velocity)
+    local now = os.clock()
+    local floorLast = wwWallDiagLastAt["EDGE_FORENSIC_FLOOR"] or 0
+    local ceilingLast = wwWallDiagLastAt["EDGE_FORENSIC_CEILING"] or 0
+    if not root or (now - floorLast < 0.50 and now - ceilingLast < 0.50) then
+        wwEdgeForensicScan = nil
+        return
+    end
+    wwEdgeForensicScan = {
+        at = now,
+        rootPosition = root.Position,
+        rootVelocity = velocity or root.AssemblyLinearVelocity,
+        rootUp = safeUnit(oldUp, UP),
+        moveVector = moveVector or ZERO,
+        worldMove = worldMove or ZERO,
+        supportSeen = currentSupportSeen == true,
+        rawFloor = nil,
+        rawCeiling = nil,
+        acceptedFloor = nil,
+        acceptedCeiling = nil,
+    }
+end
+
+function wwRecordEdgeForensicHit(hit, normal, probeOrigin, rayDirection, probeLength,
+    kind, planeDistance, pointDistance, surfaceGap, maxSurfaceGap, withinContactGap,
+    extendedFloorApproach, directionCompatible, movingTowardPlane, movingTowardTarget,
+    inputTowardTarget, velocityTowardTarget, gateAccepted, floorGateInfo, usedPointDistanceFallback)
+    local scan = wwEdgeForensicScan
+    if not scan or not hit or not hit.Instance or not normal then return end
+    local rawKey = kind == "floor" and "rawFloor" or "rawCeiling"
+    local acceptedKey = kind == "floor" and "acceptedFloor" or "acceptedCeiling"
+    local priorRaw = scan[rawKey]
+    local priorAccepted = scan[acceptedKey]
+    local betterRaw = not priorRaw or planeDistance < priorRaw.planeDistance
+    local betterAccepted = gateAccepted
+        and (not priorAccepted or planeDistance < priorAccepted.planeDistance)
+    if not betterRaw and not betterAccepted then return end
+    local record = {
+        instance = hit.Instance,
+        position = hit.Position,
+        rawNormal = hit.Normal,
+        normal = normal,
+        probeOrigin = probeOrigin,
+        rayDirection = rayDirection,
+        probeLength = probeLength,
+        hitDistance = hit.Distance,
+        kind = kind,
+        planeDistance = planeDistance,
+        pointDistance = pointDistance,
+        surfaceGap = surfaceGap,
+        maxSurfaceGap = maxSurfaceGap,
+        withinContactGap = withinContactGap == true,
+        extendedFloorApproach = extendedFloorApproach == true,
+        directionCompatible = directionCompatible == true,
+        movingTowardPlane = movingTowardPlane == true,
+        movingTowardTarget = movingTowardTarget == true,
+        inputTowardTarget = inputTowardTarget == true,
+        velocityTowardTarget = velocityTowardTarget == true,
+        gateAccepted = gateAccepted == true,
+        usedPointDistanceFallback = usedPointDistanceFallback == true,
+    }
+    if floorGateInfo then
+        record.floorGateInfo = {
+            contactAccepted = floorGateInfo.contactAccepted,
+            planeGap = floorGateInfo.planeGap,
+            tangentGap = floorGateInfo.tangentGap,
+            tangentLimit = floorGateInfo.tangentLimit,
+            movingToward = floorGateInfo.movingToward,
+            inputToward = floorGateInfo.inputToward,
+            velocityToward = floorGateInfo.velocityToward,
+            planeLimit = floorGateInfo.planeLimit,
+            pointLimit = floorGateInfo.pointLimit,
+        }
+    end
+    if betterRaw then scan[rawKey] = record end
+    if betterAccepted then scan[acceptedKey] = record end
+end
+
+function wwEdgeForensicDescribeRecord(record, selectedHit, selectedRoute)
+    if not record then return "NONE" end
+    local canCollide = "n/a"
+    local canQuery = "n/a"
+    local className = "n/a"
+    local physicalContactGate = "not-applicable"
+    local bodyPlaneGap = "not-applicable"
+    local tangentGap = "not-applicable"
+    local tangentLimit = "not-applicable"
+    if record.floorGateInfo then
+        physicalContactGate = tostring(record.floorGateInfo.contactAccepted)
+        bodyPlaneGap = string.format("%.3f", tonumber(record.floorGateInfo.planeGap) or math.huge)
+        tangentGap = string.format("%.3f", tonumber(record.floorGateInfo.tangentGap) or math.huge)
+        tangentLimit = string.format("%.3f", tonumber(record.floorGateInfo.tangentLimit) or 0)
+    end
+    local ok, isPart = pcall(function() return record.instance:IsA("BasePart") end)
+    if ok and isPart then
+        local flagsOk, collide, query, class = pcall(function()
+            return record.instance.CanCollide, record.instance.CanQuery, record.instance.ClassName
+        end)
+        if flagsOk then
+            canCollide = tostring(collide)
+            canQuery = tostring(query)
+            className = tostring(class)
+        end
+    end
+    local selected = selectedHit ~= nil
+        and selectedHit.Instance == record.instance
+        and (selectedHit.Position - record.position).Magnitude < 0.001
+    return "kind=" .. tostring(record.kind)
+        .. ", part=" .. wwEdgeForensicInstancePath(record.instance)
+        .. ", normalDotWorldUp=" .. string.format("%.4f", record.normal:Dot(UP))
+        .. ", class=" .. className
+        .. ", canCollide=" .. canCollide
+        .. ", canQuery=" .. canQuery
+        .. ", hit=" .. wwEdgeForensicVector(record.position)
+        .. ", rawNormal=" .. wwEdgeForensicVector(record.rawNormal)
+        .. ", orientedNormal=" .. wwEdgeForensicVector(record.normal)
+        .. ", origin=" .. wwEdgeForensicVector(record.probeOrigin)
+        .. ", rayDir=" .. wwEdgeForensicVector(record.rayDirection)
+        .. ", rayLength=" .. string.format("%.3f", tonumber(record.probeLength) or 0)
+        .. ", rayHitDist=" .. string.format("%.3f", tonumber(record.hitDistance) or math.huge)
+        .. ", planeDist=" .. string.format("%.3f", record.planeDistance)
+        .. ", rootPointDist=" .. string.format("%.3f", record.pointDistance)
+        .. ", surfaceGap=" .. string.format("%.3f", record.surfaceGap)
+        .. ", gapLimit=" .. string.format("%.3f", record.maxSurfaceGap)
+        .. ", scannerPrequalified=" .. tostring(record.withinContactGap)
+        .. ", physicalPlaneTangentContact=" .. physicalContactGate
+        .. ", bodyPlaneGap=" .. bodyPlaneGap
+        .. ", tangentGap=" .. tangentGap
+        .. ", tangentLimit=" .. tangentLimit
+        .. ", legacyPointDistanceFallback=" .. tostring(record.usedPointDistanceFallback)
+        .. ", extendedApproach=" .. tostring(record.extendedFloorApproach)
+        .. ", directionCompatible=" .. tostring(record.directionCompatible)
+        .. ", movingTowardPlane=" .. tostring(record.movingTowardPlane)
+        .. ", movingTowardTarget=" .. tostring(record.movingTowardTarget)
+        .. ", inputToward=" .. tostring(record.inputTowardTarget)
+        .. ", velocityToward=" .. tostring(record.velocityTowardTarget)
+        .. ", routeGateAccepted=" .. tostring(record.gateAccepted)
+        .. ", scannerSelected=" .. tostring(selected)
+        .. ", edgeDiscontinuity=not-tested-by-this-scanner"
+        .. ", selectedRoute=" .. tostring(selected and selectedRoute or "none")
+end
+
+function wwEmitEdgeForensicScan(selectedHit, selectedNormal, selectedRoute, selectedDistance)
+    local scan = wwEdgeForensicScan
+    if not scan then return end
+    local common = "probeFamily=edge-horizontal-probes"
+        .. ", root=" .. wwEdgeForensicVector(scan.rootPosition)
+        .. ", sourceUp=" .. wwEdgeForensicVector(scan.rootUp)
+        .. ", velocity=" .. wwEdgeForensicVector(scan.rootVelocity)
+        .. ", inputWorld=" .. wwEdgeForensicVector(scan.worldMove)
+        .. ", supportSeen=" .. tostring(scan.supportSeen)
+        .. ", selectedRoute=" .. tostring(selectedRoute or "none")
+        .. ", selectedPlaneDist=" .. string.format("%.3f", tonumber(selectedDistance) or math.huge)
+    wwWallDiag("EDGE_FORENSIC_FLOOR",
+        common .. ", raw={" .. wwEdgeForensicDescribeRecord(scan.rawFloor, selectedHit, selectedRoute)
+            .. "}, acceptedNearest={" .. wwEdgeForensicDescribeRecord(scan.acceptedFloor, selectedHit, selectedRoute) .. "}",
+        0.50)
+    wwWallDiag("EDGE_FORENSIC_CEILING",
+        common .. ", raw={" .. wwEdgeForensicDescribeRecord(scan.rawCeiling, selectedHit, selectedRoute)
+            .. "}, acceptedNearest={" .. wwEdgeForensicDescribeRecord(scan.acceptedCeiling, selectedHit, selectedRoute) .. "}",
+        0.50)
+    wwEdgeForensicScan = nil
+end
+]=] },
+    { name = '00b_transitionGapHelpers', source = [=[
+-- Measure distance from the surface hit point to the nearest actual body-part
+-- box. Do not use one model-wide box: that box includes empty space between limbs
+-- and accessory extents, both of which can report false contact with a floor.
+surfaceGapCacheCharacter = nil
+surfaceGapBodyParts = nil
+surfaceGapBodyPartsAt = 0
+
+function getBodyPartSurfaceGap(point)
+    if not character or not point then return math.huge end
+
+    local now = os.clock()
+    if surfaceGapCacheCharacter ~= character
+        or not surfaceGapBodyParts
+        or now - surfaceGapBodyPartsAt > 0.75
+    then
+        local parts = {}
+        for _, child in ipairs(character:GetChildren()) do
+            -- R6/R15 visible body parts are direct BasePart children. Exclude the
+            -- invisible/non-colliding HumanoidRootPart when other body parts exist.
+            -- Accessory handles and tool parts are nested under Accessory/Tool and
+            -- must not make the avatar appear to touch a surface prematurely.
+            if child:IsA("BasePart") and child ~= root and child.Name ~= "HumanoidRootPart" then
+                table.insert(parts, child)
+            end
+        end
+        if #parts == 0 and root then
+            table.insert(parts, root)
+        end
+        surfaceGapCacheCharacter = character
+        surfaceGapBodyParts = parts
+        surfaceGapBodyPartsAt = now
+    end
+
+    local bestGap = math.huge
+    local parts = surfaceGapBodyParts
+    if not parts then return bestGap end
+
+    for _, part in ipairs(parts) do
+        if part and part.Parent == character then
+            local localPoint = part.CFrame:PointToObjectSpace(point)
+            local halfSize = part.Size * 0.5
+            local dx = math.max(math.abs(localPoint.X) - halfSize.X, 0)
+            local dy = math.max(math.abs(localPoint.Y) - halfSize.Y, 0)
+            local dz = math.max(math.abs(localPoint.Z) - halfSize.Z, 0)
+            local partGap = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if partGap < bestGap then
+                bestGap = partGap
+            end
+        end
+    end
+
+    return bestGap
+end
+
+-- Floor contact is plane-based, not point-based. An angled approach ray can hit
+-- the floor ahead of the character, so its 3D point-to-box distance overstates
+-- clearance even when a body part is already at floor height. Measure (1) the
+-- part OBB's clearance along the floor normal and (2) the tangential distance
+-- from the hit point to that OBB. The adjusted score still requires true near-plane body clearance.
+function getBodyPartFloorContactGap(point, normal)
+    if not character or not point or not normal then
+        return math.huge, math.huge, math.huge
+    end
+    if normal.Magnitude <= 0.001 then
+        return math.huge, math.huge, math.huge
+    end
+    local n = normal.Unit
+
+    local now = os.clock()
+    if surfaceGapCacheCharacter ~= character
+        or not surfaceGapBodyParts
+        or now - surfaceGapBodyPartsAt > 0.75
+    then
+        local parts = {}
+        for _, child in ipairs(character:GetChildren()) do
+            if child:IsA("BasePart") and child ~= root and child.Name ~= "HumanoidRootPart" then
+                table.insert(parts, child)
+            end
+        end
+        if #parts == 0 and root then
+            table.insert(parts, root)
+        end
+        surfaceGapCacheCharacter = character
+        surfaceGapBodyParts = parts
+        surfaceGapBodyPartsAt = now
+    end
+
+    local bestGap = math.huge
+    local bestPlaneGap = math.huge
+    local bestTangentGap = math.huge
+    local parts = surfaceGapBodyParts
+    if not parts then
+        return bestGap, bestPlaneGap, bestTangentGap
+    end
+
+    for _, part in ipairs(parts) do
+        if part and part.Parent == character then
+            local cf = part.CFrame
+            local half = part.Size * 0.5
+            local centerDistance = math.abs((part.Position - point):Dot(n))
+            local planeRadius = math.abs(cf.RightVector:Dot(n)) * half.X
+                + math.abs(cf.UpVector:Dot(n)) * half.Y
+                + math.abs(cf.LookVector:Dot(n)) * half.Z
+            local planeGap = math.max(centerDistance - planeRadius, 0)
+
+            local localPoint = cf:PointToObjectSpace(point)
+            local nearestLocal = Vector3.new(
+                math.clamp(localPoint.X, -half.X, half.X),
+                math.clamp(localPoint.Y, -half.Y, half.Y),
+                math.clamp(localPoint.Z, -half.Z, half.Z)
+            )
+            local nearestPoint = cf:PointToWorldSpace(nearestLocal)
+            local delta = point - nearestPoint
+            local tangentDelta = delta - n * delta:Dot(n)
+            local tangentGap = tangentDelta.Magnitude
+            local tangentExcess = math.max(tangentGap - CFG.FloorContactTangentAllowance, 0)
+            local contactGap = math.sqrt(planeGap * planeGap + tangentExcess * tangentExcess)
+
+            if contactGap < bestGap then
+                bestGap = contactGap
+                bestPlaneGap = planeGap
+                bestTangentGap = tangentGap
+            end
+        end
+    end
+
+    return bestGap, bestPlaneGap, bestTangentGap
+end
+
+-- Cache the established model-bounds metric for ordinary transition acquisition.
+-- The final wall->floor reset uses the stricter body-part metric separately.
+edgeSurfaceGapCacheCharacter = nil
+edgeSurfaceGapCacheAt = 0
+edgeSurfaceGapCacheCFrame = nil
+edgeSurfaceGapCacheSize = nil
+
+function getLegacyCharacterBoundsGap(point)
+    if not character or not point then return math.huge end
+
+    local now = os.clock()
+    if edgeSurfaceGapCacheCharacter ~= character
+        or now - edgeSurfaceGapCacheAt > 0.006
+    then
+        local ok, boxCFrame, boxSize = pcall(function()
+            return character:GetBoundingBox()
+        end)
+        if not ok or not boxCFrame or not boxSize then
+            edgeSurfaceGapCacheCharacter = nil
+            edgeSurfaceGapCacheCFrame = nil
+            edgeSurfaceGapCacheSize = nil
+            return math.huge
+        end
+        edgeSurfaceGapCacheCharacter = character
+        edgeSurfaceGapCacheAt = now
+        edgeSurfaceGapCacheCFrame = boxCFrame
+        edgeSurfaceGapCacheSize = boxSize
+    end
+
+    local boxCFrame = edgeSurfaceGapCacheCFrame
+    local boxSize = edgeSurfaceGapCacheSize
+    if not boxCFrame or not boxSize then return math.huge end
+
+    local localPoint = boxCFrame:PointToObjectSpace(point)
+    local halfSize = boxSize * 0.5
+    local dx = math.max(math.abs(localPoint.X) - halfSize.X, 0)
+    local dy = math.max(math.abs(localPoint.Y) - halfSize.Y, 0)
+    local dz = math.max(math.abs(localPoint.Z) - halfSize.Z, 0)
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- Preserve the established v48.76.66 contact metric for ordinary transition
+-- acquisition. The stricter body-part gap is applied separately by the final
+-- wall-to-floor gravity-reset gate, where the false early reset was observed.
+function getCharacterSurfaceGap(point)
+    return getLegacyCharacterBoundsGap(point)
+end
+
+-- Determine whether input/velocity is aimed at a candidate along the currently
+-- owned surface. World-Y-only checks fail when the player approaches a floor by
+-- moving sideways/forward around a wall edge rather than directly downward.
+function isMovementTowardSurfacePoint(point, oldUp, moveVector)
+    if not root or not point then return false, false, false end
+
+    local up = safeUnit(oldUp, UP)
+    local toTarget = projectOnPlane(point - root.Position, up)
+    if toTarget.Magnitude <= 0.10 then
+        return false, false, false
+    end
+    local targetDirection = toTarget.Unit
+
+    local worldMove = ZERO
+    if moveVector and moveVector.Magnitude > 0.05 then
+        worldMove = getWorldMove(moveVector, up)
+        worldMove = projectOnPlane(worldMove, up)
+    end
+    local tangentVelocity = projectOnPlane(root.AssemblyLinearVelocity, up)
+
+    local inputToward = worldMove.Magnitude > 0.05
+        and worldMove.Unit:Dot(targetDirection) >= CFG.EdgeFloorApproachInputDot
+    local velocityToward = tangentVelocity.Magnitude >= CFG.EdgeFloorApproachMinVelocity
+        and tangentVelocity.Unit:Dot(targetDirection) >= CFG.EdgeFloorApproachVelocityDot
+
+    return inputToward or velocityToward, inputToward, velocityToward
+end
+
+-- An approach candidate is tracking/safety evidence only. It never authorizes a
+-- gravity switch outside VerticalSurfaceContactGap.
+edgeFloorApproachHit = nil
+edgeFloorApproachNormal = nil
+edgeFloorApproachAt = 0
+edgeFloorApproachHoldStartedAt = 0
+
+function clearEdgeFloorApproach()
+    edgeFloorApproachHit = nil
+    edgeFloorApproachNormal = nil
+    edgeFloorApproachAt = 0
+    edgeFloorApproachHoldStartedAt = 0
+end
+-- Speed lead for wall-edge -> floor/ceiling traversal only. Direct forward
+-- transitions never call this to widen their contact acceptance.
+function getEdgeHorizontalSpeedLead(oldUp, moveVector)
+    if not root then return 0 end
+    local up = safeUnit(oldUp, UP)
+    local planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, up).Magnitude
+    local commandedSpeed = 0
+    if humanoid then
+        commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+            * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+    end
+    local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+    return math.clamp((transitionSpeed - 9) * 0.12, 0, CFG.EdgeHorizontalContactLeadMax)
+end
+
+-- Wall-edge -> ceiling underside needs its own reach: this route loses its target
+-- quickly at speed, while ceiling-edge -> wall underside is already validated at WS 21.
+-- Keep this larger allowance scoped to wall-source / ceiling-target transitions.
+function wwGetWallEdgeToCeilingSpeedLead(fromUp, moveVector)
+    if not root then return 0 end
+    local up = safeUnit(fromUp, UP)
+    if math.abs(up:Dot(UP)) >= 0.985 then return 0 end
+    local planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, up).Magnitude
+    local commandedSpeed = 0
+    if humanoid then
+        commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+            * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+    end
+    local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+    local lead = math.clamp(
+        (transitionSpeed - 9) * 0.25,
+        0,
+        CFG.WallEdgeCeilingFastContactLeadMax
+    )
+    local baseLead = getEdgeHorizontalSpeedLead(up, moveVector)
+    if baseLead > lead then return baseLead end
+    return lead
+end
+
+-- Shared geometry decision for wall-edge -> floor. The scanner, route controller,
+-- and final candidate gate must all agree on plane clearance plus bounded tangent reach.
+function wwGetWallEdgeFloorContact(point, normal, fromUp, moveVector)
+    if not point or not normal then
+        return false, math.huge, math.huge, math.huge, 0, false, false, false
+    end
+    local surfaceGap, planeGap, tangentGap = getBodyPartFloorContactGap(point, normal)
+    local movingToward, inputToward, velocityToward =
+        isMovementTowardSurfacePoint(point, fromUp, moveVector)
+    -- A low-speed character's body edge can contact the floor while its root
+    -- remains slightly outside the old 0.95-stud tangent allowance. Add only
+    -- 0.15 studs to this edge-specific contact envelope; plane clearance stays
+    -- strict and speed-based extension remains bounded.
+    local tangentLimit = CFG.FloorContactTangentAllowance + 0.60
+        + getEdgeHorizontalSpeedLead(fromUp, moveVector)
+    local planeLimit = CFG.VerticalSurfaceContactGap + 0.10
+    -- Plane clearance plus bounded tangent reach is the physical contact test.
+    -- Switchback permission is decided separately and uses INPUT intent, not
+    -- inherited velocity, because momentum can point back at the old floor.
+    local accepted = planeGap <= planeLimit and tangentGap <= tangentLimit
+    return accepted, surfaceGap, planeGap, tangentGap, tangentLimit,
+        movingToward, inputToward, velocityToward
+end
+
+-- v48.76.42's wall-edge ceiling acquisition allowance. WalkSpeed is intentionally
+-- not multiplied by input magnitude here: this is the old bounded edge-distance
+-- rule, and is called only for a validated wall-edge -> ceiling candidate.
+function wwGetLegacyWallEdgeCeilingPointLimit(fromUp)
+    if not root then return CFG.SurfaceSwitchDistance end
+    local up = safeUnit(fromUp, UP)
+    local planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, up).Magnitude
+    local commandedSpeed = 0
+    if humanoid then
+        commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+    end
+    local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+    local speedLead = math.clamp((transitionSpeed - 14) * 0.75, 0, 2.25)
+    local pointLimit = 2.75 + speedLead
+    wwWallDiag("WW_LEGACY_EDGE_CEILING_SPEED_LIMIT",
+        "walkSpeed=" .. string.format("%.2f", commandedSpeed)
+            .. ", planarSpeed=" .. string.format("%.2f", planarSpeed)
+            .. ", speedBasis=max(planarSpeed,walkSpeed)=" .. string.format("%.2f", transitionSpeed)
+            .. ", pointLimit=" .. string.format("%.2f", pointLimit),
+        0.50
+    )
+    return pointLimit
+end
+
+-- The scanner uses the old bounded hit-point reach only when ordinary floor
+-- body/plane contact rejects the target and input or velocity points toward it.
+-- Keep this helper separate from the large scanner to reduce live registers.
+function wwGetWallEdgeFloorCandidateGate(point, normal, fromUp, moveVector)
+    local accepted, surfaceGap, planeGap, tangentGap, tangentLimit, movingToward,
+        inputToward, velocityToward =
+        wwGetWallEdgeFloorContact(point, normal, fromUp, moveVector)
+    if not point or not root then
+        return accepted, surfaceGap, false, math.huge
+    end
+    local pointDistance = (point - root.Position).Magnitude
+    local legacyFallback = not accepted
+        and movingToward
+        and pointDistance <= CFG.SurfaceSwitchDistance
+    local auditInfo = nil
+    if wwEdgeForensicScan then
+        auditInfo = wwEdgeForensicFloorGateInfo
+        auditInfo.contactAccepted = accepted
+        auditInfo.planeGap = planeGap
+        auditInfo.tangentGap = tangentGap
+        auditInfo.tangentLimit = tangentLimit
+        auditInfo.movingToward = movingToward
+        auditInfo.inputToward = inputToward
+        auditInfo.velocityToward = velocityToward
+        auditInfo.planeLimit = CFG.VerticalSurfaceContactGap + 0.10
+        auditInfo.pointLimit = CFG.SurfaceSwitchDistance
+    end
+    return accepted or legacyFallback, surfaceGap, legacyFallback, pointDistance, auditInfo
+end
+
+-- Select the legacy transition mechanism only for the two requested edge routes.
+-- Other transitions still run through wwAuthorizeTransitionCandidate unchanged.
+function wwGetLegacyWallEdgeHandoffRoute(fromUp, toUp, hasCandidate, legacyRoute, hit, normal, moveVector, switchBackBlocked, sourceSupportSeen)
+    legacyEdgeFloorQualificationReason = nil
+    if not hasCandidate or legacyRoute ~= "edge" or not root then return nil end
+    if not hit or not hit.Instance or not hit.Instance.Parent or not hit.Position or not normal then
+        return nil
+    end
+    local up = safeUnit(fromUp, UP)
+    local targetUp = safeUnit(toUp, up)
+    if math.abs(up:Dot(UP)) >= 0.985 then return nil end
+    if safeUnit(normal, targetUp):Dot(targetUp) < 0.90 then return nil end
+
+    local pointDistance = (hit.Position - root.Position).Magnitude
+    local pointLimit = 0
+    local routeName = nil
+    local floorGuardOverride = false
+    if targetUp:Dot(UP) >= 0.985 then
+        pointLimit = CFG.SurfaceSwitchDistance
+        local contactAccepted, surfaceGap, planeGap, tangentGap, tangentLimit,
+            movingToward, inputToward, velocityToward =
+            wwGetWallEdgeFloorContact(hit.Position, normal, up, moveVector)
+        local floorGrounded = getGrounded(UP)
+        -- Do not let the long GroundProbeLength ray claim the floor is ready
+        -- while the body is still climbing the source wall. A valid handoff needs
+        -- measured body-plane contact and a bounded tangent offset. While the
+        -- floor-to-wall return lock is active, velocity alone must not override it:
+        -- the character can still be carrying momentum toward the old floor.
+        local boundedDistance = pointDistance <= pointLimit
+        local directionalNearContact = inputToward
+            and boundedDistance
+            and surfaceGap <= CFG.VerticalSurfaceContactGap + 0.25
+            and planeGap <= CFG.VerticalSurfaceContactGap + 0.25
+            and tangentGap <= tangentLimit
+        local contactQualified = false
+        local qualificationBranch = "rejected-no-qualification-branch"
+        if contactAccepted and inputToward then
+            contactQualified = true
+            qualificationBranch = "contactAccepted-and-inputToward"
+        elseif directionalNearContact and (not switchBackBlocked or inputToward) then
+            contactQualified = true
+            qualificationBranch = "boundedDirectionalNearContact"
+        elseif contactAccepted and not switchBackBlocked and surfaceGap <= 0.08 then
+            -- A true near-zero landing may settle without input after the guard ends;
+            -- a nearby floor or inherited momentum alone cannot trigger a handoff.
+            contactQualified = true
+            qualificationBranch = "contactAccepted-nearZeroSurfaceGap-noSwitchback"
+        elseif wwQualifiesGroundedWallEdgeFloorApproach(
+            pointDistance, surfaceGap, planeGap, tangentGap, tangentLimit,
+            movingToward, floorGrounded, sourceSupportSeen
+        ) then
+            -- Preserve the existing grounded, direction-qualified recovery first.
+            contactQualified = true
+            qualificationBranch = "grounded-floor-approach-after-source-support-loss"
+        elseif wwQualifiesLostSupportWallEdgeFloorHandoff(
+            pointDistance, surfaceGap, planeGap, tangentGap, tangentLimit, sourceSupportSeen
+        ) then
+            -- The scanner has already confirmed support loss and a close, top-facing
+            -- floor. Do not require reverse input or a grounded Humanoid flag here.
+            contactQualified = true
+            qualificationBranch = "bounded-floor-proximity-after-source-support-loss"
+        end
+        if wwWallDiagDue("EDGE_FLOOR_HANDOFF_GATE", 0.20) then
+            wwWallDiag("EDGE_FLOOR_HANDOFF_GATE",
+                "outcome=" .. tostring(contactQualified)
+                    .. ", qualification=" .. qualificationBranch
+                    .. ", target=" .. wwEdgeForensicInstancePath(hit.Instance)
+                    .. ", point=" .. wwEdgeForensicVector(hit.Position)
+                    .. ", normal=" .. wwEdgeForensicVector(normal)
+                    .. ", root=" .. wwEdgeForensicVector(root.Position)
+                    .. ", pointDist=" .. string.format("%.3f", pointDistance)
+                    .. ", pointLimit=" .. string.format("%.3f", pointLimit)
+                    .. ", pointWithinLimit=" .. tostring(boundedDistance)
+                    .. ", contactAccepted=" .. tostring(contactAccepted)
+                    .. ", surfaceGap=" .. string.format("%.3f", surfaceGap)
+                    .. ", planeGap=" .. string.format("%.3f", planeGap)
+                    .. ", tangentGap=" .. string.format("%.3f", tangentGap)
+                    .. ", tangentLimit=" .. string.format("%.3f", tangentLimit)
+                    .. ", movingToward=" .. tostring(movingToward)
+                    .. ", inputToward=" .. tostring(inputToward)
+                    .. ", velocityToward=" .. tostring(velocityToward)
+                    .. ", switchbackBlocked=" .. tostring(switchBackBlocked)
+                    .. ", floorGrounded=" .. tostring(floorGrounded)
+                    .. ", sourceSupportSeen=" .. tostring(sourceSupportSeen == true),
+                0.20
+            )
+        end
+        if contactQualified then
+            legacyEdgeFloorQualificationReason = qualificationBranch
+            routeName = "wall-edge-to-floor"
+            if switchBackBlocked then
+                floorGuardOverride = true
+                wwWallDiag("WW_LEGACY_EDGE_FLOOR_GUARD_OVERRIDE",
+                    "reason=" .. tostring(qualificationBranch)
+                        .. ", planeGap=" .. string.format("%.2f", planeGap)
+                        .. ", tangentGap=" .. string.format("%.2f", tangentGap)
+                        .. ", tangentLimit=" .. string.format("%.2f", tangentLimit)
+                        .. ", pointDist=" .. string.format("%.2f", pointDistance)
+                        .. ", movingToward=" .. tostring(movingToward)
+                        .. ", inputToward=" .. tostring(inputToward)
+                        .. ", velocityToward=" .. tostring(velocityToward),
+                    0.12
+                )
+            end
+        elseif switchBackBlocked and surfaceGap <= CFG.VerticalSurfaceContactGap + 0.10 then
+            wwWallDiag("WW_LEGACY_EDGE_HANDOFF_DEFERRED",
+                "route=wall-edge-to-floor, reason=contact-direction-not-confirmed"
+                    .. ", pointDist=" .. string.format("%.2f", pointDistance)
+                    .. ", planeGap=" .. string.format("%.2f", planeGap)
+                    .. ", tangentGap=" .. string.format("%.2f", tangentGap)
+                    .. ", tangentLimit=" .. string.format("%.2f", tangentLimit)
+                    .. ", movingToward=" .. tostring(movingToward)
+                    .. ", inputToward=" .. tostring(inputToward)
+                    .. ", velocityToward=" .. tostring(velocityToward),
+                0.12
+            )
+        elseif pointDistance <= pointLimit + 1.00
+            or surfaceGap <= CFG.VerticalSurfaceContactGap + 0.50 then
+            wwWallDiag("WW_LEGACY_EDGE_FLOOR_GATE_REJECTED",
+                "pointDist=" .. string.format("%.2f", pointDistance)
+                    .. ", pointLimit=" .. string.format("%.2f", pointLimit)
+                    .. ", contactAccepted=" .. tostring(contactAccepted)
+                    .. ", groundedFloor=" .. tostring(floorGrounded)
+                    .. ", boundedDistance=" .. tostring(boundedDistance)
+                    .. ", surfaceGap=" .. string.format("%.2f", surfaceGap)
+                    .. ", planeGap=" .. string.format("%.2f", planeGap)
+                    .. ", tangentGap=" .. string.format("%.2f", tangentGap)
+                    .. ", tangentLimit=" .. string.format("%.2f", tangentLimit)
+                    .. ", movingToward=" .. tostring(movingToward)
+                    .. ", switchbackBlocked=" .. tostring(switchBackBlocked),
+                0.12
+            )
+        end
+    elseif targetUp:Dot(UP) <= -0.985 then
+        pointLimit = wwGetLegacyWallEdgeCeilingPointLimit(up)
+        local legacyHit, legacyNormal = findLegacyWallEdgeCeilingSurface(up, moveVector)
+        if legacyHit and legacyNormal then
+            pointDistance = (legacyHit.Position - root.Position).Magnitude
+            if pointDistance <= pointLimit and safeUnit(legacyNormal, targetUp):Dot(targetUp) >= 0.90 then
+                transitionCandidateHit = legacyHit
+                transitionCandidateNormal = safeUnit(legacyNormal, targetUp)
+                routeName = "wall-edge-to-ceiling-underside"
+            end
+        end
+    end
+
+    if routeName then
+        wwWallDiag("WW_LEGACY_EDGE_HANDOFF_SELECTED",
+            "route=" .. routeName
+                .. ", pointDist=" .. string.format("%.2f", pointDistance)
+                .. ", pointLimit=" .. string.format("%.2f", pointLimit),
+            0.12
+        )
+    end
+    return routeName, floorGuardOverride
+end
+
+function getDirectionalEdgeHorizontalSpeedLead(oldUp, moveVector, targetNormal)
+    if not root or not targetNormal then return 0 end
+    local up = safeUnit(oldUp, UP)
+    local worldMove = ZERO
+    if moveVector and moveVector.Magnitude > 0.05 then
+        worldMove = getWorldMove(moveVector, up)
+    end
+    local verticalMove = worldMove:Dot(UP)
+    local verticalVelocity = root.AssemblyLinearVelocity:Dot(UP)
+
+    if targetNormal:Dot(UP) >= 0.985 then
+        if math.abs(verticalMove) > 0.06 then
+            if verticalMove < -0.06 then
+                return getEdgeHorizontalSpeedLead(up, moveVector)
+            end
+        elseif verticalVelocity < -0.50 then
+            return getEdgeHorizontalSpeedLead(up, moveVector)
+        end
+    elseif targetNormal:Dot(UP) <= -0.985 then
+        if math.abs(verticalMove) > 0.06 then
+            if verticalMove > 0.06 then
+                return getEdgeHorizontalSpeedLead(up, moveVector)
+            end
+        elseif verticalVelocity > 0.50 then
+            return getEdgeHorizontalSpeedLead(up, moveVector)
+        end
+    end
+    return 0
+end
+
+
+
+-- Release an edge-only source-wall hold only for a deliberate ordinary wall
+-- transition. Velocity by itself is not sufficient: leftover momentum should not
+-- defeat the anti-flip guard. This helper is shared by the two hold state checks.
+function wwIsIntentionalSourceWallTransition(hit, currentUp, moveVector)
+    if not root or not hit or not hit.Position then return false, math.huge end
+    local _, inputTowardWall = isMovementTowardSurfacePoint(hit.Position, currentUp, moveVector)
+    local gap = getCharacterSurfaceGap(hit.Position)
+    local accepted = inputTowardWall and gap <= CFG.VerticalSurfaceContactGap + 0.10
+    return accepted, gap
+end
+]=] },
+    { name = '00c_grounded_wall_floor_approach_gate', source = [=[
+-- Permit a narrow wall-edge -> floor handoff when the current support
+-- sensor explicitly reports that the old wall is no longer supporting the
+-- character, a floor is grounded below, and tangent motion is aimed toward it.
+-- This is not a generic nearby-floor fallback.
+function wwQualifiesGroundedWallEdgeFloorApproach(pointDistance, surfaceGap, planeGap, tangentGap, tangentLimit, movingToward, floorGrounded, sourceSupportSeen)
+    if not floorGrounded then return false end
+    if sourceSupportSeen ~= false then return false end
+    if not movingToward then return false end
+    if pointDistance > CFG.SurfaceSwitchDistance + 1.50 then return false end
+    if surfaceGap > CFG.VerticalSurfaceContactGap + 2.50 then return false end
+    if planeGap > CFG.VerticalSurfaceContactGap + 1.50 then return false end
+    if tangentGap > tangentLimit + 1.25 then return false end
+    return true
+end
+
+-- A wall-edge fall can lose support while the player's input still points up the
+-- wall. In that case, a floor directly below the body must not be discarded just
+-- because input/velocity is not aimed at it. This is stricter than the grounded
+-- approach recovery above: it requires explicit source-support loss and bounded
+-- body-plane and tangent geometry, not merely a long ground-probe hit.
+function wwQualifiesLostSupportWallEdgeFloorHandoff(pointDistance, surfaceGap, planeGap, tangentGap, tangentLimit, sourceSupportSeen)
+    if sourceSupportSeen ~= false then return false end
+    if pointDistance > CFG.SurfaceSwitchDistance + CFG.WallEdgeFloorLostSupportPointLead then return false end
+    if surfaceGap > CFG.WallEdgeFloorLostSupportSurfaceGap then return false end
+    if planeGap > CFG.WallEdgeFloorLostSupportPlaneGap then return false end
+    if tangentGap > tangentLimit + CFG.WallEdgeFloorLostSupportTangentExtra then return false end
+    return true
+end
+]=] },
     { name = '01_guardTransitionOutwardVelocity', source = [=[function guardTransitionOutwardVelocity()
     if not root or not customActive or jumped then return end
     if os.clock() >= orientationTransitionUntil then return end
@@ -340,6 +1286,8 @@ transitionMoveCandidate =  nil
 end
 gravitySwitchBackUp =  nil
 gravitySwitchBackAt =  0
+ceilingToWallLock = nil
+floorToWallLock = nil
 safetySupportPoint =  nil
 safetySupportNormal =  nil
 safetySupportDistance =  nil
@@ -595,11 +1543,55 @@ end
     return true
 end
 ]=] },
-    { name = '11_updateAnimations', source = [=[function updateAnimations(moving, grounded, speed)
+    { name = '11_updateAnimations', source = [=[local filteredLocomotionSpeed = nil
+
+local function stopWallWalkLocomotion(fade)
+    if activeLocomotion ~= nil then
+        stopGroup(animationTracks.Walk, fade)
+        stopGroup(animationTracks.Run, fade)
+        activeLocomotion = nil
+    end
+    filteredLocomotionSpeed = nil
+end
+
+local function ensureLocomotionTrack(track, fade, smallWeight)
+    if not track then return false end
+
+    local targetWeight = track.WeightTarget
+    local needsStart = not track.IsPlaying or targetWeight <= 0.00001
+    if needsStart then
+        pcall(function()
+            track:Play(fade, smallWeight, 1)
+        end)
+    end
+    return needsStart
+end
+
+local function setLocomotionWeight(track, weight, fade)
+    if not track or not track.IsPlaying then return end
+    local targetWeight = track.WeightTarget
+    if targetWeight == nil or math.abs(targetWeight - weight) > 0.015 then
+        pcall(function()
+            track:AdjustWeight(weight, fade)
+        end)
+    end
+end
+
+local function setLocomotionSpeed(track, speed)
+    if not track or not track.IsPlaying then return end
+    local currentSpeed = track.Speed
+    if currentSpeed == nil or math.abs(currentSpeed - speed) > 0.025 then
+        pcall(function()
+            track:AdjustSpeed(speed)
+        end)
+    end
+end
+
+function updateAnimations(moving, grounded, speed, deltaTime)
     if not animator then return end
 
-    -- Movement always cancels an emote. Check this BEFORE the active-emote
-    -- early-return so locomotion cannot trap the emote in place.
+    -- Movement cancels an emote. Check this before the active-emote early return
+    -- so locomotion cannot trap the emote in place.
     local movingNow = moving
     if humanoid and humanoid.MoveDirection.Magnitude > 0.05 then
         movingNow = true
@@ -608,13 +1600,10 @@ end
         cancelActiveEmote()
     end
 
-    -- Never restart WallWalk locomotion while an emote is active. Roblox
-    -- emotes normally use Action priorities, while our movement tracks use
-    -- Movement, so the emote gets full body priority without affecting physics.
+    -- Never restart locomotion while an emote is active.
     if emoteTrack and emoteTrack.IsPlaying then
-        stopTrack(activeLocomotion, 0.08)
+        stopWallWalkLocomotion(0.08)
         stopTrack(activeIdle, 0.08)
-        activeLocomotion = nil
         activeIdle = nil
         stopTrack(activeAir, 0.08)
         activeAir = nil
@@ -622,9 +1611,8 @@ end
     end
 
     if not grounded then
-        stopTrack(activeLocomotion, 0.06)
+        stopWallWalkLocomotion(0.06)
         stopTrack(activeIdle, 0.06)
-        activeLocomotion = nil
         activeIdle = nil
 
         local group = jumped and animationTracks.Jump or animationTracks.Fall
@@ -642,38 +1630,169 @@ end
     stopTrack(activeAir, 0.06)
     activeAir = nil
 
-    if not moving then
-        stopTrack(activeLocomotion, 0.08)
-        activeLocomotion = nil
+    if not movingNow then
+        -- Match the idle fade-in to the locomotion fade-out. The shorter old
+        -- fade made the gait appear to snap when custom gravity owned Animate.
+        stopWallWalkLocomotion(0.20)
         local idle = animationTracks.Idle[1]
         if idle then
             if activeIdle ~= idle then
-                stopTrack(activeIdle, 0.06)
+                stopTrack(activeIdle, 0.20)
                 activeIdle = idle
             end
-            if not idle.IsPlaying then pcall(function() idle:Play(0.08, 1, 1) end) end
+            if not idle.IsPlaying or idle.WeightTarget <= 0.00001 then
+                pcall(function() idle:Play(0.20, 1, 1) end)
+            end
         end
         return
     end
 
-    stopTrack(activeIdle, 0.06)
+    -- Cross-fade idle out over the same interval used to fade Walk/Run in.
+    stopTrack(activeIdle, 0.20)
     activeIdle = nil
 
-    local group = #animationTracks.Run > 0 and animationTracks.Run or animationTracks.Walk
-    local track = group[1]
+    local movementSpeed = CFG.WalkSpeed
+    if humanoid then
+        local liveWalkSpeed = tonumber(humanoid.WalkSpeed)
+        if liveWalkSpeed and liveWalkSpeed >= 0 then
+            movementSpeed = liveWalkSpeed
+        end
+    end
+    local speedBase = math.max(movementSpeed, 1)
+
+    local rawSpeed = math.max(0, tonumber(speed) or 0)
+    local dt = tonumber(deltaTime)
+    if not dt or dt <= 0 then
+        dt = 1 / 60
+    end
+    dt = math.min(dt, 0.1)
+
+    -- AssemblyLinearVelocity can spike while the wall controller applies
+    -- contact/adhesion corrections. Filter the measured tangent speed so one
+    -- physics sample cannot flip the locomotion blend from all-walk to all-run.
+    if filteredLocomotionSpeed == nil then
+        filteredLocomotionSpeed = rawSpeed
+    else
+        local alpha = math.clamp(dt / 0.12, 0, 1)
+        filteredLocomotionSpeed = filteredLocomotionSpeed
+            + (rawSpeed - filteredLocomotionSpeed) * alpha
+    end
+    local animationSpeed = filteredLocomotionSpeed
+
+    local walkTrack = animationTracks.Walk[1]
+    local runTrack = animationTracks.Run[1]
+    local smallWeight = 0.0001
+    local blendTime = 0.2
+
+    if walkTrack and runTrack then
+        -- Follow the default R15 Animate pattern: keep both locomotion tracks
+        -- available and cross-fade their weights rather than repeatedly
+        -- stopping and restarting the selected track.
+        local walkWasActive = walkTrack.IsPlaying and walkTrack.WeightTarget > 0.00001
+        local runWasActive = runTrack.IsPlaying and runTrack.WeightTarget > 0.00001
+        local syncPhase = nil
+
+        if walkWasActive and walkTrack.Length > 0 then
+            syncPhase = math.clamp(walkTrack.TimePosition / walkTrack.Length, 0, 1)
+        elseif runWasActive and runTrack.Length > 0 then
+            syncPhase = math.clamp(runTrack.TimePosition / runTrack.Length, 0, 1)
+        end
+
+        local walkNeedsStart = ensureLocomotionTrack(walkTrack, blendTime, smallWeight)
+        local runNeedsStart = ensureLocomotionTrack(runTrack, blendTime, smallWeight)
+
+        -- New/restarted tracks join the existing gait phase to avoid a visible
+        -- cycle reset when the blend weights change.
+        if syncPhase ~= nil then
+            if walkNeedsStart and walkTrack.Length > 0 then
+                pcall(function()
+                    walkTrack.TimePosition = syncPhase * walkTrack.Length
+                end)
+            end
+            if runNeedsStart and runTrack.Length > 0 then
+                pcall(function()
+                    runTrack.TimePosition = syncPhase * runTrack.Length
+                end)
+            end
+        elseif walkNeedsStart and runNeedsStart
+            and walkTrack.Length > 0 and runTrack.Length > 0 then
+            pcall(function()
+                runTrack.TimePosition =
+                    (walkTrack.TimePosition / walkTrack.Length) * runTrack.Length
+            end)
+        end
+
+        -- This follows the common R15 blend range: Run fades in gradually from
+        -- roughly 40% of configured WalkSpeed and reaches full weight near 73%.
+        -- Preserve WallWalk's existing per-track playback-rate tuning.
+        local normalizedRunSpeed = animationSpeed * 1.25
+            / math.max(speedBase * 0.90625, 0.01)
+        local runWeight = math.clamp((normalizedRunSpeed - 0.5) / 0.5, 0, 1)
+        local walkWeight = 1 - runWeight
+
+        local walkPlaybackSpeed = math.clamp(
+            animationSpeed / math.max(speedBase * 0.62, 0.01), 0.35, 1.4)
+        local runPlaybackSpeed = math.clamp(
+            animationSpeed / math.max(speedBase * 0.72, 0.01), 0.35, 1.4)
+
+        setLocomotionWeight(walkTrack, math.max(smallWeight, walkWeight), blendTime)
+        setLocomotionWeight(runTrack, math.max(smallWeight, runWeight), blendTime)
+        setLocomotionSpeed(walkTrack, walkPlaybackSpeed)
+        setLocomotionSpeed(runTrack, runPlaybackSpeed)
+
+        local dominantTrack = walkTrack
+        local dominantMode = "Walk"
+        if runWeight > walkWeight then
+            dominantTrack = runTrack
+            dominantMode = "Run"
+        end
+        activeLocomotion = dominantTrack
+
+        wwWallDiag("WW_ANIMATION_BLEND_STATE",
+            "dominant=" .. dominantMode
+                .. ", rawSpeed=" .. string.format("%.2f", rawSpeed)
+                .. ", filteredSpeed=" .. string.format("%.2f", animationSpeed)
+                .. ", walkWeight=" .. string.format("%.3f", walkWeight)
+                .. ", runWeight=" .. string.format("%.3f", runWeight)
+                .. ", walkPlayback=" .. string.format("%.2f", walkPlaybackSpeed)
+                .. ", runPlayback=" .. string.format("%.2f", runPlaybackSpeed)
+                .. ", walkSpeed=" .. string.format("%.2f", movementSpeed)
+                .. ", walkTrackPlaying=" .. tostring(walkTrack.IsPlaying)
+                .. ", runTrackPlaying=" .. tostring(runTrack.IsPlaying),
+            0.25
+        )
+        return
+    end
+
+    -- Fallback for characters whose Animate script provides only one locomotion
+    -- track. This path retains the existing single-track behavior.
+    local track = runTrack or walkTrack
     if not track then return end
 
     if activeLocomotion ~= track then
-        stopTrack(activeLocomotion, 0.06)
+        stopTrack(activeLocomotion, blendTime)
         activeLocomotion = track
     end
-    if not track.IsPlaying then pcall(function() track:Play(0.08, 1, 1) end) end
+    if not track.IsPlaying or track.WeightTarget <= 0.00001 then
+        pcall(function() track:Play(blendTime, 1, 1) end)
+    end
 
-    pcall(function()
-        track:AdjustSpeed(math.clamp(speed / math.max(CFG.WalkSpeed, 0.01), 0.55, 1.4))
-    end)
+    local referenceSpeed = movementSpeed
+        * (track == runTrack and 0.72 or 0.62)
+    local playbackSpeed = math.clamp(
+        animationSpeed / math.max(referenceSpeed, 0.01), 0.35, 1.4)
+    setLocomotionSpeed(track, playbackSpeed)
+
+    wwWallDiag("WW_ANIMATION_BLEND_STATE",
+        "dominant=" .. (track == runTrack and "RunOnly" or "WalkOnly")
+            .. ", rawSpeed=" .. string.format("%.2f", rawSpeed)
+            .. ", filteredSpeed=" .. string.format("%.2f", animationSpeed)
+            .. ", playback=" .. string.format("%.2f", playbackSpeed)
+            .. ", walkTrackAvailable=" .. tostring(walkTrack ~= nil)
+            .. ", runTrackAvailable=" .. tostring(runTrack ~= nil),
+        0.25
+    )
 end
-
 ]=] },
     { name = '12_installWallWalkEmoteHandler', source = [=[function installWallWalkEmoteHandler()
     if not character or not humanoid then return end
@@ -918,7 +2037,44 @@ end
 ]=] },
     { name = '15_cast', source = [=[function cast(origin, direction, length)
     if not rayParams or direction.Magnitude <= 1e-5 then return nil end
-    return workspace:Raycast(origin, direction.Unit * length, rayParams)
+
+    -- Player characters are not valid WallWalk gravity surfaces. If a ray
+    -- first hits another player's character, exclude that character and cast
+    -- again so map geometry behind them can still be detected.
+    local originalFilter = rayParams.FilterDescendantsInstances
+    local castFilter = {}
+    for i = 1, #originalFilter do
+        castFilter[#castFilter + 1] = originalFilter[i]
+    end
+
+    local unitDirection = direction.Unit
+    local result = nil
+    local attempts = 0
+
+    while attempts < 8 do
+        rayParams.FilterDescendantsInstances = castFilter
+        result = workspace:Raycast(origin, unitDirection * length, rayParams)
+        if not result then break end
+
+        local hitModel = result.Instance and result.Instance:FindFirstAncestorOfClass("Model")
+        local hitPlayer = hitModel and Players:GetPlayerFromCharacter(hitModel)
+        if not hitPlayer or hitPlayer == player then
+            break
+        end
+
+        castFilter[#castFilter + 1] = hitModel
+        attempts = attempts + 1
+    end
+
+    rayParams.FilterDescendantsInstances = originalFilter
+    if result then
+        local finalModel = result.Instance and result.Instance:FindFirstAncestorOfClass("Model")
+        local finalPlayer = finalModel and Players:GetPlayerFromCharacter(finalModel)
+        if finalPlayer and finalPlayer ~= player then
+            return nil
+        end
+    end
+    return result
 end
 ]=] },
     { name = '16_orientSurfaceNormal', source = [=[function orientSurfaceNormal(hit, rayDirection)
@@ -1514,7 +2670,2894 @@ end
     return true
 end
 ]=] },
+    { name = '24b_radial_edge_wall_acquisition', source = [=[
+-- Source-oriented forensic trace for the radial wall-acquisition path used
+-- while gravity is floor/ceiling aligned. This is diagnostic-only state.
+wwRadialEdgeForensic = nil
+wwRadialEdgeForensicLastScanAt = 0
+
+function wwBeginRadialEdgeForensicScan(oldUp, origin, moveDir, stairRiserAhead)
+    local now = os.clock()
+    if not root or now - (wwRadialEdgeForensicLastScanAt or 0) < 0.50 then
+        wwRadialEdgeForensic = nil
+        return
+    end
+    wwRadialEdgeForensicLastScanAt = now
+    wwRadialEdgeForensic = {
+        at = now,
+        sourceUp = oldUp,
+        rootPosition = origin,
+        moveDir = moveDir,
+        stairRiserAhead = stairRiserAhead == true,
+        hits = {},
+        counts = {},
+        resolver = "not-run-yet",
+        resolvedPart = nil,
+        resolvedPosition = nil,
+        resolvedNormal = nil,
+        resolvedDistance = math.huge,
+        initialAccept = nil,
+        finalAccept = nil,
+        rejection = "not-evaluated-yet",
+        maxRadialDistance = nil,
+        sideOK = nil,
+    }
+end
+
+function wwRecordRadialEdgeForensic(hit, normal, rayIndex, origin, oldUp, rayDirection, reason)
+    local scan = wwRadialEdgeForensic
+    if not scan or not hit or not hit.Instance or not normal then return end
+    scan.counts[reason] = (scan.counts[reason] or 0) + 1
+    local delta = hit.Position - origin
+    local distance = delta.Magnitude
+    local drop = -delta:Dot(oldUp)
+    local key = tostring(reason)
+    local prior = scan.hits[key]
+    if prior and prior.distance <= distance then return end
+    local rayUnit = rayDirection and safeUnit(rayDirection, ZERO) or ZERO
+    local probeOrigin = hit.Position
+    if rayUnit.Magnitude > 0.05 and type(hit.Distance) == "number" then
+        probeOrigin = hit.Position - rayUnit * hit.Distance
+    end
+    scan.hits[key] = {
+        reason = reason,
+        rayIndex = rayIndex,
+        instance = hit.Instance,
+        className = hit.Instance.ClassName,
+        position = hit.Position,
+        normal = normal,
+        rayOrigin = probeOrigin,
+        rayDirection = rayUnit,
+        rayHitDistance = hit.Distance,
+        rootDistance = distance,
+        drop = drop,
+        normalWorldUpDot = normal:Dot(UP),
+        normalSourceUpDot = normal:Dot(oldUp),
+        canCollide = nil,
+        canQuery = nil,
+    }
+    local partOk, partIsBase = pcall(function() return hit.Instance:IsA("BasePart") end)
+    if partOk and partIsBase then
+        local flagsOk, collideValue, queryValue = pcall(function()
+            return hit.Instance.CanCollide, hit.Instance.CanQuery
+        end)
+        if flagsOk then
+            scan.hits[key].canCollide = collideValue
+            scan.hits[key].canQuery = queryValue
+        end
+    end
+end
+
+function wwDescribeRadialEdgeForensicHit(item)
+    if not item then return "NONE" end
+    local path = "none"
+    if item.instance then
+        local ok, value = pcall(function() return item.instance:GetFullName() end)
+        if ok then path = tostring(value) end
+    end
+    return "reason=" .. tostring(item.reason)
+        .. ",rayIndex=" .. tostring(item.rayIndex)
+        .. ",part=" .. path
+        .. ",class=" .. tostring(item.className)
+        .. ",CanCollide=" .. tostring(item.canCollide)
+        .. ",CanQuery=" .. tostring(item.canQuery)
+        .. ",rayOrigin=" .. wwEdgeForensicVector(item.rayOrigin)
+        .. ",rayDir=" .. wwEdgeForensicVector(item.rayDirection)
+        .. ",rayHitDist=" .. string.format("%.3f", tonumber(item.rayHitDistance) or math.huge)
+        .. ",hit=" .. wwEdgeForensicVector(item.position)
+        .. ",normal=" .. wwEdgeForensicVector(item.normal)
+        .. ",normalWorldUpDot=" .. string.format("%.3f", item.normalWorldUpDot)
+        .. ",normalSourceUpDot=" .. string.format("%.3f", item.normalSourceUpDot)
+        .. ",rootPointDist=" .. string.format("%.3f", item.rootDistance)
+        .. ",sourceDrop=" .. string.format("%.3f", item.drop)
+end
+
+function wwEmitRadialEdgeForensicScan(radialState, supportSeen, transitionRoute, transitionHit, transitionNormal, transitionDistance)
+    local scan = wwRadialEdgeForensic
+    if not scan then return end
+    local clusterParts = {}
+    for _, cluster in ipairs(radialState and radialState.clusters or {}) do
+        local path = "none"
+        if cluster.bestHit and cluster.bestHit.Instance then
+            local ok, value = pcall(function() return cluster.bestHit.Instance:GetFullName() end)
+            if ok then path = tostring(value) end
+        end
+        table.insert(clusterParts, "{part=" .. path
+            .. ",samples=" .. tostring(cluster.sampleCount or 0)
+            .. ",distance=" .. string.format("%.3f", tonumber(cluster.bestDistance) or math.huge)
+            .. ",maxDrop=" .. string.format("%.3f", tonumber(cluster.maxDrop) or -math.huge)
+            .. ",normal=" .. wwEdgeForensicVector(cluster.bestNormal) .. "}")
+    end
+    local counts = {}
+    for reason, count in pairs(scan.counts) do
+        table.insert(counts, tostring(reason) .. ":" .. tostring(count))
+    end
+    table.sort(counts)
+    local resolved = "NONE"
+    if scan.resolvedPart then
+        local ok, value = pcall(function() return scan.resolvedPart:GetFullName() end)
+        if ok then resolved = tostring(value) end
+    end
+    local function describeHit(hit)
+        if not hit or not hit.Instance then return "NONE" end
+        local path = "none"
+        local ok, value = pcall(function() return hit.Instance:GetFullName() end)
+        if ok then path = tostring(value) end
+        return path .. "@" .. wwEdgeForensicVector(hit.Position)
+    end
+    local detail = "sourceUp=" .. wwEdgeForensicVector(scan.sourceUp)
+        .. ",root=" .. wwEdgeForensicVector(scan.rootPosition)
+        .. ",moveDir=" .. wwEdgeForensicVector(scan.moveDir)
+        .. ",stairRiserAhead=" .. tostring(scan.stairRiserAhead)
+        .. ",supportSeen=" .. tostring(supportSeen == true)
+        .. ",clusterCount=" .. tostring(radialState and #radialState.clusters or 0)
+        .. ",clusters=" .. table.concat(clusterParts, ";")
+        .. ",rawGateCounts=" .. table.concat(counts, ";")
+        .. ",nearestByGate={"
+    local gates = {}
+    for reason, item in pairs(scan.hits) do
+        table.insert(gates, "[" .. tostring(reason) .. "]=" .. wwDescribeRadialEdgeForensicHit(item))
+    end
+    table.sort(gates)
+    detail = detail .. table.concat(gates, " | ") .. "}"
+        .. ",resolver=" .. tostring(scan.resolver)
+        .. ",resolved=" .. resolved
+        .. ",resolvedPos=" .. wwEdgeForensicVector(scan.resolvedPosition)
+        .. ",resolvedNormal=" .. wwEdgeForensicVector(scan.resolvedNormal)
+        .. ",resolvedDist=" .. string.format("%.3f", tonumber(scan.resolvedDistance) or math.huge)
+        .. ",initialAccept=" .. tostring(scan.initialAccept)
+        .. ",finalAccept=" .. tostring(scan.finalAccept)
+        .. ",rejectReason=" .. tostring(scan.rejection)
+        .. ",maxRadialDist=" .. tostring(scan.maxRadialDistance)
+        .. ",sideOK=" .. tostring(scan.sideOK)
+        .. ",transitionRoute=" .. tostring(transitionRoute or "none")
+        .. ",transitionHit=" .. describeHit(transitionHit)
+        .. ",transitionNormal=" .. wwEdgeForensicVector(transitionNormal)
+        .. ",transitionDist=" .. string.format("%.3f", tonumber(transitionDistance) or math.huge)
+        .. ",physicalEdgeDiscontinuity=not-directly-measured-by-this-radial-detector"
+    wwWallDiag("RADIAL_EDGE_SOURCE_FORENSIC", detail, 0.50)
+    wwRadialEdgeForensic = nil
+end
+
+function registerRadialEdgeWallHit(state, hit, normal, rayIndex, origin, oldUp, rayDirection)
+    if not state or not hit or not normal then return end
+    if math.abs(normal:Dot(UP)) >= CFG.StairRiserGravityVerticalDot then
+        pcall(wwRecordRadialEdgeForensic, hit, normal, rayIndex, origin, oldUp, rayDirection, "rejected-horizontal-normal")
+        return
+    end
+    if math.abs(oldUp:Dot(normal)) >= CFG.TransitionWallDot then
+        pcall(wwRecordRadialEdgeForensic, hit, normal, rayIndex, origin, oldUp, rayDirection, "rejected-normal-aligned-to-source")
+        return
+    end
+
+    local delta = hit.Position - origin
+    local distance = delta.Magnitude
+    if distance > CFG.RadialEdgeWallMaxDistance then
+        pcall(wwRecordRadialEdgeForensic, hit, normal, rayIndex, origin, oldUp, rayDirection, "rejected-too-far")
+        return
+    end
+
+    local drop = -delta:Dot(oldUp)
+    if drop < CFG.RadialEdgeWallMinDrop then
+        pcall(wwRecordRadialEdgeForensic, hit, normal, rayIndex, origin, oldUp, rayDirection, "rejected-insufficient-source-drop")
+        return
+    end
+
+    -- Do not flip a back-facing hit. A ray can see the far side of a wall
+    -- before the character has actually reached that face.
+    local horizontalDelta = delta - oldUp * delta:Dot(oldUp)
+    local candidateNormal = safeUnit(normal, UP)
+    if horizontalDelta.Magnitude > 0.10 then
+        if candidateNormal:Dot(horizontalDelta) > 0.10 then
+            pcall(wwRecordRadialEdgeForensic, hit, normal, rayIndex, origin, oldUp, rayDirection, "rejected-back-facing")
+            return
+        end
+    end
+    pcall(wwRecordRadialEdgeForensic, hit, normal, rayIndex, origin, oldUp, rayDirection, "registered-into-cluster")
+
+    local cluster = nil
+    for _, item in ipairs(state.clusters) do
+        if item.normal:Dot(candidateNormal) >= CFG.RadialEdgeWallNormalDot then
+            cluster = item
+            break
+        end
+    end
+
+    if not cluster then
+        cluster = {
+            normal = candidateNormal,
+            samples = {},
+            sampleCount = 0,
+            bestHit = hit,
+            bestNormal = candidateNormal,
+            bestDistance = distance,
+            maxDrop = drop,
+        }
+        table.insert(state.clusters, cluster)
+    end
+
+    -- Store the latest hit per radial ray index, not only a boolean. The
+    -- resolver revalidates its distance/drop from the current root position.
+    cluster.samples[rayIndex] = {
+        hit = hit,
+        normal = candidateNormal,
+        time = os.clock(),
+    }
+end
+
+function pruneRadialEdgeWallState(state, oldUp)
+    if not state or not root then return end
+
+    local now = os.clock()
+    for clusterIndex = #state.clusters, 1, -1 do
+        local cluster = state.clusters[clusterIndex]
+        cluster.sampleCount = 0
+        cluster.maxDrop = -math.huge
+        cluster.bestDistance = math.huge
+        cluster.bestHit = nil
+        cluster.bestNormal = nil
+
+        for rayIndex, sample in pairs(cluster.samples) do
+            local valid = type(sample) == "table"
+                and sample.hit ~= nil
+                and now - (sample.time or 0) <= CFG.RadialEdgeWallEvidenceWindow
+
+            if valid then
+                local delta = sample.hit.Position - root.Position
+                local distance = delta.Magnitude
+                local drop = -delta:Dot(oldUp)
+                valid = distance <= CFG.RadialEdgeWallMaxDistance
+                    and drop >= CFG.RadialEdgeWallMinDrop
+
+                if valid then
+                    cluster.sampleCount = cluster.sampleCount + 1
+                    if drop > cluster.maxDrop then
+                        cluster.maxDrop = drop
+                    end
+                    if distance < cluster.bestDistance then
+                        cluster.bestDistance = distance
+                        cluster.bestHit = sample.hit
+                        cluster.bestNormal = sample.normal
+                    end
+                end
+            end
+
+            if not valid then
+                cluster.samples[rayIndex] = nil
+            end
+        end
+
+        if cluster.sampleCount == 0 then
+            table.remove(state.clusters, clusterIndex)
+        end
+    end
+end
+
+function hasRadialWallContinuation(hit, normal, up)
+    if not hit or not normal then return false end
+    if math.abs(normal:Dot(UP)) >= CFG.StairRiserGravityVerticalDot then return false end
+
+    -- Probe the same face above the sample without using movement direction.
+    -- A short stair riser normally ends before this height; a long wall persists.
+    local probeOrigin = hit.Position
+        + up * CFG.StairRiserContinuationHeight
+        + normal * 0.10
+    local highHit = cast(probeOrigin, -normal, CFG.StairRiserContinuationLength)
+    if not highHit then return false end
+
+    local highNormal = orientSurfaceNormal(highHit, -normal)
+    if not highNormal then return false end
+    return math.abs(highNormal:Dot(normal)) >= 0.75
+end
+
+function resolveRadialEdgeWall(state, oldUp, moveDir, stairRiserAhead)
+    if not state then return nil, nil, math.huge end
+    if stairRiserAhead then return nil, nil, math.huge end
+
+    pruneRadialEdgeWallState(state, oldUp)
+    local chosen = nil
+    local twoSampleFallback = nil
+    for _, cluster in ipairs(state.clusters) do
+        if cluster.sampleCount >= CFG.RadialEdgeWallMinSamples then
+            if not chosen or cluster.bestDistance < chosen.bestDistance then
+                chosen = cluster
+            end
+        elseif cluster.sampleCount >= 2 then
+            if not twoSampleFallback or cluster.bestDistance < twoSampleFallback.bestDistance then
+                twoSampleFallback = cluster
+            end
+        end
+    end
+
+    -- A two-ray cluster is permitted only if it either continues above the
+    -- ordinary step height, or the hit evidence already spans that much drop.
+    if not chosen and twoSampleFallback then
+        local hit = twoSampleFallback.bestHit
+        local normal = twoSampleFallback.bestNormal
+        local tallEnough = twoSampleFallback.maxDrop >= CFG.StairRiserContinuationHeight + 0.15
+        if tallEnough or hasRadialWallContinuation(hit, normal, oldUp) then
+            chosen = twoSampleFallback
+        end
+    end
+
+    if not chosen or not chosen.bestHit or not chosen.bestNormal then
+        return nil, nil, math.huge
+    end
+    if chosen.maxDrop < CFG.RadialEdgeWallMinDrop then
+        return nil, nil, math.huge
+    end
+
+    -- Keep cached stair-traversal ownership protection, but never require a
+    -- move direction merely to observe a wall under the edge.
+    if moveDir and moveDir.Magnitude > 0.05 then
+        if isOwnedStairRiserHit(chosen.bestHit, chosen.bestNormal, oldUp, moveDir) then
+            return nil, nil, math.huge
+        end
+    end
+
+    return safeUnit(chosen.bestNormal, oldUp), chosen.bestHit, chosen.bestDistance
+end
+]=] },
+    { name = '24c_floor_wall_edge_transition_timing', source = [=[function getEdgeWallContactDistance(referenceHit, referenceNormal, up, maxDistance)
+    if not root or not referenceHit or not referenceHit.Instance then
+        return math.huge
+    end
+
+    local normal = safeUnit(referenceNormal, UP)
+    local bestDistance = math.huge
+
+    -- Sample across the body's height so a downward fan hit does not have to
+    -- be physically close to the root's exact 3D point. Every accepted sample
+    -- must ray-hit the wall plane itself at the current character height.
+    for _, heightOffset in ipairs(CFG.EdgeTransitionProbeOffsets) do
+        local probeOrigin = root.Position + up * heightOffset
+        local contactHit = cast(probeOrigin, -normal, maxDistance)
+
+        if contactHit and contactHit.Instance then
+            local contactNormal = orientSurfaceNormal(contactHit, -normal)
+            if contactNormal and contactNormal:Dot(normal) >= 0.80 then
+                local planeOffset = math.abs(
+                    (contactHit.Position - referenceHit.Position):Dot(normal)
+                )
+                local samePart = contactHit.Instance == referenceHit.Instance
+
+                -- Also permit separate, coplanar wall parts, but reject a
+                -- different parallel wall that merely lies along the same ray.
+                if samePart or planeOffset <= 0.65 then
+                    if contactHit.Distance < bestDistance then
+                        bestDistance = contactHit.Distance
+                    end
+                end
+            end
+        end
+    end
+
+    return bestDistance
+end
+
+function updateFloorWallEdgeTransition(candidateHit, candidateNormal, oldUp, moveDir, allowFastLead, routeName, moveMagnitude)
+    if not root then
+        edgeTransitionPending = nil
+        forwardTransitionPending = nil
+        return nil, nil
+    end
+
+    local route = routeName == "forward" and "forward" or "edge"
+    local now = os.clock()
+    local up = safeUnit(oldUp, UP)
+    local floorOrCeiling = math.abs(up:Dot(UP)) > 0.985
+    if not floorOrCeiling then
+        edgeTransitionPending = nil
+        forwardTransitionPending = nil
+        return nil, nil
+    end
+
+    local pending
+    if route == "forward" then
+        pending = forwardTransitionPending
+    else
+        pending = edgeTransitionPending
+    end
+
+    if candidateHit and candidateHit.Instance and candidateNormal
+        and math.abs(candidateNormal:Dot(UP)) < CFG.StairRiserGravityVerticalDot
+    then
+        -- One route owns the pending transition at a time. New evidence from
+        -- either route invalidates the other route's stale pending face.
+        if route == "forward" then
+            edgeTransitionPending = nil
+        else
+            forwardTransitionPending = nil
+        end
+        local normal = safeUnit(candidateNormal, UP)
+        local replacePending = not pending
+
+        if pending then
+            if not pending.normal or not pending.oldUp then
+                replacePending = true
+            elseif pending.oldUp:Dot(up) < 0.90 then
+                replacePending = true
+            elseif pending.normal:Dot(normal) < 0.88 then
+                replacePending = true
+            elseif pending.route ~= route then
+                replacePending = true
+            elseif now - (pending.lastSeen or 0) > CFG.EdgeTransitionPendingLifetime then
+                replacePending = true
+            end
+        end
+
+        if replacePending then
+            pending = {
+                hit = candidateHit,
+                normal = normal,
+                oldUp = up,
+                route = route,
+                lastSeen = now,
+            }
+        else
+            pending.hit = candidateHit
+            pending.normal = normal
+            pending.oldUp = up
+            pending.route = route
+            pending.lastSeen = now
+        end
+
+        if route == "forward" then
+            forwardTransitionPending = pending
+        else
+            edgeTransitionPending = pending
+        end
+    end
+
+    if route == "forward" then
+        pending = forwardTransitionPending
+    else
+        pending = edgeTransitionPending
+    end
+    if not pending then return nil, nil end
+
+    if not pending.hit or not pending.hit.Instance or not pending.hit.Instance.Parent
+        or not pending.normal or not pending.oldUp
+        or pending.oldUp:Dot(up) < 0.90
+        or pending.route ~= route
+        or now - (pending.lastSeen or 0) > CFG.EdgeTransitionPendingLifetime
+    then
+        if route == "forward" then
+            forwardTransitionPending = nil
+        else
+            edgeTransitionPending = nil
+        end
+        return nil, nil
+    end
+
+    local velocity = root.AssemblyLinearVelocity
+    local planarSpeed = projectOnPlane(velocity, up).Magnitude
+    local commandedSpeed = 0
+    if humanoid then
+        commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+            * math.clamp(tonumber(moveMagnitude) or 0, 0, 1)
+    end
+    local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+    local speedLead = 0
+
+    -- Speed-based surface-gap lead belongs only to classified floor/ceiling
+    -- edge -> vertical-wall-underneath routes. Ordinary forward approaches remain
+    -- fixed-gap at every speed.
+    if route == "edge" and math.abs(up:Dot(UP)) >= 0.985 then
+        speedLead = math.clamp(
+            planarSpeed * CFG.EdgeTransitionContactSpeedLead,
+            0,
+            CFG.EdgeTransitionContactSpeedLeadMax
+        )
+        if allowFastLead ~= false then
+            if up:Dot(UP) >= 0.985 then
+                -- Match the floor-edge controller's bounded, direction-qualified lead.
+                speedLead = wwGetFloorEdgeRouteLead(up, moveVector, pending.hit.Position)
+            else
+                -- Ceiling-edge lead remains unchanged.
+                local fastSpeedLead = math.clamp(
+                    (transitionSpeed - 9) * 0.1875,
+                    0,
+                    CFG.EdgeUndersideFastContactLeadMax
+                )
+                if fastSpeedLead > speedLead then
+                    speedLead = fastSpeedLead
+                end
+            end
+        end
+    end
+    -- Ray length is detection only. All forward transitions use the same physical
+    -- surface-gap acceptance; speed can widen only the dedicated edge route.
+    local contactProbeReach = CFG.TransitionProbeLength
+    local surfaceGapLimit = CFG.VerticalSurfaceContactGap
+    if route == "edge" then
+        surfaceGapLimit = surfaceGapLimit + speedLead
+    end
+    local candidateSurfaceGap = getCharacterSurfaceGap(pending.hit.Position)
+    if route == "edge" then
+        -- Keep the established speed-assisted platform-edge -> wall-underneath
+        -- route's previous candidate metric; ordinary forward routes use body parts.
+        candidateSurfaceGap = getLegacyCharacterBoundsGap(pending.hit.Position)
+    end
+    local wallDistance = getEdgeWallContactDistance(
+        pending.hit,
+        pending.normal,
+        up,
+        contactProbeReach
+    )
+
+    -- The height-spread probes can all miss a confirmed face at an edge even
+    -- though the accepted candidate itself proves that the same wall plane is
+    -- directly reachable. Use the candidate's perpendicular plane distance only
+    -- as a miss fallback, and only when the actual candidate point is also close.
+    if wallDistance == math.huge and pending.hit.Position then
+        local candidatePointDistance = (pending.hit.Position - root.Position).Magnitude
+        local candidatePlaneDistance = math.abs((root.Position - pending.hit.Position):Dot(safeUnit(pending.normal, up)))
+        -- Removed the old +1.35 hit-point allowance. The fallback must satisfy
+        -- the same body-to-surface gap as the direct contact route.
+        if candidatePlaneDistance <= contactProbeReach and candidateSurfaceGap <= surfaceGapLimit then
+            wallDistance = candidatePlaneDistance
+            wwWallDiag("PLANE_TO_WALL_CONTACT_FALLBACK",
+                "route=" .. route
+                    .. ", fromUpY=" .. string.format("%.2f", up:Dot(UP))
+                    .. ", pointDist=" .. string.format("%.2f", candidatePointDistance)
+                    .. ", planeDist=" .. string.format("%.2f", candidatePlaneDistance)
+                    .. ", surfaceGap=" .. string.format("%.2f", candidateSurfaceGap)
+                    .. ", gapLimit=" .. string.format("%.2f", surfaceGapLimit)
+                    .. ", probeReach=" .. string.format("%.2f", contactProbeReach),
+                0.35
+            )
+        end
+    end
+
+    -- Input need not point at an edge wall. The edge route can be approached
+    -- from the side, while the forward route is always contact-gated separately.
+    local hasMovement = (moveDir and moveDir.Magnitude > 0.05)
+        or velocity.Magnitude > 0.50
+
+    if hasMovement and wallDistance < math.huge and candidateSurfaceGap <= surfaceGapLimit then
+        local hit = pending.hit
+        local normal = safeUnit(pending.normal, up)
+        if route == "forward" then
+            forwardTransitionPending = nil
+        else
+            edgeTransitionPending = nil
+        end
+        transitionCandidateRoute = route
+        transitionCandidateHit = hit
+        transitionCandidateNormal = normal
+        transitionCandidateSupportGap = false
+        wwWallDiag("PLANE_TO_WALL_ROUTE_ACCEPTED",
+            "fromUpY=" .. string.format("%.2f", up:Dot(UP))
+                .. ", route=" .. route
+                .. ", dist=" .. string.format("%.2f", wallDistance)
+                .. ", probeReach=" .. string.format("%.2f", contactProbeReach)
+                .. ", surfaceGap=" .. string.format("%.2f", candidateSurfaceGap)
+                .. ", gapLimit=" .. string.format("%.2f", surfaceGapLimit),
+            0.35
+        )
+        return normal, hit
+    end
+
+    if hasMovement then
+        wwWallDiag("PLANE_TO_WALL_CONTACT_REJECTED",
+            "fromUpY=" .. string.format("%.2f", up:Dot(UP))
+                .. ", route=" .. route
+                .. ", wallDist=" .. tostring(wallDistance)
+                .. ", probeReach=" .. string.format("%.2f", contactProbeReach)
+                .. ", pointDist=" .. string.format("%.2f", (pending.hit.Position - root.Position).Magnitude)
+                .. ", surfaceGap=" .. string.format("%.2f", candidateSurfaceGap)
+                .. ", gapLimit=" .. string.format("%.2f", surfaceGapLimit)
+                .. ", moveMag=" .. string.format("%.2f", tonumber(moveMagnitude) or 0),
+            0.35
+        )
+    end
+
+    return nil, nil
+end
+]=] },
+    { name = '24d_falling_radial_wall_acquisition', source = [=[function findFallingRadialWall(oldUp)
+    if not root then return nil, nil, math.huge end
+
+    local up = safeUnit(oldUp, UP)
+    local axisA = root.CFrame.LookVector:Cross(up)
+    if axisA.Magnitude < 1e-4 then
+        axisA = root.CFrame.RightVector:Cross(up)
+    end
+    axisA = safeUnit(axisA, Vector3.xAxis)
+    local axisB = safeUnit(up:Cross(axisA), Vector3.zAxis)
+    local offsets = {-1.00, -0.35, 0.30, 0.95}
+    local clusters = {}
+
+    -- Scan around the body at four heights and twelve angles. The denser fan
+    -- reduces missed wall evidence when running moves the character several
+    -- studs between sensor updates. This fallback runs only after support is
+    -- lost, so ordinary grounded stair risers cannot claim gravity here.
+    for heightIndex, heightOffset in ipairs(offsets) do
+        local probeOrigin = root.Position + up * heightOffset
+        for i = 1, 12 do
+            local angle = math.pi * 2 * ((i - 1) / 12)
+            local direction = axisA * math.cos(angle) + axisB * math.sin(angle)
+            local hit = cast(probeOrigin, direction, 7.00)
+            if hit and hit.Instance then
+                local normal = orientSurfaceNormal(hit, direction)
+                if normal
+                    and math.abs(normal:Dot(UP)) < CFG.StairRiserGravityVerticalDot
+                    and math.abs(up:Dot(normal)) < CFG.TransitionWallDot
+                then
+                    local distance = (hit.Position - root.Position).Magnitude
+                    local cluster = nil
+                    for _, item in ipairs(clusters) do
+                        if item.normal:Dot(normal) >= 0.80 then
+                            local planeGap = math.abs((hit.Position - item.hit.Position):Dot(item.normal))
+                            if hit.Instance == item.hit.Instance or planeGap <= 0.65 then
+                                cluster = item
+                                break
+                            end
+                        end
+                    end
+                    if not cluster then
+                        cluster = {
+                            hit = hit,
+                            normal = normal,
+                            distance = distance,
+                            heights = {},
+                            count = 0,
+                            rayCount = 0,
+                            rayDirections = {},
+                        }
+                        table.insert(clusters, cluster)
+                    end
+                    if not cluster.heights[heightIndex] then
+                        cluster.heights[heightIndex] = true
+                        cluster.count = cluster.count + 1
+                    end
+                    local rayKey = tostring(i)
+                    if not cluster.rayDirections[rayKey] then
+                        cluster.rayDirections[rayKey] = true
+                        cluster.rayCount = cluster.rayCount + 1
+                    end
+                    if distance < cluster.distance then
+                        cluster.hit = hit
+                        cluster.normal = normal
+                        cluster.distance = distance
+                    end
+                end
+            end
+        end
+    end
+
+    local best = nil
+    for _, cluster in ipairs(clusters) do
+        if (cluster.count >= 2 or cluster.rayCount >= 3) and (not best or cluster.distance < best.distance) then
+            best = cluster
+        end
+    end
+    if not best then return nil, nil, math.huge end
+    return best.hit, safeUnit(best.normal, up), best.distance
+end
+]=] },
+    { name = '24e_wall_to_ceiling_acquisition', source = [=[function findWallToCeilingSurface(oldUp, moveVector, approachOnly)
+    if not root then return nil, nil end
+
+    local up = safeUnit(oldUp, UP)
+    -- This path is only for wall gravity. Floor/ceiling edge acquisition has
+    -- its own logic and must not be affected by this scan.
+    if math.abs(up:Dot(UP)) >= 0.985 then return nil, nil end
+
+    -- Detection is independent of input direction. When a player loses the
+    -- wall and begins falling, their input/velocity may point away from the
+    -- ceiling even though the ceiling is the next reachable support surface.
+
+    local side = safeUnit(up:Cross(UP), root.CFrame.RightVector)
+    local origins = {
+        root.Position,
+        root.Position + side * 0.75,
+        root.Position - side * 0.75,
+        root.Position + up * 0.45,
+        root.Position - up * 0.35,
+    }
+    local directions = {
+        UP,
+        safeUnit(UP + side * 0.30, UP),
+        safeUnit(UP - side * 0.30, UP),
+        safeUnit(UP + up * 0.20, UP),
+        safeUnit(UP - up * 0.20, UP),
+    }
+
+    local bestHit = nil
+    local bestNormal = nil
+    local bestDistance = math.huge
+    local bestSurfaceGap = math.huge
+    local confirmations = 0
+    local seenParts = {}
+
+    for _, probeOrigin in ipairs(origins) do
+        local originConfirmed = false
+        for _, direction in ipairs(directions) do
+            local velocity = root.AssemblyLinearVelocity
+            local planarSpeed = projectOnPlane(velocity, up).Magnitude
+            local commandedSpeed = 0
+            if humanoid then
+                commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+                    * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+            end
+            local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+            local probeLength = CFG.TransitionProbeLength + math.clamp(transitionSpeed * 0.10, 0, 3.00)
+            local hit = cast(probeOrigin, direction, probeLength)
+            if hit and hit.Instance then
+                local normal = orientSurfaceNormal(hit, direction)
+                if normal and normal:Dot(UP) <= -0.78 then
+                    local distance = (hit.Position - root.Position).Magnitude
+                    local surfaceGap = getCharacterSurfaceGap(hit.Position)
+                    local betterHit = false
+                    if approachOnly then
+                        betterHit = distance < bestDistance
+                    else
+                        betterHit = surfaceGap < bestSurfaceGap
+                    end
+                    if betterHit then
+                        bestHit = hit
+                        bestNormal = normal
+                        bestDistance = distance
+                        bestSurfaceGap = surfaceGap
+                    end
+                    if not originConfirmed then
+                        originConfirmed = true
+                        confirmations = confirmations + 1
+                    end
+                    seenParts[hit.Instance] = true
+                end
+            end
+        end
+    end
+
+    -- Normal wall-to-ceiling gravity acceptance is a fixed geometric gate.
+    -- Probe length may still expand at speed so a fast approach is detected,
+    -- but speed must not let a distant ceiling claim gravity early.
+    local maxCeilingHandoffDistance = CFG.SurfaceSwitchDistance
+    if approachOnly then
+        -- This special mode only protects the safety timer while actively
+        -- approaching a confirmed ceiling; it does not switch gravity.
+        local velocity = root.AssemblyLinearVelocity
+        local planarSpeed = projectOnPlane(velocity, up).Magnitude
+        local commandedSpeed = 0
+        if humanoid then
+            commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+                * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+        end
+        local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+        local maxApproachDistance = CFG.TransitionProbeLength
+            + math.clamp(transitionSpeed * 0.10, 0, 3.00) + 0.75
+        maxCeilingHandoffDistance = math.max(maxCeilingHandoffDistance, maxApproachDistance)
+    end
+    if confirmations >= 2 and bestHit and bestNormal then
+        if approachOnly then
+            -- Safety grace is still allowed to see an approaching ceiling farther
+            -- away; this path only delays safety release and does not switch gravity.
+            if bestDistance <= maxCeilingHandoffDistance then
+                return bestHit, safeUnit(bestNormal, -UP)
+            end
+        else
+            if bestSurfaceGap <= CFG.VerticalSurfaceContactGap then
+                return bestHit, safeUnit(bestNormal, -UP)
+            end
+        end
+    end
+    return nil, nil
+end
+
+-- A floor hit can be close to a climber without being the surface they are
+-- moving onto. Only allow a wall-to-floor handoff when the floor hit is ahead
+-- along the character's intended tangent movement on the current wall.
+function isWallFloorApproach(oldUp, hit, moveDir)
+    if not root or not hit or not hit.Position or not moveDir or moveDir.Magnitude <= 0.05 then
+        return false
+    end
+
+    local direction = safeUnit(projectOnPlane(moveDir, oldUp), moveDir)
+    local toFloor = hit.Position - root.Position
+
+    -- When wall gravity is active, the world floor below the player is not
+    -- the intended destination while the player is still climbing upward.
+    -- The camera-relative tangent vector can point partly toward a floor hit
+    -- near a corner, so explicitly reject this opposing vertical approach.
+    if toFloor:Dot(UP) < -0.50 and direction:Dot(UP) > 0.10 then
+        return false
+    end
+
+    return toFloor:Dot(direction) >= 0.35
+end
+
+-- Isolated v48.76.42 ceiling detector for the wall-edge -> ceiling-underside
+-- handoff. It retains the old five-origin / five-direction scan and requires hits
+-- from at least two origins. It is never used by ordinary wall-to-ceiling routes.
+function findLegacyWallEdgeCeilingSurface(oldUp, moveVector)
+    if not root then return nil, nil end
+    local up = safeUnit(oldUp, UP)
+    if math.abs(up:Dot(UP)) >= 0.985 then return nil, nil end
+
+    local side = safeUnit(up:Cross(UP), root.CFrame.RightVector)
+    local origins = {
+        root.Position,
+        root.Position + side * 0.75,
+        root.Position - side * 0.75,
+        root.Position + up * 0.45,
+        root.Position - up * 0.35,
+    }
+    local directions = {
+        UP,
+        safeUnit(UP + side * 0.30, UP),
+        safeUnit(UP - side * 0.30, UP),
+        safeUnit(UP + up * 0.20, UP),
+        safeUnit(UP - up * 0.20, UP),
+    }
+
+    local bestHit = nil
+    local bestNormal = nil
+    local bestDistance = math.huge
+    local confirmations = 0
+    for _, probeOrigin in ipairs(origins) do
+        local originConfirmed = false
+        for _, direction in ipairs(directions) do
+            local planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, up).Magnitude
+            local commandedSpeed = 0
+            if humanoid then
+                commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+            end
+            local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+            local probeLength = CFG.TransitionProbeLength
+                + math.clamp(transitionSpeed * 0.10, 0, 3.00)
+            local hit = cast(probeOrigin, direction, probeLength)
+            if hit and hit.Instance then
+                local normal = orientSurfaceNormal(hit, direction)
+                if normal and normal:Dot(UP) <= -0.78 then
+                    local distance = (hit.Position - root.Position).Magnitude
+                    if distance < bestDistance then
+                        bestHit = hit
+                        bestNormal = normal
+                        bestDistance = distance
+                    end
+                    if not originConfirmed then
+                        originConfirmed = true
+                        confirmations = confirmations + 1
+                    end
+                end
+            end
+        end
+    end
+
+    local planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, up).Magnitude
+    local commandedSpeed = 0
+    if humanoid then
+        commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+    end
+    local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+    local baseLead = math.clamp(transitionSpeed * 0.10, 0, 2.00)
+    local fastLead = math.clamp((transitionSpeed - 9) * 0.90, 0, 3.50)
+    local maxHandoffDistance = 3.25 + baseLead + fastLead
+    if confirmations >= 2 and bestHit and bestNormal and bestDistance <= maxHandoffDistance then
+        return bestHit, safeUnit(bestNormal, -UP)
+    end
+    return nil, nil
+end
+
+-- EDGE SYSTEM: while attached to a vertical wall, independently inspect the
+-- horizontal plane around the wall edge. This is not the forward-facing system:
+-- it samples world-up/world-down from a small tangent fan and only commits when
+-- the plane is near and movement, velocity, or a real support gap points to it.
+function findWallEdgeHorizontalTransition(oldUp, moveVector, currentSupportSeen)
+    if not root then return nil, nil, math.huge end
+
+    local now = os.clock()
+    local up = safeUnit(oldUp, UP)
+    if math.abs(up:Dot(UP)) >= 0.985 then
+        return nil, nil, math.huge
+    end
+
+    local worldMove = ZERO
+    if moveVector and moveVector.Magnitude > 0.05 then
+        worldMove = getWorldMove(moveVector, up)
+    end
+    local velocity = root.AssemblyLinearVelocity
+    local verticalMove = worldMove:Dot(UP)
+    local verticalVelocity = velocity:Dot(UP)
+    wwBeginEdgeForensicScan(up, moveVector, currentSupportSeen, worldMove, velocity)
+    local tangentUp = projectOnPlane(UP, up)
+    tangentUp = safeUnit(tangentUp, UP)
+    local tangentSide = projectOnPlane(root.CFrame.RightVector, up)
+    tangentSide = safeUnit(tangentSide, Vector3.xAxis)
+    local offsets = {
+        ZERO,
+        tangentUp * 0.70,
+        -tangentUp * 0.70,
+        tangentSide * 0.60,
+        -tangentSide * 0.60,
+    }
+
+    local bestHit = nil
+    local bestNormal = nil
+    local bestDistance = math.huge
+    local bestRoute = nil
+    local bestSurfaceGap = math.huge
+    local bestGapLimit = CFG.VerticalSurfaceContactGap
+    local bestPointDistance = math.huge
+    local bestPointDistanceLimit = 0
+    local bestUsedPointDistanceFallback = false
+    local bestApproachOnly = false
+    local approachFloorHit = nil
+    local approachFloorNormal = nil
+    local approachFloorDistance = math.huge
+    local approachInputToward = false
+    local approachVelocityToward = false
+
+    for _, offset in ipairs(offsets) do
+        local probeOrigin = root.Position + offset
+        local directions = {-UP, UP}
+
+        -- The old floor-edge scanner only cast straight world-down. At the foot
+        -- of a wall, the floor may begin forward of the character, so a vertical
+        -- ray can miss it until after the 0.20s safety timer releases gravity.
+        -- Add target-directed down-slanting probes for floor discovery only.
+        -- These rays are for candidate tracking; the 0.25-stud final contact gap
+        -- still decides when gravity can actually switch.
+        local floorApproachMove = projectOnPlane(worldMove, up)
+        if floorApproachMove.Magnitude <= 0.05 then
+            -- After the joystick is released, preserve a directional probe along
+            -- the actual tangent momentum instead of losing floor discovery.
+            floorApproachMove = projectOnPlane(velocity, up)
+        end
+        if floorApproachMove.Magnitude > 0.05
+            and safeUnit(floorApproachMove, ZERO):Dot(UP) <= 0.35
+        then
+            local floorMoveDirection = safeUnit(floorApproachMove, -UP)
+            table.insert(directions, safeUnit(floorMoveDirection - UP * 0.65, -UP))
+            table.insert(directions, safeUnit(floorMoveDirection - UP * 1.35, -UP))
+        end
+
+        -- A fast wall climb may reach the edge before the vertical probe sits under
+        -- the ceiling. On the centre origin only, add two upward/forward rays.
+        -- Strict ceiling-normal validation below still distinguishes an underside.
+        if offset == ZERO and (verticalMove > 0.06 or verticalVelocity > 0.50) then
+            local ceilingLateralMove = projectOnPlane(floorApproachMove, UP)
+            if ceilingLateralMove.Magnitude > 0.15 then
+                local ceilingSideDirection = safeUnit(ceilingLateralMove, ZERO)
+                table.insert(directions, safeUnit(ceilingSideDirection + UP * 0.75, UP))
+                table.insert(directions, safeUnit(ceilingSideDirection + UP * 1.50, UP))
+            end
+        end
+
+        for _, direction in ipairs(directions) do
+            local probeLength = CFG.EdgeHorizontalProbeLength
+            if direction:Dot(-UP) > 0.20 then
+                probeLength = math.max(probeLength, CFG.EdgeFloorApproachProbeLength)
+            end
+            local hit = cast(probeOrigin, direction, probeLength)
+            if hit and hit.Instance then
+                local normal = orientSurfaceNormal(hit, direction)
+                if normal then
+                    -- Classify floor by its oriented surface normal rather than
+                    -- requiring a nearly vertical ray; floor-directed probes are
+                    -- intentionally angled toward the player's movement.
+                    local floorTarget = normal:Dot(UP) >= 0.985
+                    local ceilingTarget = normal:Dot(UP) <= -0.985 and direction:Dot(UP) >= 0.45
+                    if floorTarget or ceilingTarget then
+                        local planeDistance = math.abs((root.Position - hit.Position):Dot(normal))
+                        local pointDistance = (root.Position - hit.Position).Magnitude
+                        local surfaceGap = getCharacterSurfaceGap(hit.Position)
+                        if floorTarget then
+                            surfaceGap = getBodyPartFloorContactGap(hit.Position, normal)
+                        elseif ceilingTarget then
+                            -- This is the tested wall-edge -> underneath-ceiling
+                            -- route. Preserve its previous gap metric and speed lead.
+                            surfaceGap = getLegacyCharacterBoundsGap(hit.Position)
+                        end
+                        local movingTowardTarget, inputTowardTarget, velocityTowardTarget =
+                            isMovementTowardSurfacePoint(hit.Position, up, moveVector)
+                        local hasVerticalInput = math.abs(verticalMove) > 0.06
+                        local hasVerticalVelocity = math.abs(verticalVelocity) > 0.75
+                        local movingTowardPlane = false
+                        local directionCompatible = true
+                        local edgeLead = 0
+
+                        if floorTarget then
+                            -- Floor-edge intent follows the target along the wall's
+                            -- tangent, not just world Y. This supports angled and
+                            -- camera-relative joystick movement toward the edge.
+                            movingTowardPlane = movingTowardTarget
+                            directionCompatible = movingTowardTarget
+                                or surfaceGap <= CFG.VerticalSurfaceContactGap
+                        else
+                            movingTowardPlane = (hasVerticalInput and verticalMove > 0.06)
+                                or (not hasVerticalInput and verticalVelocity > 0.50)
+                            if hasVerticalInput then
+                                directionCompatible = verticalMove > 0.06
+                            elseif hasVerticalVelocity then
+                                directionCompatible = verticalVelocity > 0.50
+                            end
+                            -- Match the wall-edge -> ceiling controller's progressive
+                            -- speed lead; upward intent/velocity is still required above.
+                            if movingTowardPlane then
+                                edgeLead = wwGetWallEdgeToCeilingSpeedLead(up, moveVector)
+                            end
+                        end
+
+                        local maxSurfaceGap = CFG.VerticalSurfaceContactGap + edgeLead
+                        local pointDistanceLimit = 0
+                        local usedPointDistanceFallback = false
+                        local floorGateInfo = nil
+                        local withinContactGap = surfaceGap <= maxSurfaceGap
+                        if floorTarget then
+                            -- Use the same floor geometry as the route controller,
+                            -- plus v42's bounded point-distance fallback for this edge only.
+                            local floorAccepted, floorContactGap, floorLegacyFallback, floorPointDistance, floorGateInfoResult =
+                                wwGetWallEdgeFloorCandidateGate(hit.Position, normal, up, moveVector)
+                            floorGateInfo = floorGateInfoResult
+                            withinContactGap = floorAccepted
+                            surfaceGap = floorContactGap
+                            pointDistance = floorPointDistance
+                            pointDistanceLimit = CFG.SurfaceSwitchDistance
+                            usedPointDistanceFallback = floorLegacyFallback
+                            maxSurfaceGap = CFG.VerticalSurfaceContactGap + 0.10
+                        elseif ceilingTarget then
+                            -- Restore the old speed-scaled edge reach only for this
+                            -- route. The later route-specific handoff uses the old point reach
+                            -- and a route-only support envelope; ordinary ceiling acquisition
+                            -- continues to use its existing fixed geometry gate.
+                            pointDistanceLimit = wwGetLegacyWallEdgeCeilingPointLimit(up)
+                            usedPointDistanceFallback = surfaceGap > maxSurfaceGap
+                                and movingTowardPlane
+                                and pointDistance <= pointDistanceLimit
+                            withinContactGap = withinContactGap or usedPointDistanceFallback
+                        end
+
+                        -- Pre-acquire the floor target while still supported so a
+                        -- one-frame support loss does not erase the destination.
+                        -- Target direction is normally required; after support is
+                        -- explicitly lost, a near floor may instead qualify through
+                        -- the bounded body/tangent fallback below.
+                        local lostSupportFloorHandoff = false
+                        if floorTarget and currentSupportSeen == false then
+                            local lostSurfaceGap, lostPlaneGap, lostTangentGap =
+                                getBodyPartFloorContactGap(hit.Position, normal)
+                            local lostTangentLimit = CFG.FloorContactTangentAllowance + 0.60
+                                + getEdgeHorizontalSpeedLead(up, moveVector)
+                            lostSupportFloorHandoff = wwQualifiesLostSupportWallEdgeFloorHandoff(
+                                pointDistance, lostSurfaceGap, lostPlaneGap, lostTangentGap,
+                                lostTangentLimit, currentSupportSeen
+                            )
+                            if lostSupportFloorHandoff then
+                                wwWallDiag("EDGE_FLOOR_LOST_SUPPORT_CANDIDATE",
+                                    "sourceSupport=false, pointDist=" .. string.format("%.2f", pointDistance)
+                                        .. ", surfaceGap=" .. string.format("%.2f", lostSurfaceGap)
+                                        .. ", planeGap=" .. string.format("%.2f", lostPlaneGap)
+                                        .. ", tangentGap=" .. string.format("%.2f", lostTangentGap)
+                                        .. ", tangentLimit=" .. string.format("%.2f", lostTangentLimit)
+                                        .. ", directionCompatible=" .. tostring(directionCompatible)
+                                        .. ", directionBypass=true",
+                                    0.25
+                                )
+                            end
+                        end
+                        local floorApproachEligible = floorTarget
+                            and planeDistance <= CFG.EdgeFloorApproachDistance
+                            and movingTowardTarget
+                        if floorApproachEligible and planeDistance < approachFloorDistance then
+                            approachFloorHit = hit
+                            approachFloorNormal = normal
+                            approachFloorDistance = planeDistance
+                            approachInputToward = inputTowardTarget
+                            approachVelocityToward = velocityTowardTarget
+                        end
+
+                        -- Only return a distant floor as an approach candidate after
+                        -- support is actually lost. The final reset still requires
+                        -- the same 0.25-stud body-part contact gap as other forward
+                        -- transitions.
+                        local extendedFloorApproach = (floorApproachEligible or lostSupportFloorHandoff)
+                            and currentSupportSeen ~= true
+                            and surfaceGap > CFG.VerticalSurfaceContactGap
+                        local routeAcceptedForensic = false
+
+                        if withinContactGap or extendedFloorApproach or lostSupportFloorHandoff then
+                            local toTarget = projectOnPlane(hit.Position - root.Position, up)
+                            local targetAhead = false
+                            if worldMove.Magnitude > 0.05 and toTarget.Magnitude > 0.05 then
+                                targetAhead = toTarget.Unit:Dot(worldMove.Unit) >= 0.20
+                            end
+
+                            local nearSupportGap = currentSupportSeen ~= true
+                                and withinContactGap
+                            local ambiguousEdgeApproach = not hasVerticalInput and not hasVerticalVelocity
+                            local accepted = lostSupportFloorHandoff
+                                or (directionCompatible
+                                    and (movingTowardPlane
+                                        or (ambiguousEdgeApproach and (targetAhead or nearSupportGap))
+                                        or extendedFloorApproach
+                                        or (floorTarget and withinContactGap)))
+                            routeAcceptedForensic = accepted
+
+                            if accepted and planeDistance < bestDistance then
+                                bestHit = hit
+                                bestNormal = normal
+                                bestDistance = planeDistance
+                                bestRoute = floorTarget and "wall-edge-to-floor" or "wall-edge-to-ceiling"
+                                bestSurfaceGap = surfaceGap
+                                bestGapLimit = maxSurfaceGap
+                                bestPointDistance = pointDistance
+                                bestPointDistanceLimit = lostSupportFloorHandoff
+                                    and (CFG.SurfaceSwitchDistance + CFG.WallEdgeFloorLostSupportPointLead)
+                                    or pointDistanceLimit
+                                bestUsedPointDistanceFallback = usedPointDistanceFallback
+                                bestApproachOnly = floorTarget and (extendedFloorApproach or lostSupportFloorHandoff)
+                            end
+                        end
+                        if wwEdgeForensicScan then
+                            wwRecordEdgeForensicHit(
+                                hit, normal, probeOrigin, direction, probeLength,
+                                floorTarget and "floor" or "ceiling",
+                                planeDistance, pointDistance, surfaceGap, maxSurfaceGap,
+                                withinContactGap, extendedFloorApproach, directionCompatible,
+                                movingTowardPlane, movingTowardTarget, inputTowardTarget,
+                                velocityTowardTarget, routeAcceptedForensic, floorGateInfo,
+                                usedPointDistanceFallback
+                            )
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- The radial probe fan can miss a broad floor directly under a character
+    -- after wall contact is lost, especially while movement is still upward along
+    -- the source wall. Use one centered world-down probe as a bounded fallback.
+    -- This only runs when the scanner has no competing target and support is false.
+    if not bestHit and currentSupportSeen == false and root then
+        local lostFloorProbeLength = CFG.SurfaceSwitchDistance + CFG.WallEdgeFloorLostSupportPointLead
+        local lostFloorHit = cast(root.Position, -UP, lostFloorProbeLength)
+        if lostFloorHit and lostFloorHit.Instance then
+            local lostFloorNormal = orientSurfaceNormal(lostFloorHit, -UP)
+            if lostFloorNormal and lostFloorNormal:Dot(UP) >= 0.985 then
+                local lostPointDistance = (lostFloorHit.Position - root.Position).Magnitude
+                local lostPlaneDistance = math.abs((root.Position - lostFloorHit.Position):Dot(lostFloorNormal))
+                local lostSurfaceGap, lostPlaneGap, lostTangentGap =
+                    getBodyPartFloorContactGap(lostFloorHit.Position, lostFloorNormal)
+                local lostTangentLimit = CFG.FloorContactTangentAllowance + 0.60
+                    + getEdgeHorizontalSpeedLead(up, moveVector)
+                local lostFloorQualified = wwQualifiesLostSupportWallEdgeFloorHandoff(
+                    lostPointDistance, lostSurfaceGap, lostPlaneGap, lostTangentGap,
+                    lostTangentLimit, currentSupportSeen
+                )
+                wwWallDiag("EDGE_FLOOR_LOST_SUPPORT_DIRECT_PROBE",
+                    "result=" .. (lostFloorQualified and "accepted" or "rejected-geometry")
+                        .. ", target=" .. wwEdgeForensicInstancePath(lostFloorHit.Instance)
+                        .. ", pointDist=" .. string.format("%.2f", lostPointDistance)
+                        .. ", planeDist=" .. string.format("%.2f", lostPlaneDistance)
+                        .. ", surfaceGap=" .. string.format("%.2f", lostSurfaceGap)
+                        .. ", planeGap=" .. string.format("%.2f", lostPlaneGap)
+                        .. ", tangentGap=" .. string.format("%.2f", lostTangentGap)
+                        .. ", tangentLimit=" .. string.format("%.2f", lostTangentLimit)
+                        .. ", directionBypass=true",
+                    0.25
+                )
+                if lostFloorQualified then
+                    bestHit = lostFloorHit
+                    bestNormal = lostFloorNormal
+                    bestDistance = lostPlaneDistance
+                    bestRoute = "wall-edge-to-floor"
+                    bestSurfaceGap = lostSurfaceGap
+                    bestGapLimit = CFG.VerticalSurfaceContactGap
+                    bestPointDistance = lostPointDistance
+                    bestPointDistanceLimit = CFG.SurfaceSwitchDistance + CFG.WallEdgeFloorLostSupportPointLead
+                    bestUsedPointDistanceFallback = false
+                    bestApproachOnly = true
+                end
+            else
+                wwWallDiag("EDGE_FLOOR_LOST_SUPPORT_DIRECT_PROBE",
+                    "result=rejected-normal, target=" .. wwEdgeForensicInstancePath(lostFloorHit.Instance)
+                        .. ", normal=" .. wwEdgeForensicVector(lostFloorNormal)
+                        .. ", directionBypass=true",
+                    0.25
+                )
+            end
+        else
+            wwWallDiag("EDGE_FLOOR_LOST_SUPPORT_DIRECT_PROBE",
+                "result=no-direct-floor-hit, probeLength=" .. string.format("%.2f", lostFloorProbeLength)
+                    .. ", sourceSupport=false",
+                0.25
+            )
+        end
+    end
+
+    wwEmitEdgeForensicScan(bestHit, bestNormal, bestRoute, bestDistance)
+
+    if approachFloorHit then
+        edgeFloorApproachHit = approachFloorHit
+        edgeFloorApproachNormal = approachFloorNormal
+        edgeFloorApproachAt = now
+        wwWallDiag("EDGE_FLOOR_APPROACH_TRACKED",
+            "planeDist=" .. string.format("%.2f", approachFloorDistance)
+                .. ", surfaceGap=" .. string.format("%.2f", (getBodyPartFloorContactGap(approachFloorHit.Position, approachFloorNormal)))
+                .. ", inputToward=" .. tostring(approachInputToward)
+                .. ", velocityToward=" .. tostring(approachVelocityToward)
+                .. ", support=" .. tostring(currentSupportSeen),
+            0.35
+        )
+    elseif bestRoute == "wall-edge-to-floor" and bestSurfaceGap <= CFG.VerticalSurfaceContactGap then
+        clearEdgeFloorApproach()
+    elseif now - (edgeFloorApproachAt or 0) > CFG.EdgeFloorApproachCandidateLifetime then
+        clearEdgeFloorApproach()
+    end
+
+    if bestHit and bestNormal then
+        wwWallDiag("EDGE_HORIZONTAL_CANDIDATE",
+            "route=" .. tostring(bestRoute)
+                .. ", dist=" .. string.format("%.2f", bestDistance)
+                .. ", surfaceGap=" .. string.format("%.2f", bestSurfaceGap)
+                .. ", maxGap=" .. string.format("%.2f", bestGapLimit)
+                .. ", pointDist=" .. string.format("%.2f", bestPointDistance)
+                .. ", pointLimit=" .. string.format("%.2f", bestPointDistanceLimit)
+                .. ", pointFallback=" .. tostring(bestUsedPointDistanceFallback)
+                .. ", approachOnly=" .. tostring(bestApproachOnly)
+                .. ", moveY=" .. string.format("%.2f", verticalMove)
+                .. ", velY=" .. string.format("%.2f", verticalVelocity)
+                .. ", support=" .. tostring(currentSupportSeen)
+                .. ", floorApproachReach=" .. string.format("%.2f", CFG.EdgeFloorApproachProbeLength),
+            0.35
+        )
+        if bestRoute == "wall-edge-to-floor" and bestApproachOnly then
+            wwWallDiag("EDGE_FLOOR_APPROACH_ONLY_CANDIDATE",
+                "qualification=approach-only-not-contact-confirmed"
+                    .. ", planeDist=" .. string.format("%.2f", bestDistance)
+                    .. ", surfaceGap=" .. string.format("%.2f", bestSurfaceGap)
+                    .. ", gapLimit=" .. string.format("%.2f", CFG.VerticalSurfaceContactGap)
+                    .. ", moveY=" .. string.format("%.2f", verticalMove)
+                    .. ", velY=" .. string.format("%.2f", verticalVelocity),
+                0.20
+            )
+        end
+        return bestHit, bestNormal, bestDistance
+    end
+
+    return nil, nil, math.huge
+end
+]=] },
+    { name = '24f_transition_route_core', source = [=[
+-- Exact-route controller core. Geometry probes supply candidates; these
+-- controllers independently decide whether each route may proceed.
+function wwIsManagedTransitionRoute(routeName)
+    return routeName == "floor-to-wall"
+        or routeName == "floor-edge-to-wall-underside"
+        or routeName == "wall-to-ceiling"
+        or routeName == "wall-edge-to-ceiling-underside"
+        or routeName == "ceiling-to-wall"
+        or routeName == "ceiling-edge-to-wall-underside"
+        or routeName == "wall-to-floor"
+        or routeName == "wall-edge-to-floor"
+end
+
+function wwClearTransitionRouteState(routeName, terminalPhase, reason, stateOverride)
+    if not routeName then return end
+    local state = stateOverride
+    if not state and transitionRouteStates then
+        state = transitionRouteStates[routeName]
+    end
+    if state then
+        wwSetTransitionPipelinePhase(state, terminalPhase or "aborted", os.clock(), reason or "route-state-cleared")
+    end
+end
+function wwResetTransitionRouteStates()
+    transitionRouteStates = {}
+    transitionResolvedRoute = nil
+end
+
+function wwGetFloorEdgeRouteLead(fromUp, moveVector, targetPoint)
+    local up = safeUnit(fromUp, UP)
+    local planarSpeed = 0
+    if root then
+        planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, up).Magnitude
+    end
+    local commandedSpeed = 0
+    if humanoid then
+        commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+            * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+    end
+    local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+    local lead = math.clamp(
+        planarSpeed * CFG.EdgeTransitionContactSpeedLead,
+        0,
+        CFG.EdgeTransitionContactSpeedLeadMax
+    )
+
+    local movingToward = false
+    local inputToward = false
+    local velocityToward = false
+    if targetPoint and root then
+        movingToward, inputToward, velocityToward =
+            isMovementTowardSurfacePoint(targetPoint, up, moveVector)
+    end
+
+    -- Direction-confirmed contact keeps its existing limit. If direction evidence
+    -- is absent, allow only a smaller near-miss cap when the floor-edge target point
+    -- is physically close; the caller still requires a real wall-plane ray hit.
+    local fastLeadLimit = CFG.EdgeUndersideFastContactLeadMax
+    local nearMissCapActive = false
+    if movingToward then
+        fastLeadLimit = CFG.FloorEdgeUndersideFastContactLeadMax
+    elseif targetPoint and root and up:Dot(UP) >= 0.985
+        and (targetPoint - root.Position).Magnitude <= CFG.FloorEdgeUndersideUndirectedNearMissPointLimit
+    then
+        fastLeadLimit = CFG.FloorEdgeUndersideUndirectedNearMissLeadMax
+        nearMissCapActive = true
+    end
+    local fastLead = math.clamp((transitionSpeed - 9) * 0.90, 0, fastLeadLimit)
+    if fastLead > lead then
+        lead = fastLead
+    end
+
+    local minLeadApplied = false
+    if movingToward and lead < CFG.FloorEdgeUndersideMinContactLead then
+        lead = CFG.FloorEdgeUndersideMinContactLead
+        minLeadApplied = true
+    end
+
+    if targetPoint and root and wwWallDiagDue("FLOOR_EDGE_UNDERSIDE_CONTACT_LEAD", 0.25) then
+        wwWallDiag("FLOOR_EDGE_UNDERSIDE_CONTACT_LEAD",
+            "directedToward=" .. tostring(movingToward)
+                .. ", inputToward=" .. tostring(inputToward)
+                .. ", velocityToward=" .. tostring(velocityToward)
+                .. ", planarSpeed=" .. string.format("%.2f", planarSpeed)
+                .. ", commandedSpeed=" .. string.format("%.2f", commandedSpeed)
+                .. ", baseLead=" .. string.format("%.2f", math.clamp(
+                    planarSpeed * CFG.EdgeTransitionContactSpeedLead, 0, CFG.EdgeTransitionContactSpeedLeadMax))
+                .. ", minLeadApplied=" .. tostring(minLeadApplied)
+                .. ", nearMissCapActive=" .. tostring(nearMissCapActive)
+                .. ", effectiveLead=" .. string.format("%.2f", lead)
+                .. ", gapLimit=" .. string.format("%.2f", CFG.VerticalSurfaceContactGap + lead)
+                .. ", candidatePointDist=" .. string.format("%.2f", (targetPoint - root.Position).Magnitude),
+            0.25
+        )
+    end
+    return lead
+end
+
+-- Progressive contact lead for wall-edge -> ceiling underside and ceiling-edge
+-- -> wall underside. It reaches 2.25 studs at WS 21, rather than hitting the cap
+-- at low speeds; normal contact rules for non-edge routes are unchanged.
+function wwGetUndersideEdgeSpeedLead(fromUp, moveVector)
+    local planarSpeed = 0
+    if root then
+        planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, safeUnit(fromUp, UP)).Magnitude
+    end
+    local commandedSpeed = 0
+    if humanoid then
+        commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+            * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+    end
+    local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+    local baseLead = math.clamp(
+        planarSpeed * CFG.EdgeTransitionContactSpeedLead,
+        0,
+        CFG.EdgeTransitionContactSpeedLeadMax
+    )
+    local fastLead = math.clamp(
+        (transitionSpeed - 9) * 0.1875,
+        0,
+        CFG.EdgeUndersideFastContactLeadMax
+    )
+    if fastLead > baseLead then
+        baseLead = fastLead
+    end
+    return baseLead
+end
+
+function wwClassifyTransitionRoute(fromUp, toUp, legacyRoute)
+    if not fromUp or not toUp then return nil end
+    if legacyRoute ~= "forward" and legacyRoute ~= "edge" then return nil end
+
+    local fromY = safeUnit(fromUp, UP):Dot(UP)
+    local toY = safeUnit(toUp, UP):Dot(UP)
+    local fromHorizontalPlane = math.abs(fromY) >= 0.985
+    -- Wall-to-ceiling acquisition already accepts underside normals well short
+    -- of perfectly horizontal. Keep floor handoffs strict, but classify a clear
+    -- underside (Y <= -0.90) as a ceiling destination so it receives the managed
+    -- route's bounded support grace instead of a short generic "forward" lease.
+    local toFloorPlane = toY >= 0.985
+    local toCeilingUnderside = toY <= -0.90
+    local toWall = math.abs(toY) < CFG.StairRiserGravityVerticalDot
+    local edgeRoute = legacyRoute == "edge"
+
+    if fromHorizontalPlane and toWall then
+        if fromY >= 0.985 then
+            if edgeRoute then return "floor-edge-to-wall-underside" end
+            return "floor-to-wall"
+        end
+        if edgeRoute then return "ceiling-edge-to-wall-underside" end
+        return "ceiling-to-wall"
+    end
+
+    if not fromHorizontalPlane and (toFloorPlane or toCeilingUnderside) then
+        if toCeilingUnderside then
+            if edgeRoute then return "wall-edge-to-ceiling-underside" end
+            return "wall-to-ceiling"
+        end
+        if edgeRoute then return "wall-edge-to-floor" end
+        return "wall-to-floor"
+    end
+
+    return nil
+end
+
+function wwRecordTransitionRoute(routeName, fromUp, toUp, hit, normal, now, gap, gapLimit)
+    if not wwIsManagedTransitionRoute(routeName) then return false end
+    if not root or not hit or not hit.Instance or not hit.Instance.Parent or not hit.Position then
+        return false
+    end
+    if not normal or safeUnit(normal, toUp):Dot(safeUnit(toUp, fromUp)) < 0.90 then
+        return false
+    end
+
+    gap = tonumber(gap) or math.huge
+    gapLimit = tonumber(gapLimit) or 0
+    if gap ~= gap or gapLimit ~= gapLimit or gap > gapLimit then
+        wwWallDiag("WW_ROUTE_CONTACT_REJECTED",
+            "route=" .. routeName
+                .. ", gap=" .. tostring(gap)
+                .. ", limit=" .. tostring(gapLimit),
+            0.15
+        )
+        return false
+    end
+
+    now = now or os.clock()
+    local state = transitionRouteStates[routeName]
+    local sourceUp = safeUnit(fromUp, UP)
+    local targetUp = safeUnit(toUp, sourceUp)
+    local targetNormal = safeUnit(normal, targetUp)
+    local sameState = state ~= nil
+        and not wwIsTerminalTransitionPhase(state.phase)
+        and state.fromUp ~= nil
+        and state.toUp ~= nil
+        and state.fromUp:Dot(sourceUp) >= 0.90
+        and state.toUp:Dot(targetUp) >= 0.90
+        and state.normal ~= nil
+        and safeUnit(state.normal, targetNormal):Dot(targetNormal) >= 0.85
+        and state.instance == hit.Instance
+        and state.point ~= nil
+        and math.abs((state.point - hit.Position):Dot(targetNormal)) <= 0.65
+        and now - (state.lastSeenAt or 0) <= CFG.EdgeTransitionPendingLifetime
+
+    if not sameState then
+        wwSupersedeTransitionPipelineStateIfUnowned(state, now, "validated-target-changed")
+        transitionRouteAttemptSequence = transitionRouteAttemptSequence + 1
+        state = {
+            route = routeName,
+            legacyRoute = (string.find(routeName, "edge", 1, true) and "edge" or "forward"),
+            attemptId = transitionRouteAttemptSequence,
+            phase = "idle",
+            fromUp = sourceUp,
+            toUp = targetUp,
+            startedAt = now,
+            firstSeenAt = now,
+            lastSeenAt = now,
+            hit = hit,
+            instance = hit.Instance,
+            point = hit.Position,
+            normal = targetNormal,
+            gap = gap,
+            gapLimit = gapLimit,
+            observations = 1,
+            lastObservedFrame = transitionPipelineSensorFrame or 0,
+            phaseHistory = {},
+        }
+        transitionRouteStates[routeName] = state
+        wwSetTransitionPipelinePhase(state, "validated", now, "route-controller-accepted")
+    else
+        state.lastSeenAt = now
+        state.hit = hit
+        state.instance = hit.Instance
+        state.point = hit.Position
+        state.normal = targetNormal
+        state.legacyRoute = (string.find(routeName, "edge", 1, true) and "edge" or "forward")
+        state.gap = gap
+        state.gapLimit = gapLimit
+        local frameToken = transitionPipelineSensorFrame or 0
+        if state.lastObservedFrame ~= frameToken then
+            state.observations = (state.observations or 0) + 1
+            state.lastObservedFrame = frameToken
+        end
+        if state.phase == "candidate" or state.phase == "idle" then
+            wwSetTransitionPipelinePhase(state, "validated", now, "route-controller-accepted")
+        end
+        -- Critical: do not downgrade queued/authorized/committed/confirming states
+        -- merely because the sensor sees the same route again.
+    end
+    return true
+end
+function wwPruneTransitionRouteStates(now)
+    if not transitionRouteStates then
+        transitionRouteStates = {}
+        return
+    end
+    now = now or os.clock()
+    for routeName, state in pairs(transitionRouteStates) do
+        local age = now - (state.lastSeenAt or state.startedAt or now)
+        local timeout = CFG.EdgeTransitionPendingLifetime
+        if routeName == "floor-to-wall" then
+            timeout = CFG.FloorToWallReturnLockMaxTime
+        elseif routeName == "ceiling-to-wall" then
+            timeout = CFG.CeilingToWallLockMaxTime
+        end
+
+        if wwIsTerminalTransitionPhase(state.phase) then
+            if now - (state.finishedAt or state.phaseChangedAt or now) > timeout then
+                transitionRouteStates[routeName] = nil
+            end
+        elseif state.phase == "committed" or state.phase == "confirming" then
+            if transitionClaim == nil then
+                wwSetTransitionPipelinePhase(state, "aborted", now, "active-claim-no-longer-exists")
+            end
+        elseif age > timeout then
+            wwSetTransitionPipelinePhase(state, "expired", now, "route-candidate-stale")
+            wwWallDiag("WW_ROUTE_STATE_EXPIRED",
+                "route=" .. routeName .. ", attempt=" .. tostring(state.attemptId)
+                    .. ", absentFor=" .. string.format("%.2f", age),
+                0
+            )
+        end
+    end
+end
+function wwControllerHitIsValid(fromUp, toUp, hit, normal)
+    if not root or not hit or not hit.Instance or not hit.Instance.Parent or not hit.Position then
+        return false
+    end
+    if not normal then return false end
+    if safeUnit(normal, toUp):Dot(safeUnit(toUp, fromUp)) < 0.90 then
+        return false
+    end
+    return true
+end
+
+function wwControllerReject(routeName, reason)
+    wwWallDiag("WW_ROUTE_CONTROLLER_REJECTED",
+        "route=" .. tostring(routeName) .. ", reason=" .. tostring(reason),
+        0.20
+    )
+    return false
+end
+]=] },
+    { name = '24f1_controller_floor_to_wall', source = [=[function wwControlFloorToWall(fromUp, toUp, legacyRoute, hit, normal, moveVector, now)
+    if fromUp:Dot(UP) < 0.985 then return wwControllerReject("floor-to-wall", "source-not-floor") end
+    if math.abs(toUp:Dot(UP)) >= CFG.StairRiserGravityVerticalDot then return wwControllerReject("floor-to-wall", "target-not-wall") end
+    if legacyRoute ~= "forward" then return wwControllerReject("floor-to-wall", "wrong-route-class") end
+    if not wwControllerHitIsValid(fromUp, toUp, hit, normal) then return wwControllerReject("floor-to-wall", "invalid-target") end
+    local gap = getCharacterSurfaceGap(hit.Position)
+    return wwRecordTransitionRoute("floor-to-wall", fromUp, toUp, hit, normal, now, gap, CFG.VerticalSurfaceContactGap)
+end
+]=] },
+    { name = '24f2_controller_floor_edge_to_wall_underside', source = [=[function wwControlFloorEdgeToWallUnderside(fromUp, toUp, legacyRoute, hit, normal, moveVector, now)
+    if fromUp:Dot(UP) < 0.985 then return wwControllerReject("floor-edge-to-wall-underside", "source-not-floor") end
+    if math.abs(toUp:Dot(UP)) >= CFG.StairRiserGravityVerticalDot then return wwControllerReject("floor-edge-to-wall-underside", "target-not-wall") end
+    if legacyRoute ~= "edge" then return wwControllerReject("floor-edge-to-wall-underside", "wrong-route-class") end
+    if not wwControllerHitIsValid(fromUp, toUp, hit, normal) then return wwControllerReject("floor-edge-to-wall-underside", "invalid-target") end
+    local gap = getLegacyCharacterBoundsGap(hit.Position)
+    local gapLimit = CFG.VerticalSurfaceContactGap + wwGetFloorEdgeRouteLead(fromUp, moveVector, hit.Position)
+    return wwRecordTransitionRoute("floor-edge-to-wall-underside", fromUp, toUp, hit, normal, now, gap, gapLimit)
+end
+]=] },
+    { name = '24f3_controller_wall_to_ceiling', source = [=[function wwControlWallToCeiling(fromUp, toUp, legacyRoute, hit, normal, moveVector, now)
+    if math.abs(fromUp:Dot(UP)) >= 0.985 then return wwControllerReject("wall-to-ceiling", "source-not-wall") end
+    if toUp:Dot(UP) > -0.90 then return wwControllerReject("wall-to-ceiling", "target-not-ceiling") end
+    if legacyRoute ~= "forward" then return wwControllerReject("wall-to-ceiling", "wrong-route-class") end
+    if not wwControllerHitIsValid(fromUp, toUp, hit, normal) then return wwControllerReject("wall-to-ceiling", "invalid-target") end
+    local gap = getCharacterSurfaceGap(hit.Position)
+    return wwRecordTransitionRoute("wall-to-ceiling", fromUp, toUp, hit, normal, now, gap, CFG.VerticalSurfaceContactGap)
+end
+]=] },
+    { name = '24f4_controller_wall_edge_to_ceiling_underside', source = [=[function wwControlWallEdgeToCeilingUnderside(fromUp, toUp, legacyRoute, hit, normal, moveVector, now)
+    if math.abs(fromUp:Dot(UP)) >= 0.985 then return wwControllerReject("wall-edge-to-ceiling-underside", "source-not-wall") end
+    if toUp:Dot(UP) > -0.90 then return wwControllerReject("wall-edge-to-ceiling-underside", "target-not-ceiling") end
+    if legacyRoute ~= "edge" then return wwControllerReject("wall-edge-to-ceiling-underside", "wrong-route-class") end
+    if not wwControllerHitIsValid(fromUp, toUp, hit, normal) then return wwControllerReject("wall-edge-to-ceiling-underside", "invalid-target") end
+    local gap = getLegacyCharacterBoundsGap(hit.Position)
+    local gapLimit = CFG.VerticalSurfaceContactGap + wwGetWallEdgeToCeilingSpeedLead(fromUp, moveVector)
+    return wwRecordTransitionRoute("wall-edge-to-ceiling-underside", fromUp, toUp, hit, normal, now, gap, gapLimit)
+end
+]=] },
+    { name = '24f5_controller_ceiling_to_wall', source = [=[function wwControlCeilingToWall(fromUp, toUp, legacyRoute, hit, normal, moveVector, now)
+    if fromUp:Dot(UP) > -0.985 then return wwControllerReject("ceiling-to-wall", "source-not-ceiling") end
+    if math.abs(toUp:Dot(UP)) >= CFG.StairRiserGravityVerticalDot then return wwControllerReject("ceiling-to-wall", "target-not-wall") end
+    if legacyRoute ~= "forward" then return wwControllerReject("ceiling-to-wall", "wrong-route-class") end
+    if not wwControllerHitIsValid(fromUp, toUp, hit, normal) then return wwControllerReject("ceiling-to-wall", "invalid-target") end
+    local gap = getCharacterSurfaceGap(hit.Position)
+    return wwRecordTransitionRoute("ceiling-to-wall", fromUp, toUp, hit, normal, now, gap, CFG.VerticalSurfaceContactGap)
+end
+]=] },
+    { name = '24f6_controller_ceiling_edge_to_wall_underside', source = [=[function wwControlCeilingEdgeToWallUnderside(fromUp, toUp, legacyRoute, hit, normal, moveVector, now)
+    if fromUp:Dot(UP) > -0.985 then return wwControllerReject("ceiling-edge-to-wall-underside", "source-not-ceiling") end
+    if math.abs(toUp:Dot(UP)) >= CFG.StairRiserGravityVerticalDot then return wwControllerReject("ceiling-edge-to-wall-underside", "target-not-wall") end
+    if legacyRoute ~= "edge" then return wwControllerReject("ceiling-edge-to-wall-underside", "wrong-route-class") end
+    if not wwControllerHitIsValid(fromUp, toUp, hit, normal) then return wwControllerReject("ceiling-edge-to-wall-underside", "invalid-target") end
+    local gap = getLegacyCharacterBoundsGap(hit.Position)
+    -- Keep the ceiling-edge contact gate progressive at higher speeds. This route
+    -- is already classified as an edge, while ordinary ceiling -> wall stays fixed-gap.
+    local gapLimit = CFG.VerticalSurfaceContactGap + wwGetUndersideEdgeSpeedLead(fromUp, moveVector)
+    return wwRecordTransitionRoute("ceiling-edge-to-wall-underside", fromUp, toUp, hit, normal, now, gap, gapLimit)
+end
+]=] },
+    { name = '24f7_controller_wall_to_floor', source = [=[function wwControlWallToFloor(fromUp, toUp, legacyRoute, hit, normal, moveVector, now)
+    if math.abs(fromUp:Dot(UP)) >= 0.985 then return wwControllerReject("wall-to-floor", "source-not-wall") end
+    if toUp:Dot(UP) < 0.985 then return wwControllerReject("wall-to-floor", "target-not-floor") end
+    if legacyRoute ~= "forward" then return wwControllerReject("wall-to-floor", "wrong-route-class") end
+    if not wwControllerHitIsValid(fromUp, toUp, hit, normal) then return wwControllerReject("wall-to-floor", "invalid-target") end
+    local unusedGap, planeGap, tangentGap = getBodyPartFloorContactGap(hit.Position, normal)
+    local planeLimit = CFG.VerticalSurfaceContactGap + 0.10
+    local tangentLimit = CFG.FloorContactTangentAllowance + 0.30
+    local movingToward = isMovementTowardSurfacePoint(hit.Position, fromUp, moveVector)
+    if planeGap > planeLimit or tangentGap > tangentLimit
+        or (tangentGap > CFG.FloorContactTangentAllowance and not movingToward)
+    then
+        wwWallDiag("WW_FLOOR_ROUTE_CONTACT_REJECTED",
+            "route=wall-to-floor, planeGap=" .. string.format("%.2f", planeGap)
+                .. ", tangentGap=" .. string.format("%.2f", tangentGap)
+                .. ", movingToward=" .. tostring(movingToward),
+            0.15
+        )
+        return false
+    end
+    wwWallDiag("WW_FLOOR_ROUTE_CONTACT_ACCEPTED",
+        "route=wall-to-floor, planeGap=" .. string.format("%.2f", planeGap)
+            .. ", tangentGap=" .. string.format("%.2f", tangentGap),
+        0.15
+    )
+    return wwRecordTransitionRoute("wall-to-floor", fromUp, toUp, hit, normal, now, planeGap, planeLimit)
+end
+]=] },
+    { name = '24f8_controller_wall_edge_to_floor', source = [=[function wwControlWallEdgeToFloor(fromUp, toUp, legacyRoute, hit, normal, moveVector, now)
+    if math.abs(fromUp:Dot(UP)) >= 0.985 then return wwControllerReject("wall-edge-to-floor", "source-not-wall") end
+    if toUp:Dot(UP) < 0.985 then return wwControllerReject("wall-edge-to-floor", "target-not-floor") end
+    if legacyRoute ~= "edge" then return wwControllerReject("wall-edge-to-floor", "wrong-route-class") end
+    if not wwControllerHitIsValid(fromUp, toUp, hit, normal) then return wwControllerReject("wall-edge-to-floor", "invalid-target") end
+    local contactAccepted, surfaceGap, planeGap, tangentGap, tangentLimit, movingToward =
+        wwGetWallEdgeFloorContact(hit.Position, normal, fromUp, moveVector)
+    local planeLimit = CFG.VerticalSurfaceContactGap + 0.10
+    if not contactAccepted then
+        wwWallDiag("WW_FLOOR_ROUTE_CONTACT_REJECTED",
+            "route=wall-edge-to-floor, contactGap=" .. string.format("%.2f", surfaceGap)
+                .. ", planeGap=" .. string.format("%.2f", planeGap)
+                .. ", tangentGap=" .. string.format("%.2f", tangentGap)
+                .. ", movingToward=" .. tostring(movingToward)
+                .. ", tangentLimit=" .. string.format("%.2f", tangentLimit),
+            0.15
+        )
+        return false
+    end
+    wwWallDiag("WW_FLOOR_ROUTE_CONTACT_ACCEPTED",
+        "route=wall-edge-to-floor, contactGap=" .. string.format("%.2f", surfaceGap)
+            .. ", planeGap=" .. string.format("%.2f", planeGap)
+            .. ", tangentGap=" .. string.format("%.2f", tangentGap)
+            .. ", tangentLimit=" .. string.format("%.2f", tangentLimit),
+        0.15
+    )
+    return wwRecordTransitionRoute("wall-edge-to-floor", fromUp, toUp, hit, normal, now, planeGap, planeLimit)
+end
+]=] },
+    { name = '24f9_transition_route_arbiter', source = [=[function wwGetTransitionRootContactLimit(claim)
+    -- Claim completion must be possible only inside the range of the same
+    -- root-centered probe used by the adhesion actuator and safety controller.
+    -- A hand/foot can brush a surface while the root is still too far away for
+    -- updateGravityAndMovement() to see it; that is not a stable handoff.
+    local reach = CFG.AdhesionProbeLength
+    local hipHeight = 0
+    if humanoid then
+        hipHeight = tonumber(humanoid.HipHeight) or 0
+    end
+    if hipHeight + 0.25 > reach then
+        reach = hipHeight + 0.25
+    end
+    if CFG.SurfaceSafetySupportDistance and reach > CFG.SurfaceSafetySupportDistance then
+        reach = CFG.SurfaceSafetySupportDistance
+    end
+    -- Keep a small margin so the next center probe is not operating exactly
+    -- on the ray-length boundary on a moving physics frame.
+    local normalLimit = math.max(0.10, reach - 0.12)
+    if legacyEdgeCeilingSupportActive and claim
+        and claim.route == "wall-edge-to-ceiling-underside" then
+        return math.max(normalLimit, CFG.LegacyWallEdgeCeilingSupportDistance)
+    end
+    return normalLimit
+end
+
+-- Root-to-plane distance alone is not a reliable contact proof for these rotated
+-- character poses: the body can touch a matching target face while the root remains
+-- about 3.25 studs away. Allow a bypass only with strict body clearance and a hit
+-- that remains on the claimed target plane. Other transitions keep the root gate.
+function wwCanConfirmTransitionByBodyContact(route, bodyGap, planeOffset)
+    if (tonumber(bodyGap) or math.huge) > CFG.VerticalSurfaceContactGap + 0.10 then
+        return false
+    end
+    if (tonumber(planeOffset) or math.huge) > 0.65 then
+        return false
+    end
+    return route == "floor-to-wall"
+        or route == "floor-edge-to-wall-underside"
+        or route == "ceiling-to-wall"
+        or route == "ceiling-edge-to-wall-underside"
+        or route == "wall-to-ceiling"
+        or route == "wall-edge-to-ceiling-underside"
+        or route == "wall-to-floor"
+        or route == "wall-edge-to-floor"
+end
+
+function wwIsTransitionTargetSupport(up, claim, point, normal, distance)
+    if not root or not claim or not claim.point or not claim.normal or not claim.instance then
+        return false
+    end
+    if not claim.instance.Parent or not point or not normal then
+        return false
+    end
+
+    local current = safeUnit(up, UP)
+    local targetNormal = safeUnit(claim.normal, current)
+    local supportNormal = safeUnit(normal, current)
+    if current:Dot(targetNormal) < CFG.SurfaceSafetySupportNormalDot then
+        return false
+    end
+    if supportNormal:Dot(targetNormal) < 0.90 then
+        return false
+    end
+
+    local maxDistance = CFG.TransitionHandoffMaxDistance
+    if claim.route == "wall-edge-to-ceiling-underside" then
+        maxDistance = CFG.WallEdgeCeilingHandoffMaxDistance
+    end
+    if (tonumber(distance) or math.huge) > maxDistance then
+        return false
+    end
+
+    local planeOffset = math.abs((point - claim.point):Dot(targetNormal))
+    if planeOffset > 0.65 then
+        return false
+    end
+
+    local bodyGap = getBodyPartSurfaceGap(point)
+    if bodyGap > CFG.VerticalSurfaceContactGap + 0.50 then
+        return false
+    end
+
+    -- This second, stricter distance is deliberately root-to-plane distance,
+    -- not hit-to-limb distance. The same physical hit can be near an extended
+    -- limb while the root remains outside the actual adhesion probe's range.
+    local rootPlaneGap = math.abs((root.Position - point):Dot(targetNormal))
+    local rootContactLimit = wwGetTransitionRootContactLimit(claim)
+    if rootPlaneGap > rootContactLimit then
+        if wwCanConfirmTransitionByBodyContact(claim.route, bodyGap, planeOffset) then
+            wwWallDiag("TRANSITION_SUPPORT_BODY_CONTACT_ROOT_BYPASS",
+                "route=" .. tostring(claim.route)
+                    .. ", bodyGap=" .. string.format("%.2f", bodyGap)
+                    .. ", rootGap=" .. string.format("%.2f", rootPlaneGap)
+                    .. ", rootLimit=" .. string.format("%.2f", rootContactLimit)
+                    .. ", planeOffset=" .. string.format("%.2f", planeOffset),
+                0.20
+            )
+            return true
+        end
+        wwWallDiag("TRANSITION_SUPPORT_WAIT_ROOT_CONTACT",
+            "route=" .. tostring(claim.route)
+                .. ", rootGap=" .. string.format("%.2f", rootPlaneGap)
+                .. ", rootLimit=" .. string.format("%.2f", rootContactLimit),
+            0.30
+        )
+        return false
+    end
+    return true
+end
+
+function wwFindTransitionTargetSupport(up, claim)
+    if not root or not claim or not claim.point or not claim.normal or not claim.instance then
+        return false, nil, nil, math.huge
+    end
+    if not claim.instance.Parent then return false, nil, nil, math.huge end
+
+    local route = claim.route
+    if route ~= "floor-edge-to-wall-underside"
+        and route ~= "floor-to-wall"
+        and route ~= "ceiling-edge-to-wall-underside"
+        and route ~= "ceiling-to-wall"
+        and route ~= "wall-edge-to-ceiling-underside"
+        and route ~= "wall-to-ceiling"
+        and route ~= "wall-edge-to-floor"
+        and route ~= "wall-to-floor"
+    then
+        return false, nil, nil, math.huge
+    end
+
+    local current = safeUnit(up, UP)
+    local targetNormal = safeUnit(claim.normal, current)
+    if current:Dot(targetNormal) < CFG.SurfaceSafetySupportNormalDot then
+        return false, nil, nil, math.huge
+    end
+
+    local reach = CFG.TransitionHandoffMaxDistance
+    if route == "wall-edge-to-ceiling-underside" then
+        reach = CFG.WallEdgeCeilingHandoffMaxDistance
+    end
+    local rootContactLimit = wwGetTransitionRootContactLimit(claim)
+    local contactLimit = CFG.VerticalSurfaceContactGap + 0.50
+
+    local tangentA = projectOnPlane(root.CFrame.RightVector, current)
+    tangentA = safeUnit(tangentA, safeUnit(current:Cross(root.CFrame.LookVector), Vector3.xAxis))
+    local tangentB = safeUnit(tangentA:Cross(current), root.CFrame.LookVector)
+    tangentB = safeUnit(projectOnPlane(tangentB, current), Vector3.zAxis)
+    local radius = CFG.SurfaceSafetyFanRadius
+    local offsets = {
+        ZERO,
+        tangentA * radius,
+        -tangentA * radius,
+        tangentB * radius,
+        -tangentB * radius,
+    }
+
+    local bestHit = nil
+    local bestNormal = nil
+    local bestDistance = math.huge
+    local bestBodyGap = math.huge
+    local bestPlaneOffset = math.huge
+    local bestRootPlaneGap = math.huge
+    local bestIsRootContact = false
+
+    for _, offset in ipairs(offsets) do
+        local probeOrigin = root.Position + offset
+        local hit = cast(probeOrigin, -current, reach)
+        if hit and hit.Instance and hit.Position then
+            local normal = orientSurfaceNormal(hit, -current)
+            if normal and normal:Dot(targetNormal) >= 0.90
+                and normal:Dot(current) >= CFG.SurfaceSafetySupportNormalDot
+            then
+                local planeOffset = math.abs((hit.Position - claim.point):Dot(targetNormal))
+                if planeOffset <= 0.65 then
+                    local bodyGap = getBodyPartSurfaceGap(hit.Position)
+                    local distance = math.abs((probeOrigin - hit.Position):Dot(normal))
+                    local rootPlaneGap = math.abs((root.Position - hit.Position):Dot(targetNormal))
+                    local bodyContactQualified = wwCanConfirmTransitionByBodyContact(
+                        route, bodyGap, planeOffset
+                    )
+                    local isRootContact = bodyGap <= contactLimit
+                        and (rootPlaneGap <= rootContactLimit or bodyContactQualified)
+                    if bodyContactQualified and rootPlaneGap > rootContactLimit then
+                        wwWallDiag("TRANSITION_SUPPORT_BODY_CONTACT_ROOT_BYPASS",
+                            "route=" .. tostring(route)
+                                .. ", bodyGap=" .. string.format("%.2f", bodyGap)
+                                .. ", rootGap=" .. string.format("%.2f", rootPlaneGap)
+                                .. ", rootLimit=" .. string.format("%.2f", rootContactLimit)
+                                .. ", planeOffset=" .. string.format("%.2f", planeOffset),
+                            0.20
+                        )
+                    end
+                    local replaceBest = false
+                    if not bestHit then
+                        replaceBest = true
+                    elseif isRootContact and not bestIsRootContact then
+                        replaceBest = true
+                    elseif isRootContact == bestIsRootContact and bodyGap < bestBodyGap then
+                        replaceBest = true
+                    end
+                    if replaceBest then
+                        bestHit = hit
+                        bestNormal = normal
+                        bestDistance = distance
+                        bestBodyGap = bodyGap
+                        bestPlaneOffset = planeOffset
+                        bestRootPlaneGap = rootPlaneGap
+                        bestIsRootContact = isRootContact
+                    end
+                end
+            end
+        end
+    end
+
+    if bestHit and bestNormal and bestIsRootContact then
+        return true, bestHit.Position, bestNormal, bestDistance
+    end
+
+    if bestHit and bestBodyGap <= contactLimit and bestRootPlaneGap > rootContactLimit then
+        wwWallDiag("TRANSITION_TARGET_SUPPORT_WAIT_ROOT_CONTACT",
+            "route=" .. tostring(route)
+                .. ", rootGap=" .. string.format("%.2f", bestRootPlaneGap)
+                .. ", rootLimit=" .. string.format("%.2f", rootContactLimit)
+                .. ", bodyGap=" .. string.format("%.2f", bestBodyGap)
+                .. ", planeOffset=" .. string.format("%.2f", bestPlaneOffset),
+            0.30
+        )
+    elseif bestHit then
+        wwWallDiag("TRANSITION_TARGET_SUPPORT_NOT_CONTACT",
+            "route=" .. tostring(route)
+                .. ", bodyGap=" .. string.format("%.2f", bestBodyGap)
+                .. ", contactLimit=" .. string.format("%.2f", contactLimit)
+                .. ", rootGap=" .. string.format("%.2f", bestDistance)
+                .. ", planeOffset=" .. string.format("%.2f", bestPlaneOffset)
+                .. ", reach=" .. string.format("%.2f", reach),
+            0.40
+        )
+    else
+        wwWallDiag("TRANSITION_TARGET_SUPPORT_PROBE_MISS",
+            "route=" .. tostring(route)
+                .. ", reach=" .. string.format("%.2f", reach)
+                .. ", pointDist=" .. string.format("%.2f", (claim.point - root.Position).Magnitude),
+            0.40
+        )
+    end
+    return false, nil, nil, math.huge
+end
+
+function wwResolveTransitionTargetSupport(up, claim, supportSeen, supportPoint, supportNormal, supportDistance)
+    if not claim then
+        return supportSeen, supportPoint, supportNormal, supportDistance
+    end
+
+    if supportSeen and wwIsTransitionTargetSupport(
+        up, claim, supportPoint, supportNormal, supportDistance
+    ) then
+        return supportSeen, supportPoint, supportNormal, supportDistance
+    end
+
+    local targetSeen, targetPoint, targetNormal, targetDistance =
+        wwFindTransitionTargetSupport(up, claim)
+    if targetSeen then
+        wwWallDiag("TRANSITION_TARGET_SUPPORT_CONFIRMED",
+            "route=" .. tostring(claim.route)
+                .. ", dist=" .. string.format("%.2f", targetDistance),
+            0.12
+        )
+        return true, targetPoint, targetNormal, targetDistance
+    end
+
+    if supportSeen and supportPoint and supportNormal then
+        local targetNormal = safeUnit(claim.normal, safeUnit(up, UP))
+        local seenNormal = safeUnit(supportNormal, targetNormal)
+        local normalDot = seenNormal:Dot(targetNormal)
+        local planeOffset = math.abs((supportPoint - claim.point):Dot(targetNormal))
+        local bodyGap = getBodyPartSurfaceGap(supportPoint)
+        wwWallDiag("TRANSITION_SUPPORT_NOT_TARGET",
+            "route=" .. tostring(claim.route)
+                .. ", dist=" .. string.format("%.2f", tonumber(supportDistance) or math.huge)
+                .. ", normalDot=" .. string.format("%.2f", normalDot)
+                .. ", planeOffset=" .. string.format("%.2f", planeOffset)
+                .. ", bodyGap=" .. string.format("%.2f", bodyGap),
+            0.40
+        )
+    end
+
+    return supportSeen, supportPoint, supportNormal, supportDistance
+end
+
+-- Shared ownership predicate: body contact alone is not a completed handoff.
+-- Keep this as a small helper to avoid adding locals to the large updateSurface function.
+function wwIsTransitionClaimSupportStable(claim, now)
+    if not claim or claim.supportSince == nil then return false end
+    now = now or os.clock()
+    return math.max(0, now - claim.supportSince) >= CFG.TransitionSupportConfirmTime
+end
+
+function wwAuthorizeTransitionCandidate(fromUp, toUp, hasCandidate, legacyRoute, hit, normal, moveVector, now)
+    now = now or os.clock()
+    transitionResolvedRoute = nil
+    wwPruneTransitionRouteStates(now)
+
+    local safeFrom = safeUnit(fromUp, UP)
+    local safeTo = safeUnit(toUp, safeFrom)
+    local routeName = wwClassifyTransitionRoute(safeFrom, safeTo, legacyRoute)
+
+    -- Expire a stale physical-transition lease before validating the new route.
+    local claim = transitionClaim
+    if claim then
+        local claimAge = now - (claim.startedAt or now)
+        local ownerValid = root ~= nil
+            and claim.instance ~= nil and claim.instance.Parent ~= nil
+            and claim.normal ~= nil and claim.point ~= nil
+            and claimAge <= (claim.grace or CFG.TransitionSupportGrace)
+        if ownerValid then
+            local ownerDistance = math.abs((root.Position - claim.point):Dot(claim.normal))
+            local ownerDistanceLimit = CFG.TransitionHandoffMaxDistance
+            if claim.route == "wall-edge-to-ceiling-underside" then
+                ownerDistanceLimit = CFG.WallEdgeCeilingHandoffMaxDistance
+            end
+            if ownerDistance > ownerDistanceLimit then ownerValid = false end
+        end
+
+        if not ownerValid then
+            wwWallDiag("WW_ROUTE_OWNER_EXPIRED",
+                "route=" .. tostring(claim.route)
+                    .. ", attempt=" .. tostring(claim.ownerAttemptId or "none")
+                    .. ", age=" .. string.format("%.2f", claimAge),
+                0
+            )
+            wwSafeTransitionAuditCall("expiry", wwRecordTransitionAuditExpiry, claim, "arbiter-owner-invalid-or-out-of-range")
+            wwFinishTransitionClaimRoute(claim, "expired", "arbiter-owner-invalid-or-out-of-range", now)
+            transitionClaim = nil
+            gravityTransitionActive = false
+            claim = nil
+        end
+    end
+
+    if not hasCandidate or not routeName then
+        return true, nil
+    end
+
+    -- Each route validates its own geometry and maintains its own timeline before
+    -- the shared arbiter decides whether the one physical commit lane is available.
+    local accepted = false
+    if routeName == "floor-to-wall" then
+        accepted = wwControlFloorToWall(safeFrom, safeTo, legacyRoute, hit, normal, moveVector, now)
+    elseif routeName == "floor-edge-to-wall-underside" then
+        accepted = wwControlFloorEdgeToWallUnderside(safeFrom, safeTo, legacyRoute, hit, normal, moveVector, now)
+    elseif routeName == "wall-to-ceiling" then
+        accepted = wwControlWallToCeiling(safeFrom, safeTo, legacyRoute, hit, normal, moveVector, now)
+    elseif routeName == "wall-edge-to-ceiling-underside" then
+        accepted = wwControlWallEdgeToCeilingUnderside(safeFrom, safeTo, legacyRoute, hit, normal, moveVector, now)
+    elseif routeName == "ceiling-to-wall" then
+        accepted = wwControlCeilingToWall(safeFrom, safeTo, legacyRoute, hit, normal, moveVector, now)
+    elseif routeName == "ceiling-edge-to-wall-underside" then
+        accepted = wwControlCeilingEdgeToWallUnderside(safeFrom, safeTo, legacyRoute, hit, normal, moveVector, now)
+    elseif routeName == "wall-to-floor" then
+        accepted = wwControlWallToFloor(safeFrom, safeTo, legacyRoute, hit, normal, moveVector, now)
+    elseif routeName == "wall-edge-to-floor" then
+        accepted = wwControlWallEdgeToFloor(safeFrom, safeTo, legacyRoute, hit, normal, moveVector, now)
+    end
+
+    if not accepted then
+        -- A failed observation must not terminate a previously queued attempt for
+        -- another target on the same route. That attempt expires on its own timer.
+        return false, routeName
+    end
+
+    local routeState = transitionRouteStates[routeName]
+    claim = transitionClaim
+    if claim then
+        local claimAge = now - (claim.startedAt or now)
+        local claimedTargetUp = safeUnit(claim.targetUp, safeFrom)
+        local targetDot = safeTo:Dot(claimedTargetUp)
+
+        if targetDot < CFG.GravitySwitchBackDot then
+            local sourceReachedClaimTarget = safeFrom:Dot(claimedTargetUp) >= 0.90
+            local claimSource = safeUnit(claim.fromUp, safeFrom)
+            local returningToClaimSource = safeTo:Dot(claimSource) >= 0.90
+
+            -- Preserve the pre-existing, narrowly scoped edge-ceiling exception.
+            local edgeCeilingReturnQualified = routeName == "wall-edge-to-ceiling-underside"
+                and legacyRoute == "edge"
+                and hit and hit.Instance and hit.Instance.Parent and hit.Position
+                and normal and safeUnit(normal, safeTo):Dot(safeTo) >= 0.90
+            local edgeCeilingReturnGuardBypass = edgeCeilingReturnQualified
+                and claimAge < CFG.TransitionReturnGuardTime
+            local directedSourceReturnQualified = false
+            if returningToClaimSource then
+                directedSourceReturnQualified = wwIsIntentionalSurfaceReturn(
+                    safeTo, moveVector, hit, normal
+                )
+            end
+            local returnGuardActive = returningToClaimSource
+                and not edgeCeilingReturnGuardBypass
+                and not directedSourceReturnQualified
+
+            if edgeCeilingReturnGuardBypass and returningToClaimSource then
+                wwWallDiag("WW_ROUTE_EDGE_RETURN_ALLOWED",
+                    "owner=" .. tostring(claim.route)
+                        .. ", candidate=" .. routeName
+                        .. ", age=" .. string.format("%.2f", claimAge),
+                    0.15
+                )
+            elseif directedSourceReturnQualified then
+                wwWallDiag("WW_ROUTE_DIRECTED_SOURCE_RETURN_ALLOWED",
+                    "owner=" .. tostring(claim.route)
+                        .. ", candidate=" .. tostring(routeName)
+                        .. ", age=" .. string.format("%.2f", claimAge),
+                    0.15
+                )
+            end
+
+            local chainAllowed = false
+            local ownerSupportStable = wwIsTransitionClaimSupportStable(claim, now)
+            -- Keep the narrow, previously existing edge-ceiling return exception.
+            -- All other cross-route takeovers wait until the current owner's target
+            -- support has completed its real stabilization interval. A single body
+            -- contact frame is not enough: it can occur during a floor->wall rotation.
+            if sourceReachedClaimTarget and routeName ~= nil and not returnGuardActive then
+                if ownerSupportStable or (edgeCeilingReturnGuardBypass
+                    and routeName == "wall-edge-to-ceiling-underside") then
+                    chainAllowed = wwIsClaimTargetPhysicallyReached(safeFrom, claim)
+                else
+                    wwWallDiag("WW_ROUTE_OWNER_SUPPORT_NOT_STABLE",
+                        "owner=" .. tostring(claim.route)
+                            .. ", candidate=" .. tostring(routeName)
+                            .. ", ownerAttempt=" .. tostring(claim.ownerAttemptId or "none")
+                            .. ", supportStableFor=" .. string.format("%.3f", claim.supportSince and math.max(0, now - claim.supportSince) or 0)
+                            .. ", required=" .. string.format("%.3f", CFG.TransitionSupportConfirmTime)
+                            .. ", ownerContactMayBeTrue=true, ownerPhase=" .. tostring(claim.leasePhase),
+                        0.12
+                    )
+                end
+            end
+
+            if chainAllowed then
+                wwWallDiag("WW_ROUTE_OWNER_CHAIN_ALLOWED",
+                    "owner=" .. tostring(claim.route)
+                        .. ", ownerAttempt=" .. tostring(claim.ownerAttemptId or "none")
+                        .. ", candidate=" .. tostring(routeName)
+                        .. ", candidateAttempt=" .. tostring(routeState and routeState.attemptId or "none")
+                        .. ", physicalContact=true, age=" .. string.format("%.2f", claimAge),
+                    0.12
+                )
+            else
+                if routeState and not wwIsTerminalTransitionPhase(routeState.phase)
+                    and routeState.phase ~= "committed" and routeState.phase ~= "confirming" then
+                    wwSetTransitionPipelinePhase(routeState, "queued", now,
+                        returnGuardActive and "waiting-for-directed-source-return" or "waiting-for-active-owner-contact")
+                end
+                local eventName = returnGuardActive
+                    and "WW_ROUTE_RETURN_GUARD_BLOCKED"
+                    or "WW_ROUTE_OWNER_BLOCKED_CANDIDATE"
+                wwWallDiag(eventName,
+                    "owner=" .. tostring(claim.route)
+                        .. ", ownerAttempt=" .. tostring(claim.ownerAttemptId or "none")
+                        .. ", candidate=" .. tostring(routeName or legacyRoute or "unknown")
+                        .. ", targetDot=" .. string.format("%.2f", targetDot)
+                        .. ", sourceReachedTarget=" .. tostring(sourceReachedClaimTarget)
+                        .. ", returningToSource=" .. tostring(returningToClaimSource)
+                        .. ", ownerContact=" .. tostring(chainAllowed)
+                        .. ", age=" .. string.format("%.2f", claimAge),
+                    0.15
+                )
+                return false, routeName
+            end
+        end
+    end
+
+    if routeState and not wwIsTerminalTransitionPhase(routeState.phase)
+        and routeState.phase ~= "committed" and routeState.phase ~= "confirming" then
+        wwSetTransitionPipelinePhase(routeState, "authorized", now, "route-valid-and-arbiter-granted")
+    end
+    transitionResolvedRoute = routeName
+    return true, routeName
+end
+]=] },
+    { name = '24fa_transition_pipeline_audit', source = [=[
+-- Observational compatibility adapter for the legacy candidate mailbox.
+-- This module does not choose routes, modify thresholds, or affect physics.
+-- Every hook is called through a fail-open wrapper so observer errors cannot
+-- interrupt updateSurface(), claim commit, or support-safety execution.
+function wwSafeTransitionAuditCall(label, callback, ...)
+    local ok, result = pcall(callback, ...)
+    if not ok then
+        transitionCandidateAuditErrorCount = transitionCandidateAuditErrorCount + 1
+        if transitionCandidateAuditErrorCount <= 3 then
+            pcall(wwWallDiag, "WW_PIPE_AUDIT_ERROR",
+                "hook=" .. tostring(label)
+                    .. ", count=" .. tostring(transitionCandidateAuditErrorCount)
+                    .. ", error=" .. string.sub(tostring(result), 1, 180),
+                0
+            )
+        end
+        if label == "capture" then
+            transitionCandidateAuditCurrent = nil
+        end
+        return nil
+    end
+    return result
+end
+
+function wwTransitionAuditFormatVector(value)
+    if not value then return "nil" end
+    return string.format("%.2f,%.2f,%.2f", value.X, value.Y, value.Z)
+end
+
+function wwTrimTransitionAuditHistory(protectedCandidateSequence)
+    local limit = transitionCandidateAuditHistoryLimit or 128
+    while transitionCandidateAuditHistoryCount > limit do
+        local sequence = transitionCandidateAuditPruneCursor or 1
+        local record = transitionCandidateAuditBySequence[sequence]
+        local activeSequence = transitionClaim and transitionClaim.auditSequence or nil
+        if record and (sequence == activeSequence or sequence == protectedCandidateSequence) then
+            transitionCandidateAuditPruneCursor = sequence + 1
+        else
+            if record then
+                transitionCandidateAuditBySequence[sequence] = nil
+                transitionCandidateAuditHistoryCount = transitionCandidateAuditHistoryCount - 1
+            end
+            transitionCandidateAuditPruneCursor = sequence + 1
+        end
+        if transitionCandidateAuditPruneCursor > transitionCandidateAuditSequence then
+            break
+        end
+    end
+end
+
+function wwCaptureTransitionCandidate(fromUp, toUp, hasCandidate, legacyRoute, hit, normal, moveVector, now)
+    if not hasCandidate then
+        transitionCandidateAuditCurrent = nil
+        return nil
+    end
+
+    now = now or os.clock()
+    local sourceUp = safeUnit(fromUp, UP)
+    local targetUp = safeUnit(toUp, sourceUp)
+    local routeName = wwClassifyTransitionRoute(sourceUp, targetUp, legacyRoute)
+    local routeKey = routeName or ("legacy-" .. tostring(legacyRoute or "unknown"))
+    local instance = hit and hit.Instance or nil
+    local point = hit and hit.Position or nil
+    local targetNormal = normal and safeUnit(normal, targetUp) or nil
+    local record = transitionCandidateAuditByRoute[routeKey]
+    local sameAttempt = record ~= nil
+        and record.phase ~= "completed"
+        and record.phase ~= "superseded"
+        and record.phase ~= "expired"
+        and record.phase ~= "aborted"
+        and now - (record.lastSeenAt or 0) <= (CFG.EdgeTransitionPendingLifetime or 0.40)
+        and record.instance == instance
+        and record.fromUp ~= nil
+        and record.fromUp:Dot(sourceUp) >= 0.985
+        and record.toUp ~= nil
+        and record.toUp:Dot(targetUp) >= 0.985
+        and ((record.normal == nil and targetNormal == nil)
+            or (record.normal ~= nil and targetNormal ~= nil
+                and record.normal:Dot(targetNormal) >= 0.985))
+
+    if not sameAttempt then
+        transitionCandidateAuditSequence = transitionCandidateAuditSequence + 1
+        record = {
+            sequence = transitionCandidateAuditSequence,
+            route = routeKey,
+            classifiedRoute = routeName,
+            legacyRoute = legacyRoute,
+            phase = "candidate",
+            firstSeenAt = now,
+            lastSeenAt = now,
+            observations = 1,
+            fromUp = sourceUp,
+            toUp = targetUp,
+            hit = hit,
+            instance = instance,
+            point = point,
+            normal = targetNormal,
+            lastDecision = nil,
+        }
+        transitionCandidateAuditByRoute[routeKey] = record
+        transitionCandidateAuditBySequence[record.sequence] = record
+        transitionCandidateAuditHistoryCount = transitionCandidateAuditHistoryCount + 1
+        wwTrimTransitionAuditHistory(record.sequence)
+        transitionCandidateAuditStats.offered = transitionCandidateAuditStats.offered + 1
+        wwWallDiag("WW_PIPE_CANDIDATE_CAPTURED",
+            "seq=" .. tostring(record.sequence)
+                .. ", route=" .. routeKey
+                .. ", legacy=" .. tostring(legacyRoute)
+                .. ", fromY=" .. string.format("%.2f", sourceUp:Dot(UP))
+                .. ", toY=" .. string.format("%.2f", targetUp:Dot(UP))
+                .. ", target=" .. tostring(instance and instance.Name or "none")
+                .. ", point=" .. wwTransitionAuditFormatVector(point)
+                .. ", normal=" .. wwTransitionAuditFormatVector(targetNormal),
+            0
+        )
+    else
+        record.lastSeenAt = now
+        record.observations = (record.observations or 0) + 1
+        record.legacyRoute = legacyRoute
+        record.hit = hit
+        record.instance = instance
+        record.point = point
+        record.normal = targetNormal
+        record.moveMagnitude = moveVector and moveVector.Magnitude or 0
+        record.toUp = targetUp
+    end
+
+    record.lastSeenAt = now
+    record.lastPoint = point
+    record.lastNormal = targetNormal
+    record.moveMagnitude = moveVector and moveVector.Magnitude or 0
+    transitionCandidateAuditCurrent = record
+    transitionCandidateAuditLatest = record
+    if routeName and wwBeginTransitionPipelineCandidate then
+        local pipelineOk, pipelineError = pcall(
+            wwBeginTransitionPipelineCandidate,
+            routeName, sourceUp, targetUp, hit, targetNormal, legacyRoute, now
+        )
+        if not pipelineOk then
+            transitionCandidateAuditErrorCount = transitionCandidateAuditErrorCount + 1
+            if transitionCandidateAuditErrorCount <= 3 then
+                pcall(wwWallDiag, "WW_PIPELINE_CANDIDATE_ERROR",
+                    "route=" .. tostring(routeName) .. ", error=" .. string.sub(tostring(pipelineError), 1, 160), 0)
+            end
+        end
+    end
+    return record
+end
+
+function wwRecordTransitionCandidateDecision(record, allowed, resolvedRoute, now)
+    if not record then return end
+    now = now or os.clock()
+    record.lastDecisionAt = now
+    record.resolvedRoute = resolvedRoute
+
+    local decision = "unmanaged"
+    if not allowed then
+        local pendingState = resolvedRoute and transitionRouteStates
+            and transitionRouteStates[resolvedRoute] or nil
+        if pendingState and pendingState.phase == "queued" then
+            decision = "queued"
+        else
+            decision = "rejected"
+        end
+    elseif wwIsManagedTransitionRoute(resolvedRoute) then
+        decision = "authorized"
+    end
+
+    -- Do not downgrade a claim that has already committed or finished.
+    if record.phase ~= "committed"
+        and record.phase ~= "confirming"
+        and record.phase ~= "completed"
+        and record.phase ~= "superseded"
+        and record.phase ~= "expired"
+        and record.phase ~= "aborted"
+    then
+        record.phase = decision
+    end
+
+    if record.lastDecision ~= decision then
+        record.lastDecision = decision
+        if decision == "authorized" then
+            transitionCandidateAuditStats.authorized = transitionCandidateAuditStats.authorized + 1
+        elseif decision == "rejected" then
+            transitionCandidateAuditStats.rejected = transitionCandidateAuditStats.rejected + 1
+        elseif decision == "queued" then
+            transitionCandidateAuditStats.queued = (transitionCandidateAuditStats.queued or 0) + 1
+        else
+            transitionCandidateAuditStats.unmanaged = transitionCandidateAuditStats.unmanaged + 1
+        end
+        wwWallDiag("WW_PIPE_CANDIDATE_" .. string.upper(decision),
+            "seq=" .. tostring(record.sequence)
+                .. ", route=" .. tostring(record.route)
+                .. ", resolved=" .. tostring(resolvedRoute)
+                .. ", legacy=" .. tostring(record.legacyRoute)
+                .. ", age=" .. string.format("%.3f", now - (record.firstSeenAt or now))
+                .. ", seen=" .. tostring(record.observations),
+            0
+        )
+    end
+end
+
+function wwTransitionAuditRouteForClaim(claim)
+    if not claim then return nil end
+    if wwIsManagedTransitionRoute(claim.route) then return claim.route end
+    return wwClassifyTransitionRoute(claim.fromUp, claim.targetUp, claim.legacyRoute)
+end
+
+function wwFindTransitionAuditRecordForClaim(claim)
+    if not claim then return nil end
+    local record = nil
+    if claim.auditSequence and transitionCandidateAuditBySequence then
+        record = transitionCandidateAuditBySequence[claim.auditSequence]
+    end
+    if record and record.instance == claim.instance then
+        return record
+    end
+    local routeKey = wwTransitionAuditRouteForClaim(claim)
+    record = routeKey and transitionCandidateAuditByRoute[routeKey] or nil
+    if record and record.instance == claim.instance then
+        return record
+    end
+    return nil
+end
+
+function wwSetTransitionAuditPhaseForClaim(claim, phase, detail)
+    if not claim then return end
+    local record = wwFindTransitionAuditRecordForClaim(claim)
+    if record then
+        claim.auditSequence = record.sequence
+        if record.phase ~= "completed" and record.phase ~= "superseded" and record.phase ~= "expired" and record.phase ~= "aborted" then
+            record.phase = phase
+            record.phaseAt = os.clock()
+            record.phaseDetail = detail
+        end
+    end
+end
+
+function wwRecordTransitionAuditCommit(claim)
+    if not claim then return end
+    local record = wwFindTransitionAuditRecordForClaim(claim)
+    if record then claim.auditSequence = record.sequence end
+    transitionCandidateAuditStats.committed = transitionCandidateAuditStats.committed + 1
+    wwSetTransitionAuditPhaseForClaim(claim, "committed", "gravity-side-changed")
+    wwWallDiag("WW_PIPE_COMMIT",
+        "seq=" .. tostring(claim.auditSequence or "unlinked")
+            .. ", route=" .. tostring(claim.route)
+            .. ", target=" .. tostring(claim.instance and claim.instance.Name or "none")
+            .. ", age=" .. string.format("%.3f", os.clock() - (claim.startedAt or os.clock()))
+            .. ", grace=" .. string.format("%.3f", tonumber(claim.grace) or 0)
+            .. ", point=" .. wwTransitionAuditFormatVector(claim.point)
+            .. ", normal=" .. wwTransitionAuditFormatVector(claim.normal),
+        0
+    )
+end
+
+function wwRecordTransitionAuditClaimReplacement(oldClaim, newRoute, newUp, now)
+    if not oldClaim then return end
+    now = now or os.clock()
+    transitionCandidateAuditStats.claimReplacements = transitionCandidateAuditStats.claimReplacements + 1
+    wwSetTransitionAuditPhaseForClaim(oldClaim, "superseded", "new-claim-before-confirmation")
+    local stable = 0
+    if oldClaim.supportSince then stable = math.max(0, now - oldClaim.supportSince) end
+    local oldTargetDot = -1
+    if oldClaim.targetUp and newUp then
+        oldTargetDot = safeUnit(oldClaim.targetUp, UP):Dot(safeUnit(newUp, UP))
+    end
+    wwWallDiag("WW_PIPE_CLAIM_REPLACED_BEFORE_CONFIRMATION",
+        "seq=" .. tostring(oldClaim.auditSequence or "unlinked")
+            .. ", old=" .. tostring(oldClaim.route)
+            .. ", new=" .. tostring(newRoute)
+            .. ", oldAge=" .. string.format("%.3f", now - (oldClaim.startedAt or now))
+            .. ", oldStable=" .. string.format("%.3f", stable)
+            .. ", newTargetDot=" .. string.format("%.3f", oldTargetDot)
+            .. ", oldTarget=" .. tostring(oldClaim.instance and oldClaim.instance.Name or "none"),
+        0
+    )
+end
+
+function wwRecordTransitionAuditCompletion(claim, supportDistance, stableDuration)
+    if not claim then return end
+    transitionCandidateAuditStats.completed = transitionCandidateAuditStats.completed + 1
+    wwSetTransitionAuditPhaseForClaim(claim, "completed", "stable-target-support")
+    wwWallDiag("WW_PIPE_COMPLETED",
+        "seq=" .. tostring(claim.auditSequence or "unlinked")
+            .. ", route=" .. tostring(claim.route)
+            .. ", stable=" .. string.format("%.3f", tonumber(stableDuration) or 0)
+            .. ", supportDist=" .. string.format("%.3f", tonumber(supportDistance) or math.huge),
+        0
+    )
+end
+
+function wwRecordTransitionAuditExpiry(claim, reason)
+    if not claim then return end
+    transitionCandidateAuditStats.expired = transitionCandidateAuditStats.expired + 1
+    wwSetTransitionAuditPhaseForClaim(claim, "expired", reason or "expired")
+    wwWallDiag("WW_PIPE_EXPIRED",
+        "seq=" .. tostring(claim.auditSequence or "unlinked")
+            .. ", route=" .. tostring(claim.route)
+            .. ", reason=" .. tostring(reason or "expired")
+            .. ", age=" .. string.format("%.3f", os.clock() - (claim.startedAt or os.clock()))
+            .. ", target=" .. tostring(claim.instance and claim.instance.Name or "none"),
+        0
+    )
+end
+
+
+function wwRecordTransitionAuditAbort(claim, reason)
+    if not claim then return end
+    transitionCandidateAuditStats.aborted = transitionCandidateAuditStats.aborted + 1
+    wwSetTransitionAuditPhaseForClaim(claim, "aborted", reason or "claim-cleared-without-completion")
+    wwWallDiag("WW_PIPE_ABORTED",
+        "seq=" .. tostring(claim.auditSequence or "unlinked")
+            .. ", route=" .. tostring(claim.route)
+            .. ", reason=" .. tostring(reason or "claim-cleared-without-completion")
+            .. ", age=" .. string.format("%.3f", os.clock() - (claim.startedAt or os.clock()))
+            .. ", target=" .. tostring(claim.instance and claim.instance.Name or "none"),
+        0
+    )
+end
+]=] },
+    { name = '24fb_independent_transition_pipelines', source = [=[
+-- v48.76.97: route-owned attempt timelines with one physical commit owner.
+-- Geometry and route thresholds remain in the existing route controllers.
+transitionRouteAttemptSequence = transitionRouteAttemptSequence or 0
+transitionCommitSequence = transitionCommitSequence or 0
+transitionRoutePhaseHistoryLimit = 12
+transitionRouteHistoryLimit = 8
+transitionRouteHistory = transitionRouteHistory or {}
+
+function wwIsTerminalTransitionPhase(phase)
+    return phase == "completed"
+        or phase == "expired"
+        or phase == "aborted"
+        or phase == "superseded"
+        or phase == "failed"
+end
+
+function wwArchiveTransitionPipelineState(state, phase, now)
+    if not state or state.historyArchived then return end
+    local routeName = state.route or "unknown"
+    local history = transitionRouteHistory[routeName]
+    if not history then
+        history = {}
+        transitionRouteHistory[routeName] = history
+    end
+    table.insert(history, {
+        route = routeName,
+        attemptId = state.attemptId,
+        phase = phase,
+        startedAt = state.startedAt,
+        finishedAt = now,
+        fromUp = state.fromUp,
+        toUp = state.toUp,
+        instance = state.instance,
+        point = state.point,
+        normal = state.normal,
+        observations = state.observations or 0,
+        phaseHistory = state.phaseHistory,
+        rejectReason = state.rejectReason,
+        finishDetail = state.lastPhaseDetail,
+    })
+    while #history > transitionRouteHistoryLimit do
+        table.remove(history, 1)
+    end
+    state.historyArchived = true
+end
+
+function wwSetTransitionPipelinePhase(state, phase, now, detail)
+    if not state or not phase then return false end
+    now = now or os.clock()
+    local previous = state.phase or "idle"
+    if wwIsTerminalTransitionPhase(previous) then return false end
+    if previous == phase then
+        state.lastPhaseDetail = detail or state.lastPhaseDetail
+        return false
+    end
+
+    state.phase = phase
+    state.phaseChangedAt = now
+    state.lastPhaseDetail = detail
+
+    if not state.phaseHistory then state.phaseHistory = {} end
+    if #state.phaseHistory >= transitionRoutePhaseHistoryLimit then
+        table.remove(state.phaseHistory, 1)
+    end
+    table.insert(state.phaseHistory, {
+        phase = phase,
+        previous = previous,
+        at = now,
+        detail = detail,
+    })
+
+    local terminal = wwIsTerminalTransitionPhase(phase)
+    if terminal then
+        state.finishedAt = now
+        wwArchiveTransitionPipelineState(state, phase, now)
+    end
+    local phaseLogKey = tostring(state.route or "unknown") .. ":" .. tostring(phase)
+    local lastRoutePhaseLog = wwTransitionPhaseLogAt[phaseLogKey] or 0
+    local transientPhase = phase == "candidate" or phase == "validated"
+    local logAllowed = terminal or not transientPhase
+        or now - lastRoutePhaseLog >= 0.30
+    if logAllowed then
+        state.lastPhaseLogAt = now
+        if transientPhase then
+            wwTransitionPhaseLogAt[phaseLogKey] = now
+        end
+        wwWallDiag("WW_PIPELINE_PHASE",
+            "attempt=" .. tostring(state.attemptId or "none")
+                .. ", route=" .. tostring(state.route)
+                .. ", " .. tostring(previous) .. "->" .. tostring(phase)
+                .. ", elapsed=" .. string.format("%.3f", math.max(0, now - (state.startedAt or now)))
+                .. ", detail=" .. tostring(detail or "none"),
+            0
+        )
+    end
+    return true
+end
+
+function wwSetTransitionRoutePhase(routeName, phase, now, detail, stateOverride)
+    local state = stateOverride
+    if not state and transitionRouteStates then
+        state = transitionRouteStates[routeName]
+    end
+    if not state then return false end
+    return wwSetTransitionPipelinePhase(state, phase, now, detail)
+end
+
+function wwSupersedeTransitionPipelineStateIfUnowned(state, now, reason)
+    if not state or wwIsTerminalTransitionPhase(state.phase) then return false end
+    if transitionClaim and transitionClaim.pipelineState == state then return false end
+    return wwSetTransitionPipelinePhase(state, "superseded", now or os.clock(), reason or "replaced-by-new-attempt")
+end
+
+function wwObserveTransitionPipelineCandidate(fromUp, toUp, legacyRoute, hit, normal, now)
+    local routeName = wwClassifyTransitionRoute(fromUp, toUp, legacyRoute)
+    if not routeName then return nil end
+    local ok, state = pcall(wwBeginTransitionPipelineCandidate,
+        routeName, fromUp, toUp, hit, normal, legacyRoute, now or os.clock())
+    if not ok then
+        transitionCandidateAuditErrorCount = (transitionCandidateAuditErrorCount or 0) + 1
+        if transitionCandidateAuditErrorCount <= 3 then
+            pcall(wwWallDiag, "WW_PIPELINE_CANDIDATE_ERROR",
+                "route=" .. tostring(routeName) .. ", error=" .. string.sub(tostring(state), 1, 160), 0)
+        end
+        return nil
+    end
+    return state
+end
+
+function wwBeginTransitionPipelineCandidate(routeName, fromUp, toUp, hit, normal, legacyRoute, now)
+    if not wwIsManagedTransitionRoute(routeName) then return nil end
+    if not root or not hit or not hit.Instance or not hit.Instance.Parent or not hit.Position or not normal then
+        return nil
+    end
+    now = now or os.clock()
+    legacyRoute = legacyRoute or (string.find(routeName, "edge", 1, true) and "edge" or "forward")
+    local state = transitionRouteStates and transitionRouteStates[routeName] or nil
+    local sourceUp = safeUnit(fromUp, UP)
+    local targetUp = safeUnit(toUp, sourceUp)
+    local targetNormal = safeUnit(normal, targetUp)
+    local sameAttempt = state ~= nil
+        and not wwIsTerminalTransitionPhase(state.phase)
+        and state.instance == hit.Instance
+        and state.fromUp ~= nil
+        and state.toUp ~= nil
+        and state.fromUp:Dot(sourceUp) >= 0.90
+        and state.toUp:Dot(targetUp) >= 0.90
+        and state.normal ~= nil
+        and safeUnit(state.normal, targetNormal):Dot(targetNormal) >= 0.85
+        and state.point ~= nil
+        and math.abs((state.point - hit.Position):Dot(targetNormal)) <= 0.65
+        and now - (state.lastSeenAt or state.startedAt or 0) <= CFG.EdgeTransitionPendingLifetime
+
+    if not sameAttempt then
+        wwSupersedeTransitionPipelineStateIfUnowned(state, now, "candidate-target-changed")
+        transitionRouteAttemptSequence = transitionRouteAttemptSequence + 1
+        state = {
+            route = routeName,
+            legacyRoute = legacyRoute,
+            attemptId = transitionRouteAttemptSequence,
+            phase = "idle",
+            fromUp = sourceUp,
+            toUp = targetUp,
+            startedAt = now,
+            firstSeenAt = now,
+            lastSeenAt = now,
+            hit = hit,
+            instance = hit.Instance,
+            point = hit.Position,
+            normal = targetNormal,
+            observations = 1,
+            lastObservedFrame = transitionPipelineSensorFrame or 0,
+            phaseHistory = {},
+        }
+        transitionRouteStates[routeName] = state
+        wwSetTransitionPipelinePhase(state, "candidate", now, "sensor-candidate-observed")
+    else
+        state.lastSeenAt = now
+        state.hit = hit
+        state.instance = hit.Instance
+        state.point = hit.Position
+        state.normal = targetNormal
+        state.legacyRoute = legacyRoute
+        state.fromUp = sourceUp
+        state.toUp = targetUp
+        local frameToken = transitionPipelineSensorFrame or 0
+        if state.lastObservedFrame ~= frameToken then
+            state.observations = (state.observations or 0) + 1
+            state.lastObservedFrame = frameToken
+        end
+        if state.phase == "idle" then
+            wwSetTransitionPipelinePhase(state, "candidate", now, "sensor-candidate-observed")
+        end
+    end
+    return state
+end
+
+function wwEnsureTransitionPipelineState(routeName, fromUp, toUp, hit, normal, now)
+    if not wwIsManagedTransitionRoute(routeName) then return nil end
+    now = now or os.clock()
+    local state = transitionRouteStates and transitionRouteStates[routeName] or nil
+    local sourceUp = safeUnit(fromUp, UP)
+    local targetUp = safeUnit(toUp, sourceUp)
+    local hitInstance = hit and hit.Instance or nil
+    local hitPoint = hit and hit.Position or nil
+    local sameAttempt = state ~= nil
+        and not wwIsTerminalTransitionPhase(state.phase)
+        and state.instance == hitInstance
+        and state.fromUp ~= nil
+        and state.toUp ~= nil
+        and state.fromUp:Dot(sourceUp) >= 0.985
+        and state.toUp:Dot(targetUp) >= 0.985
+        and state.point ~= nil
+        and hitPoint ~= nil
+        and math.abs((state.point - hitPoint):Dot(safeUnit(normal, targetUp))) <= 0.65
+
+    if not sameAttempt then
+        wwSupersedeTransitionPipelineStateIfUnowned(state, now, "commit-target-changed")
+        transitionRouteAttemptSequence = transitionRouteAttemptSequence + 1
+        state = {
+            route = routeName,
+            attemptId = transitionRouteAttemptSequence,
+            phase = "idle",
+            fromUp = sourceUp,
+            toUp = targetUp,
+            hit = hit,
+            instance = hitInstance,
+            point = hitPoint,
+            normal = normal and safeUnit(normal, targetUp) or nil,
+            startedAt = now,
+            firstSeenAt = now,
+            lastSeenAt = now,
+            observations = 1,
+            lastObservedFrame = transitionPipelineSensorFrame or 0,
+            phaseHistory = {},
+        }
+        transitionRouteStates[routeName] = state
+        wwSetTransitionPipelinePhase(state, "validated", now, "route-controller-accepted")
+    else
+        state.lastSeenAt = now
+        local frameToken = transitionPipelineSensorFrame or 0
+        if state.lastObservedFrame ~= frameToken then
+            state.observations = (state.observations or 0) + 1
+            state.lastObservedFrame = frameToken
+        end
+        state.hit = hit
+        state.instance = hitInstance
+        state.point = hitPoint
+        state.normal = normal and safeUnit(normal, targetUp) or state.normal
+        state.fromUp = sourceUp
+        state.toUp = targetUp
+    end
+    return state
+end
+
+function wwFinishTransitionClaimRoute(claim, phase, reason, now)
+    if not claim then return end
+    local state = claim.pipelineState
+    if not state and transitionRouteStates then
+        state = transitionRouteStates[claim.route]
+    end
+    if state then
+        wwSetTransitionPipelinePhase(state, phase or "aborted", now or os.clock(), reason)
+    end
+end
+
+-- The active claim is a single physical-transition lease. A new route may chain
+-- only after the old target is actually reachable at the existing strict contact
+-- envelope, except for the explicit legacy return paths handled by the arbiter.
+function wwIsClaimTargetPhysicallyReached(currentUp, claim)
+    if not claim or not root or not claim.instance or not claim.instance.Parent then
+        return false
+    end
+    local seen = false
+    if surfaceSupportSeen and surfaceSupportPoint and surfaceSupportNormal then
+        seen = wwIsTransitionTargetSupport(
+            currentUp, claim, surfaceSupportPoint, surfaceSupportNormal, surfaceSupportDistance
+        )
+    end
+    if seen then return true end
+    local targetSeen = false
+    targetSeen = wwFindTransitionTargetSupport(currentUp, claim)
+    return targetSeen == true
+end
+
+-- Retry one queued route only after the previous physical claim has completed.
+-- The stored hit is not trusted by itself: its instance, age, reach, source plane,
+-- input direction, and original route controller are checked again every retry.
+function wwTryResumeQueuedTransitionCandidate(currentUp, moveVector, now)
+    now = now or os.clock()
+    if transitionClaim ~= nil or not root or not transitionRouteStates then return nil end
+    if not moveVector or moveVector.Magnitude <= 0.05 then return nil end
+
+    local worldMove = getWorldMove(moveVector, safeUnit(currentUp, UP))
+    if worldMove.Magnitude <= 0.05 then return nil end
+
+    local chosen = nil
+    for routeName, state in pairs(transitionRouteStates) do
+        if state and state.phase == "queued"
+            and state.fromUp and state.toUp and state.hit and state.instance
+            and state.instance.Parent and state.point and state.normal
+            and state.legacyRoute
+            and now - (state.lastSeenAt or state.startedAt or now) <= CFG.EdgeTransitionPendingLifetime
+            and safeUnit(state.fromUp, currentUp):Dot(safeUnit(currentUp, UP)) >= 0.90
+        then
+            local age = now - (state.startedAt or now)
+            local pointDistance = (state.point - root.Position).Magnitude
+            local reach = CFG.TransitionHandoffMaxDistance
+            if routeName == "wall-edge-to-ceiling-underside" then
+                reach = CFG.WallEdgeCeilingHandoffMaxDistance
+            end
+            local targetUp = safeUnit(state.toUp, currentUp)
+            local moveTowardTarget = worldMove.Unit:Dot(-targetUp) >= CFG.EdgeFloorApproachInputDot
+            if moveTowardTarget and pointDistance <= reach then
+                if not chosen or (state.startedAt or now) < (chosen.startedAt or now) then
+                    chosen = state
+                end
+            end
+        end
+    end
+    if not chosen then return nil end
+
+    -- Confirm the target is still directly reachable now. A cached hit from a
+    -- previous frame is only a hint; it cannot wake a queued transition by itself.
+    local chosenDelta = chosen.point - root.Position
+    local chosenPointDistance = chosenDelta.Magnitude
+    if chosenPointDistance <= 0.05 then return nil end
+    local freshHit = cast(root.Position, chosenDelta, chosenPointDistance + 0.35)
+    if not freshHit or freshHit.Instance ~= chosen.instance or not freshHit.Normal
+        or safeUnit(freshHit.Normal, chosen.normal):Dot(safeUnit(chosen.normal, freshHit.Normal)) < 0.85
+        or (freshHit.Position - chosen.point).Magnitude > 1.50
+    then
+        wwWallDiag("WW_PIPE_QUEUED_CANDIDATE_STALE_RAY",
+            "attempt=" .. tostring(chosen.attemptId)
+                .. ", route=" .. tostring(chosen.route)
+                .. ", pointDist=" .. string.format("%.2f", chosenPointDistance)
+                .. ", freshTarget=" .. tostring(freshHit and freshHit.Instance and freshHit.Instance.Name or "none")
+                .. ", reason=cached-candidate-not-reconfirmed-by-current-ray", 0.20)
+        return nil
+    end
+    chosen.hit = freshHit
+    chosen.instance = freshHit.Instance
+    chosen.point = freshHit.Position
+    chosen.normal = safeUnit(freshHit.Normal, chosen.normal)
+
+    local accepted = false
+    local routeName = chosen.route
+    if routeName == "floor-to-wall" then
+        accepted = wwControlFloorToWall(chosen.fromUp, chosen.toUp, chosen.legacyRoute,
+            chosen.hit, chosen.normal, moveVector, now)
+    elseif routeName == "floor-edge-to-wall-underside" then
+        accepted = wwControlFloorEdgeToWallUnderside(chosen.fromUp, chosen.toUp, chosen.legacyRoute,
+            chosen.hit, chosen.normal, moveVector, now)
+    elseif routeName == "wall-to-ceiling" then
+        accepted = wwControlWallToCeiling(chosen.fromUp, chosen.toUp, chosen.legacyRoute,
+            chosen.hit, chosen.normal, moveVector, now)
+    elseif routeName == "wall-edge-to-ceiling-underside" then
+        accepted = wwControlWallEdgeToCeilingUnderside(chosen.fromUp, chosen.toUp, chosen.legacyRoute,
+            chosen.hit, chosen.normal, moveVector, now)
+    elseif routeName == "ceiling-to-wall" then
+        accepted = wwControlCeilingToWall(chosen.fromUp, chosen.toUp, chosen.legacyRoute,
+            chosen.hit, chosen.normal, moveVector, now)
+    elseif routeName == "ceiling-edge-to-wall-underside" then
+        accepted = wwControlCeilingEdgeToWallUnderside(chosen.fromUp, chosen.toUp, chosen.legacyRoute,
+            chosen.hit, chosen.normal, moveVector, now)
+    elseif routeName == "wall-to-floor" then
+        accepted = wwControlWallToFloor(chosen.fromUp, chosen.toUp, chosen.legacyRoute,
+            chosen.hit, chosen.normal, moveVector, now)
+    elseif routeName == "wall-edge-to-floor" then
+        accepted = wwControlWallEdgeToFloor(chosen.fromUp, chosen.toUp, chosen.legacyRoute,
+            chosen.hit, chosen.normal, moveVector, now)
+    end
+
+    if not accepted then return nil end
+    local queuedAge = now - (chosen.startedAt or now)
+    local queuedPointDistance = (chosen.point - root.Position).Magnitude
+    wwWallDiag("WW_PIPE_QUEUED_CANDIDATE_REVALIDATED",
+        "attempt=" .. tostring(chosen.attemptId)
+            .. ", route=" .. tostring(routeName)
+            .. ", age=" .. string.format("%.3f", queuedAge)
+            .. ", pointDist=" .. string.format("%.2f", queuedPointDistance)
+            .. ", target=" .. tostring(chosen.instance.Name), 0)
+    return chosen
+end
+
+]=] },
     { name = '25_getGravityUp', source = [=[function getGravityUp(oldUp, moveVector)
+    transitionPipelineSensorFrame = (transitionPipelineSensorFrame or 0) + 1
+    transitionResolvedRoute = nil
+    transitionCandidateRoute = nil
+    transitionCandidateHit = nil
+    transitionCandidateNormal = nil
+    transitionCandidateSupportGap = false
     if not root then return oldUp, false, false, nil, nil, math.huge end
 
     local origin = root.Position
@@ -1529,11 +5572,24 @@ end
     local closestDistance = math.huge
     local closestNormal
     local transitionNormal
+    local transitionHit
+    local transitionIsRadialEdge = false
     local transitionDistance = math.huge
     local supportSeen = false
     local supportPoint
     local supportNormal
     local supportDistance = math.huge
+    local edgeNow = os.clock()
+    if not radialEdgeMemory or not radialEdgeMemory.oldUp
+        or radialEdgeMemory.oldUp:Dot(oldUp) < 0.90
+        or edgeNow - (radialEdgeMemory.updatedAt or 0) > CFG.RadialEdgeWallEvidenceWindow
+    then
+        radialEdgeMemory = { clusters = {}, oldUp = oldUp, updatedAt = edgeNow }
+    end
+    radialEdgeMemory.oldUp = oldUp
+    radialEdgeMemory.updatedAt = edgeNow
+    pruneRadialEdgeWallState(radialEdgeMemory, oldUp)
+    local radialEdgeState = radialEdgeMemory
 
     -- v48.64: keep first-riser filtering independent of continuous stair ownership
     -- rays are added. Every gravity acquisition path below consults the same
@@ -1568,8 +5624,13 @@ end
         -- floor/ceiling states.
         stairRiserAhead = isStairRiserAhead(oldUp, moveVector)
     end
+    if floorOrCeiling then
+        pcall(wwBeginRadialEdgeForensicScan, oldUp, origin, stairMoveDir, stairRiserAhead)
+    else
+        wwRadialEdgeForensic = nil
+    end
 
-    local function addHit(hit, weight, rayDirection)
+    local function addHit(hit, weight, rayDirection, edgeRayIndex)
         if not hit then return end
 
         local normal = orientSurfaceNormal(hit, rayDirection)
@@ -1581,6 +5642,21 @@ end
         local floorOrCeiling = math.abs(oldUp:Dot(UP)) > 0.985
         local nearVerticalRiser = floorOrCeiling
             and math.abs(normal:Dot(UP)) < CFG.StairRiserGravityVerticalDot
+
+        -- Save vertical wall evidence from the existing down-fan before the
+        -- normal surface average rejects it as a possible stair riser.
+        if edgeRayIndex and floorOrCeiling then
+            registerRadialEdgeWallHit(
+                radialEdgeState,
+                hit,
+                normal,
+                edgeRayIndex,
+                origin,
+                oldUp,
+                rayDirection
+            )
+        end
+
         if nearVerticalRiser then
             return
         end
@@ -1628,7 +5704,7 @@ end
         local hit = cast(origin + startRadius * offset, direction, CFG.DownRayLength)
         if hit then
             local weight = 0.35 + 0.65 * math.abs(math.cos(theta))
-            addHit(hit, weight, direction)
+            addHit(hit, weight, direction, i)
         end
     end
 
@@ -1715,6 +5791,11 @@ end
                             if allowed and not stairHit and distance < transitionDistance then
                                 transitionDistance = distance
                                 transitionNormal = hitNormal
+                                transitionHit = hit
+                                transitionCandidateRoute = "forward"
+                                transitionCandidateHit = hit
+                                transitionCandidateNormal = hitNormal
+                                wwObserveTransitionPipelineCandidate(oldUp, hitNormal, "forward", hit, hitNormal, edgeNow)
                             end
                         end
                     end
@@ -1759,7 +5840,19 @@ end
                     moveDir,
                     safeUnit(moveDir + oldUp * 0.72, moveDir),
                     safeUnit(moveDir - oldUp * 0.72, moveDir),
+                    safeUnit(moveDir + right * 0.35, moveDir),
+                    safeUnit(moveDir - right * 0.35, moveDir),
                 }
+
+                local planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, oldUp).Magnitude
+                local commandedSpeed = 0
+                if humanoid then
+                    commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+                    * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+                end
+                local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+                local sharedProbeLength = CFG.TransitionProbeLength
+                    + math.clamp(transitionSpeed * 0.12, 0, 2.50)
 
                 local candidates = {}
 
@@ -1831,7 +5924,7 @@ end
 
                 for offsetIndex, offset in ipairs(offsets) do
                     for _, direction in ipairs(directions) do
-                        local hit = cast(origin + offset, direction, CFG.TransitionProbeLength)
+                        local hit = cast(origin + offset, direction, sharedProbeLength)
                         if hit then
                             local distance = (hit.Position - origin).Magnitude
                             local hitNormal = orientSurfaceNormal(hit, direction)
@@ -1888,8 +5981,324 @@ end
 
                 if chosenCluster then
                     transitionNormal = chosenCluster.bestNormal
+                    transitionHit = chosenCluster.bestHit
+                    transitionIsRadialEdge = false
                     transitionDistance = chosenCluster.bestDistance
+                    transitionCandidateRoute = "forward"
+                    transitionCandidateHit = transitionHit
+                    transitionCandidateNormal = transitionNormal
+                    wwObserveTransitionPipelineCandidate(oldUp, transitionNormal, "forward", transitionHit, transitionNormal, edgeNow)
                 end
+            end
+        end
+    end
+
+    -- A nearby world-floor hit is not enough to end wall gravity. While
+    -- climbing upward or sideways, the floor is behind/below the movement path;
+    -- discard that candidate before the wall-to-ceiling scan gets its chance.
+    -- This avoids the 2.75-stud distance gate mistaking the original floor for
+    -- the intended destination during sustained wall climbing.
+    if not floorOrCeiling and transitionNormal and transitionNormal:Dot(UP) > 0.985 then
+        if not wwWallDiagCheckFloorApproach(oldUp, transitionHit, stairMoveDir, transitionDistance, moveVector) then
+            transitionNormal = nil
+            transitionHit = nil
+            transitionIsRadialEdge = false
+            transitionDistance = math.huge
+            transitionCandidateRoute = nil
+            transitionCandidateHit = nil
+            transitionCandidateNormal = nil
+        end
+    end
+
+    -- The EDGE SYSTEM inspects horizontal planes independently of forward probes.
+    -- If both systems see a horizontal target, preserve a validated edge ceiling
+    -- candidate when upward intent selects that route. Otherwise the forward
+    -- candidate can mask the edge route and bypass its longer handoff grace.
+    -- A forward-facing vertical wall candidate keeps ownership.
+    if not floorOrCeiling then
+        local edgePlaneHit, edgePlaneNormal, edgePlaneDistance = findWallEdgeHorizontalTransition(
+            oldUp,
+            moveVector,
+            supportSeen
+        )
+        local edgeOwnsTarget = edgePlaneHit ~= nil and edgePlaneNormal ~= nil and not transitionNormal
+
+        if edgePlaneHit and edgePlaneNormal and transitionNormal
+            and math.abs(transitionNormal:Dot(UP)) > 0.985
+        then
+            local edgeFloor = edgePlaneNormal:Dot(UP) > 0.985
+            local currentTargetFloor = transitionNormal:Dot(UP) > 0.985
+            local worldMove = ZERO
+            if moveVector and moveVector.Magnitude > 0.05 then
+                worldMove = getWorldMove(moveVector, oldUp)
+            end
+            local verticalMove = worldMove:Dot(UP)
+            local verticalVelocity = root.AssemblyLinearVelocity:Dot(UP)
+            if edgeFloor ~= currentTargetFloor then
+                if edgeFloor then
+                    local towardFloor = isMovementTowardSurfacePoint(edgePlaneHit.Position, oldUp, moveVector)
+                    local edgeFloorGap = getBodyPartFloorContactGap(edgePlaneHit.Position, edgePlaneNormal)
+                    edgeOwnsTarget = towardFloor or edgeFloorGap <= CFG.VerticalSurfaceContactGap
+                else
+                    edgeOwnsTarget = verticalMove > 0.06
+                        or (math.abs(verticalMove) <= 0.06 and verticalVelocity > 0.50)
+                end
+            else
+                if edgeFloor then
+                    -- Keep the existing nearer-floor preference.
+                    edgeOwnsTarget = edgePlaneDistance < transitionDistance
+                else
+                    -- Both sensors have selected the ceiling plane. If the edge
+                    -- scanner's own speed-scaled contact test passed and upward
+                    -- intent is present, keep its edge route instead of silently
+                    -- downgrading the same face to ordinary wall-to-ceiling.
+                    -- The edge scanner already accepted this exact ceiling hit
+                    -- using getLegacyCharacterBoundsGap and the same speed-lead
+                    -- helper. Do not run a second gap test here: it can downgrade
+                    -- a valid edge candidate to ordinary wall-to-ceiling, losing
+                    -- the route-specific handoff policy.
+                    edgeOwnsTarget = transitionNormal:Dot(UP) <= -0.985
+                        and edgePlaneNormal:Dot(UP) <= -0.985
+                        and (verticalMove > 0.06
+                            or (math.abs(verticalMove) <= 0.06 and verticalVelocity > 0.50))
+                end
+            end
+        end
+
+        if edgeOwnsTarget then
+            transitionCandidateRoute = "edge"
+            transitionCandidateHit = edgePlaneHit
+            transitionCandidateNormal = edgePlaneNormal
+            wwObserveTransitionPipelineCandidate(oldUp, edgePlaneNormal, "edge", edgePlaneHit, edgePlaneNormal, edgeNow)
+            transitionCandidateSupportGap = supportSeen ~= true
+            wwWallDiag("EDGE_HORIZONTAL_CANDIDATE_ACCEPTED",
+                "stage=scanner-selected-not-final-commit"
+                    .. ", route=" .. (edgePlaneNormal:Dot(UP) > 0.985 and "wall-edge-to-floor" or "wall-edge-to-ceiling")
+                    .. ", dist=" .. string.format("%.2f", edgePlaneDistance)
+                    .. ", sourceGap=" .. tostring(transitionCandidateSupportGap),
+                0.25
+            )
+            -- Candidate acceptance selects the target gravity plane, but is not
+            -- proof of physical support. The transition claim bridges the approach;
+            -- the safety fan confirms support only after near-contact is real.
+            return safeUnit(edgePlaneNormal, oldUp), true, false,
+                nil, nil, math.huge
+        end
+    end
+
+    -- Wall -> ceiling uses a separate surface-relative scan. The falling
+    -- radial wall scan intentionally rejects upward-facing ceiling normals;
+    -- without this path, slow wall climbs can reach the ceiling without ever
+    -- producing a valid transition candidate.
+    if not transitionNormal and math.abs(oldUp:Dot(UP)) < 0.985 then
+        local ceilingHit, ceilingNormal = findWallToCeilingSurface(oldUp, moveVector)
+        if ceilingHit and ceilingNormal then
+            local ceilingDistance = (ceilingHit.Position - root.Position).Magnitude
+            local ceilingSurfaceGap = getCharacterSurfaceGap(ceilingHit.Position)
+            local ceilingBodyGap = getBodyPartSurfaceGap(ceilingHit.Position)
+            local maxCeilingSurfaceGap = CFG.VerticalSurfaceContactGap
+            wwWallDiag("CEILING_SCAN_FOUND",
+                "orientation=" .. wwDescribeSurfaceOrientation(oldUp)
+                    .. ", rootDist=" .. string.format("%.2f", ceilingDistance)
+                    .. ", boundsGap=" .. string.format("%.2f", ceilingSurfaceGap)
+                    .. ", bodyGap=" .. string.format("%.2f", ceilingBodyGap)
+                    .. ", gapLimit=" .. string.format("%.2f", maxCeilingSurfaceGap)
+                    .. ", normalY=" .. string.format("%.2f", ceilingNormal:Dot(UP))
+                    .. ", evidence=raycast-candidate-not-support-confirmation"
+                    .. ", posY=" .. string.format("%.2f", root.Position.Y),
+                0.35
+            )
+            if ceilingSurfaceGap <= maxCeilingSurfaceGap then
+                wwWallDiag("CEILING_SCAN_CANDIDATE_ACCEPTED", "orientation=" .. wwDescribeSurfaceOrientation(oldUp)
+                    .. ", rootDist=" .. string.format("%.2f", ceilingDistance)
+                    .. ", boundsGap=" .. string.format("%.2f", ceilingSurfaceGap)
+                    .. ", bodyGap=" .. string.format("%.2f", ceilingBodyGap)
+                    .. ", bodyContact=" .. tostring(ceilingBodyGap <= CFG.VerticalSurfaceContactGap + 0.10)
+                    .. ", gate=bounds-gap, support-confirmation=separate", 0.35)
+                transitionNormal = ceilingNormal
+                transitionHit = ceilingHit
+                transitionIsRadialEdge = false
+                transitionDistance = ceilingDistance
+                transitionCandidateRoute = "forward"
+                transitionCandidateHit = ceilingHit
+                transitionCandidateNormal = ceilingNormal
+                wwObserveTransitionPipelineCandidate(oldUp, ceilingNormal, "forward", ceilingHit, ceilingNormal, edgeNow)
+            else
+                wwWallDiag("CEILING_SCAN_REJECTED_DISTANCE", "rootDist=" .. string.format("%.2f", ceilingDistance)
+                    .. ", surfaceGap=" .. string.format("%.2f", ceilingSurfaceGap)
+                    .. ", gapLimit=" .. string.format("%.2f", maxCeilingSurfaceGap), 0.35)
+            end
+        else
+            local moveMagnitude = moveVector and moveVector.Magnitude or 0
+            local currentSupportDot = -1
+            if supportSeen and supportNormal then
+                currentSupportDot = safeUnit(supportNormal, oldUp):Dot(safeUnit(oldUp, UP))
+            elseif surfaceSupportSeen and surfaceSupportNormal then
+                currentSupportDot = safeUnit(surfaceSupportNormal, oldUp):Dot(safeUnit(oldUp, UP))
+            end
+            local currentWallSupport = currentSupportDot >= CFG.SurfaceSafetySupportNormalDot
+            local upwardInput = 0
+            if moveMagnitude > 0.05 then
+                upwardInput = getWorldMove(moveVector, oldUp):Dot(UP)
+            end
+            local upwardVelocity = root.AssemblyLinearVelocity:Dot(UP)
+            -- A ceiling search can fail while the player is correctly supported
+            -- on a wall. Suppress idle misses when wall support is confirmed;
+            -- otherwise name the scan result and the independent support state.
+            if moveMagnitude > 0.05 or not currentWallSupport then
+                wwWallDiag("CEILING_SCAN_NO_CANDIDATE",
+                    "orientation=" .. wwDescribeSurfaceOrientation(oldUp)
+                        .. ", probe=world-up-ceiling-search"
+                        .. ", orientationSource=gravity-axis"
+                        .. ", currentWallSupport=" .. tostring(currentWallSupport)
+                        .. ", primarySupportSensorCurrent=" .. tostring(supportSeen == true)
+                        .. ", lastPublishedSupportMatches=" .. tostring(surfaceSupportSeen == true and surfaceSupportNormal ~= nil and safeUnit(surfaceSupportNormal, oldUp):Dot(safeUnit(oldUp, UP)) >= CFG.SurfaceSafetySupportNormalDot)
+                        .. ", supportDot=" .. string.format("%.2f", currentSupportDot)
+                        .. ", supportDist=" .. tostring(supportDistance)
+                        .. ", moveMag=" .. string.format("%.2f", moveMagnitude)
+                        .. ", upwardInput=" .. string.format("%.2f", upwardInput)
+                        .. ", worldYVelocity=" .. string.format("%.2f", upwardVelocity)
+                        .. ", result=no-ceiling-candidate;not-a-wall-support-verdict"
+                        .. ", posY=" .. string.format("%.2f", root.Position.Y), 0.8)
+            end
+        end
+    end
+
+    -- Check the radial wall candidate before and after support is lost. A
+    -- speed-scaled acquisition envelope catches fast approaches, while the
+    -- contact gate below prevents early gravity commitment from this evidence.
+    if floorOrCeiling and #radialEdgeState.clusters > 0 then
+        local edgeStillGrounded = getGrounded(oldUp)
+        local radialNormal, radialHit, radialDistance = resolveRadialEdgeWall(
+            radialEdgeState,
+            oldUp,
+            stairMoveDir,
+            stairRiserAhead
+        )
+        if wwRadialEdgeForensic then
+            wwRadialEdgeForensic.resolver = "ran"
+            wwRadialEdgeForensic.resolvedPart = radialHit and radialHit.Instance or nil
+            wwRadialEdgeForensic.resolvedPosition = radialHit and radialHit.Position or nil
+            wwRadialEdgeForensic.resolvedNormal = radialNormal
+            wwRadialEdgeForensic.resolvedDistance = radialDistance
+            wwRadialEdgeForensic.initialAccept = radialNormal ~= nil and radialHit ~= nil
+            wwRadialEdgeForensic.rejection = (radialNormal ~= nil and radialHit ~= nil) and "pending-grounded-distance-side-checks" or "resolver-returned-no-wall-candidate"
+        end
+        local acceptRadial = radialNormal ~= nil and radialHit ~= nil
+        if wwRadialEdgeForensic then
+            wwRadialEdgeForensic.edgeStillGrounded = edgeStillGrounded == true
+        end
+        if acceptRadial and edgeStillGrounded then
+            acceptRadial = false
+            if wwRadialEdgeForensic then wwRadialEdgeForensic.rejection = "grounded-until-distance-and-side-allowance" end
+            local planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, oldUp).Magnitude
+            local commandedSpeed = 0
+            if humanoid then
+                commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+                    * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+            end
+            local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+            local speedLead = math.clamp(
+                planarSpeed * CFG.EdgeTransitionContactSpeedLead,
+                0,
+                CFG.EdgeTransitionContactSpeedLeadMax
+            )
+            local fastSpeedLead = math.clamp((transitionSpeed - 9) * 0.90, 0, 2.25)
+            if fastSpeedLead > speedLead then
+                speedLead = fastSpeedLead
+            end
+            local maxRadialDistance = 4.25 + speedLead
+            if wwRadialEdgeForensic then
+                wwRadialEdgeForensic.maxRadialDistance = maxRadialDistance
+                wwRadialEdgeForensic.radialDistanceWithinLimit = radialDistance <= maxRadialDistance
+            end
+            if radialDistance <= maxRadialDistance then
+                local sideOK = true
+                if stairMoveDir and stairMoveDir.Magnitude > 0.05 then
+                    local toWall = radialHit.Position - origin
+                    local forwardOffset = toWall:Dot(stairMoveDir)
+                    local sideOffset = (toWall - stairMoveDir * forwardOffset).Magnitude
+                    local maxSide = 2.50 + speedLead * 0.50
+                    if sideOffset > maxSide then
+                        sideOK = false
+                    end
+                end
+                if wwRadialEdgeForensic then wwRadialEdgeForensic.sideOK = sideOK end
+                if sideOK then
+                    acceptRadial = true
+                    if wwRadialEdgeForensic then wwRadialEdgeForensic.rejection = "accepted-by-distance-and-side" end
+                else
+                    if wwRadialEdgeForensic then wwRadialEdgeForensic.rejection = "rejected-side-offset" end
+                end
+            elseif wwRadialEdgeForensic then
+                wwRadialEdgeForensic.rejection = "rejected-distance-limit"
+            end
+        end
+        if wwRadialEdgeForensic then
+            wwRadialEdgeForensic.finalAccept = acceptRadial == true
+            if acceptRadial and not edgeStillGrounded then
+                wwRadialEdgeForensic.rejection = "accepted-source-support-already-lost"
+            end
+            if acceptRadial and radialDistance >= transitionDistance then
+                wwRadialEdgeForensic.rejection = "valid-radial-candidate-not-nearest-transition"
+            elseif not acceptRadial and wwRadialEdgeForensic.rejection == "pending-grounded-distance-side-checks" then
+                wwRadialEdgeForensic.rejection = "rejected-by-radial-qualification"
+            end
+        end
+        if acceptRadial and radialDistance < transitionDistance then
+            transitionNormal = radialNormal
+            transitionHit = radialHit
+            transitionIsRadialEdge = true
+            transitionDistance = radialDistance
+            transitionCandidateRoute = "edge"
+            transitionCandidateHit = radialHit
+            transitionCandidateNormal = radialNormal
+            wwObserveTransitionPipelineCandidate(oldUp, radialNormal, "edge", radialHit, radialNormal, edgeNow)
+        end
+    end
+
+    -- Emit source-floor/source-ceiling radial diagnostics even when no cluster
+    -- formed. This distinguishes “no qualifying wall hit” from “candidate found
+    -- but rejected by resolver/contact/distance/side checks”.
+    if wwRadialEdgeForensic then
+        if wwRadialEdgeForensic.resolver == "not-run-yet" then
+            if #radialEdgeState.clusters == 0 then
+                wwRadialEdgeForensic.resolver = "not-run-no-clusters"
+                wwRadialEdgeForensic.rejection = "no-registered-wall-cluster"
+            else
+                wwRadialEdgeForensic.resolver = "not-run-clusters-present-but-radial-gate-skipped"
+                wwRadialEdgeForensic.rejection = "radial-resolver-gate-not-entered"
+            end
+        end
+        pcall(wwEmitRadialEdgeForensicScan, radialEdgeState, supportSeen, transitionCandidateRoute,
+            transitionCandidateHit, transitionCandidateNormal, transitionDistance)
+    end
+
+    -- If the down-fan missed the wall, do a direct 360-degree scan at body
+    -- height only after support is actually lost. This addresses
+    -- the case where falling beside a wall never creates a radial down-fan
+    -- candidate, so the later contact gate was never reached.
+    if floorOrCeiling and not transitionNormal and not stairRiserAhead then
+        if not getGrounded(oldUp) then
+            local fallHit, fallNormal, fallDistance = findFallingRadialWall(oldUp)
+            local planarSpeed = projectOnPlane(root.AssemblyLinearVelocity, oldUp).Magnitude
+            local commandedSpeed = 0
+            if humanoid then
+                commandedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+                    * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+            end
+            local transitionSpeed = math.max(planarSpeed, commandedSpeed)
+            local speedLead = math.clamp(transitionSpeed * 0.16, 0, 4.00)
+            local fallAcquireDistance = 4.25 + speedLead
+            if fallHit and fallNormal and fallDistance <= fallAcquireDistance then
+                transitionNormal = fallNormal
+                transitionHit = fallHit
+                transitionIsRadialEdge = true
+                transitionDistance = fallDistance
+                transitionCandidateRoute = "edge"
+                transitionCandidateHit = fallHit
+                transitionCandidateNormal = fallNormal
+                wwObserveTransitionPipelineCandidate(oldUp, fallNormal, "edge", fallHit, fallNormal, edgeNow)
             end
         end
     end
@@ -1910,22 +6319,199 @@ end
 
             if supportDot >= CFG.ExactFaceSupportMinDot and not exactIsStair then
                 -- The exact-face probe is part of the normal WallWalk
-                -- acquisition path too, so it must count as valid support for
-                -- the safety handoff when the broader fan happens to miss.
+                -- acquisition path too, so it must publish its real support
+                -- metadata when the broader fan misses. Without this, callers
+                -- receive supportSeen=true with a nil point and infinite
+                -- distance, which can erase the safety controller's last
+                -- confirmed support reference.
                 supportSeen = true
+                if exactHit and exactNormal and exactDistance < supportDistance then
+                    supportPoint = exactHit.Position
+                    supportNormal = exactNormal
+                    supportDistance = exactDistance
+                end
                 return safeUnit(exactNormal, oldUp), true, supportSeen, supportPoint, supportNormal, supportDistance
             end
         end
     end
 
-    if transitionNormal then
-        -- A true movement-facing hit has priority. Stair risers have already
-        -- been filtered against the cached physical stair geometry above.
-        return safeUnit(transitionNormal, oldUp), true, supportSeen, supportPoint, supportNormal, supportDistance
+    local floorOrCeilingNow = math.abs(oldUp:Dot(UP)) > 0.985
+    local targetIsVerticalWall = transitionNormal
+        and math.abs(transitionNormal:Dot(UP)) < CFG.StairRiserGravityVerticalDot
+    local targetDrop = transitionHit and (origin - transitionHit.Position):Dot(oldUp) or 0
+    -- A ray hitting the lower part of a wall does not by itself make this an
+    -- underneath-edge transition. The usual path requires independent radial
+    -- edge evidence, or lost source support plus a target point below the root.
+    local supportLostEdgeCandidate = supportSeen ~= true
+        and targetDrop >= CFG.RadialEdgeWallMinDrop
+
+    -- Startup recovery: while Roblox still reports floor support, offset rays
+    -- can keep supportSeen=true for several frames as the player approaches an
+    -- overhang. The movement-facing wall probes have already required a tall
+    -- continuation test before producing this non-radial candidate. Reuse that
+    -- independent evidence so a real lower wall can use the edge controller on
+    -- the first transition after respawn; do not depend on gravity having been
+    -- changed once already. hasVerticalWallContinuation also preserves the
+    -- short-stair-riser rejection and demands movement facing the candidate.
+    local supportedTallWallEdgeCandidate = false
+    if not transitionIsRadialEdge
+        and supportSeen == true
+        and floorOrCeilingNow
+        and targetIsVerticalWall
+        and targetDrop >= CFG.RadialEdgeWallMinDrop
+        and stairMoveDir
+        and stairMoveDir.Magnitude > 0.05
+    then
+        supportedTallWallEdgeCandidate = hasVerticalWallContinuation(
+            transitionHit, transitionNormal, oldUp, stairMoveDir
+        )
+    end
+
+    local edgeBelowCandidate = transitionIsRadialEdge
+        or supportLostEdgeCandidate
+        or supportedTallWallEdgeCandidate
+
+    if supportedTallWallEdgeCandidate then
+        wwWallDiag("FLOOR_EDGE_STARTUP_ROUTE_EVIDENCE",
+            "supportStillSeen=true, targetDrop=" .. string.format("%.2f", targetDrop)
+                .. ", wallContinuation=true, route=edge",
+            0.25
+        )
+    end
+
+    if floorOrCeilingNow and targetIsVerticalWall then
+        -- Speed lead is allowed only after the edge route has actual edge/drop
+        -- evidence. A forward wall remains fixed-gap even if an angled probe hit
+        -- a lower or upper point on that same wall.
+        local routeName = edgeBelowCandidate and "edge" or "forward"
+        local allowFastLead = routeName == "edge" and edgeBelowCandidate
+        local readyNormal, readyHit = updateFloorWallEdgeTransition(
+            transitionHit,
+            transitionNormal,
+            oldUp,
+            stairMoveDir,
+            allowFastLead,
+            routeName,
+            moveVector and moveVector.Magnitude or 0
+        )
+        if readyNormal and readyHit then
+            -- Record whether source support was already lost before this edge
+            -- candidate was accepted. Keep it for diagnostics and handoff state.
+            transitionCandidateSupportGap = supportSeen ~= true
+            -- This is an accepted destination, not support yet. Do not publish
+            -- the prediction distance as a successful support-sensor reading.
+            return safeUnit(readyNormal, oldUp), true, false,
+                nil, nil, math.huge
+        end
+        transitionNormal = nil
+        transitionCandidateSupportGap = false
+        transitionCandidateRoute = nil
+        transitionCandidateHit = nil
+        transitionCandidateNormal = nil
+    elseif transitionNormal then
+        -- From a floor/ceiling, a vertical wall must pass the dedicated
+        -- contact-gated path above. From wall gravity, horizontal-plane candidates
+        -- keep their own near-contact/direction checks before claiming gravity.
+        local transitionIsHorizontalPlane = math.abs(transitionNormal:Dot(UP)) > 0.985
+        local transitionIsCeilingUnderside = transitionNormal:Dot(UP) < -0.985
+        local rejectDistantHorizontalSurface = false
+
+        if transitionIsHorizontalPlane then
+            if transitionNormal:Dot(UP) >= 0.985
+                and oldUp:Dot(UP) < 0.985
+                and transitionCandidateRoute == "edge"
+                and transitionHit and transitionHit.Position
+            then
+                -- Same plane-clearance/tangent rule as the wall-edge floor controller.
+                rejectDistantHorizontalSurface = not wwGetWallEdgeFloorContact(
+                    transitionHit.Position, transitionNormal, oldUp, moveVector
+                )
+            else
+                local targetSurfaceGap = math.huge
+                if transitionHit and transitionHit.Position then
+                    if transitionNormal:Dot(UP) >= 0.985 and oldUp:Dot(UP) < 0.985 then
+                        targetSurfaceGap = getBodyPartFloorContactGap(transitionHit.Position, transitionNormal)
+                    else
+                        targetSurfaceGap = getCharacterSurfaceGap(transitionHit.Position)
+                        if transitionCandidateRoute == "edge" and transitionNormal:Dot(UP) <= -0.985 then
+                            targetSurfaceGap = getLegacyCharacterBoundsGap(transitionHit.Position)
+                        end
+                    end
+                end
+                local targetGapLimit = CFG.VerticalSurfaceContactGap
+                if transitionCandidateRoute == "edge" and transitionNormal:Dot(UP) <= -0.985 then
+                    targetGapLimit = targetGapLimit + wwGetWallEdgeToCeilingSpeedLead(oldUp, moveVector)
+                end
+                rejectDistantHorizontalSurface = targetSurfaceGap > targetGapLimit
+            end
+        end
+
+        if rejectDistantHorizontalSurface then
+            edgeTransitionPending = nil
+            forwardTransitionPending = nil
+            transitionCandidateRoute = nil
+            transitionCandidateHit = nil
+            transitionCandidateNormal = nil
+            transitionCandidateSupportGap = false
+            return oldUp, false, supportSeen, supportPoint, supportNormal, supportDistance
+        end
+        edgeTransitionPending = nil
+        forwardTransitionPending = nil
+        -- A target face is accepted independently from support confirmation.
+        -- Its normal/instance remain in transitionCandidate* for handoff logic,
+        -- while the support return values below describe actual near-contact only.
+        if not floorOrCeilingNow and transitionIsHorizontalPlane then
+            transitionCandidateRoute = transitionCandidateRoute or "forward"
+            transitionCandidateHit = transitionHit
+            transitionCandidateNormal = transitionNormal
+            transitionCandidateSupportGap = supportSeen ~= true
+            wwObserveTransitionPipelineCandidate(oldUp, transitionNormal, transitionCandidateRoute,
+                transitionHit, transitionNormal, edgeNow)
+            -- The target-plane distance is candidate evidence only. Let the
+            -- transition claim hold the handoff until a near-contact probe confirms it.
+            return safeUnit(transitionNormal, oldUp), true, false,
+                nil, nil, math.huge
+        end
+        transitionCandidateRoute = transitionCandidateRoute or "forward"
+        transitionCandidateHit = transitionHit
+        transitionCandidateNormal = transitionNormal
+        transitionCandidateSupportGap = supportSeen ~= true
+        wwObserveTransitionPipelineCandidate(oldUp, transitionNormal, transitionCandidateRoute,
+            transitionHit, transitionNormal, edgeNow)
+        -- Any accepted change to another face is a candidate, not support on
+        -- that destination. Do not carry old-face support across the gravity switch.
+        return safeUnit(transitionNormal, oldUp), true, false, nil, nil, math.huge
+    else
+        local readyNormal, readyHit = updateFloorWallEdgeTransition(
+            nil, nil, oldUp, stairMoveDir, true, "edge",
+            moveVector and moveVector.Magnitude or 0
+        )
+        if not readyNormal then
+            readyNormal, readyHit = updateFloorWallEdgeTransition(
+                nil, nil, oldUp, stairMoveDir, false, "forward",
+                moveVector and moveVector.Magnitude or 0
+            )
+        end
+        if readyNormal and readyHit then
+            transitionCandidateSupportGap = supportSeen ~= true
+            -- This is an accepted destination, not support yet. Do not publish
+            -- the prediction distance as a successful support-sensor reading.
+            return safeUnit(readyNormal, oldUp), true, false,
+                nil, nil, math.huge
+        end
     end
 
     if hitWeight > 0 and normalSum.Magnitude > 1e-5 then
         local candidate = normalSum.Unit
+
+        -- While wall gravity is active, a floor underneath/behind the player
+        -- can bias the broad fan toward world-up even when it is not a valid
+        -- wall-to-floor handoff. Horizontal transitions must pass the direct,
+        -- contact-gated candidate path above instead of this averaged fallback.
+        if oldUp:Dot(UP) < 0.985 and candidate:Dot(UP) > 0.985 then
+            return oldUp, false, supportSeen, supportPoint, supportNormal, supportDistance
+        end
+
         local nearEnough = closestDistance <= CFG.SurfaceSwitchDistance
         local closestDot = closestNormal and math.clamp(oldUp:Dot(closestNormal), -1, 1) or 1
         local changed = candidate:Dot(oldUp) < CFG.GravitySwitchDot
@@ -1944,7 +6530,13 @@ end
             changed = candidate:Dot(oldUp) < CFG.GravitySwitchDot
             strongSurface = candidate:Dot(oldUp) < CFG.SurfaceContactSnapDot
         end
-        return candidate, (nearEnough and (changed or strongSurface)), supportSeen, supportPoint, supportNormal, supportDistance
+        local changedSurface = nearEnough and (changed or strongSurface)
+        if changedSurface then
+            transitionCandidateRoute = "support"
+            transitionCandidateHit = nil
+            transitionCandidateNormal = candidate
+        end
+        return candidate, changedSurface, supportSeen, supportPoint, supportNormal, supportDistance
     end
 
     return oldUp, false, supportSeen, supportPoint, supportNormal, supportDistance
@@ -2571,6 +7163,47 @@ end
 ]=] },
     { name = '38_leaveCustom', source = [=[function leaveCustom(forceFreefall)
     customActive = false
+    if transitionClaim then
+        local claimRoute = transitionClaim.route
+        local claimTargetUp = safeUnit(transitionClaim.targetUp, UP)
+        local isIntentionalFloorHandoff = nativeFloorHandoffInProgress == true
+            and forceFreefall ~= true
+            and claimTargetUp:Dot(UP) >= 0.985
+            and (claimRoute == "wall-edge-to-floor" or claimRoute == "wall-to-floor")
+        if isIntentionalFloorHandoff then
+            wwWallDiag("WW_PIPE_NATIVE_FLOOR_HANDOFF",
+                "route=" .. tostring(claimRoute)
+                    .. ", seq=" .. tostring(transitionClaim.auditSequence or "unlinked")
+                    .. ", outcome=completed-native-gravity-restored", 0)
+            transitionCandidateAuditStats.completed = (transitionCandidateAuditStats.completed or 0) + 1
+            wwSafeTransitionAuditCall("native-floor-completion", wwSetTransitionAuditPhaseForClaim,
+                transitionClaim, "completed", "native-floor-handoff")
+            wwFinishTransitionClaimRoute(transitionClaim, "completed", "native-floor-handoff", os.clock())
+        else
+            wwSafeTransitionAuditCall("native-release", wwRecordTransitionAuditAbort,
+                transitionClaim, "leaveCustom-native-gravity-release"
+            )
+        end
+    end
+    transitionClaim = nil
+    nativeFloorHandoffInProgress = false
+    legacyEdgeCeilingSupportActive = false
+    ceilingContactSupportReachActive = false
+    legacyEdgeCeilingSourceWallHoldActive = false
+    legacyEdgeCeilingHandoffPending = false
+    legacyEdgeFloorSourceWallActive = false
+    legacyEdgeFloorSourceUp = nil
+    legacyEdgeFloorHandoffPosition = nil
+    legacyEdgeFloorStartedAt = 0
+    legacyEdgeFloorSourceWallIntentReleased = false
+    wwResetTransitionRouteStates()
+    floorToWallLock = nil
+    edgeTransitionPending = nil
+    forwardTransitionPending = nil
+    transitionCandidateRoute = nil
+    transitionCandidateHit = nil
+    transitionCandidateNormal = nil
+    transitionCandidateSupportGap = false
     restoreNativeWorkspaceGravity()
     filteredAdhesionDistance = nil
     microStepBlend = 0
@@ -2620,15 +7253,40 @@ end
     { name = '39_resetGravitySwitchBackState', source = [=[function resetGravitySwitchBackState()
     gravitySwitchBackUp = nil
     gravitySwitchBackAt = 0
+    floorToWallLock = nil
 end
 ]=] },
     { name = '40_resetSafeSurfaceState', source = [=[function resetSafeSurfaceState()
     surfaceLostAt = 0
+    ceilingApproachHoldStartedAt = 0
+    ceilingApproachHoldExpired = false
+    ceilingApproachHoldInstance = nil
+    ceilingApproachHoldPoint = nil
+    ceilingApproachHoldNormal = nil
+    nativeFloorHandoffInProgress = false
+    wwResetTransitionRouteStates()
     gravityTransitionActive = false
+    ceilingToWallLock = nil
+    floorToWallLock = nil
     orientationTransitionUntil = 0
     transitionFacing = nil
     lastFacingDirection = nil
     transitionMoveCandidate = nil
+    radialEdgeMemory = nil
+    edgeTransitionPending = nil
+    forwardTransitionPending = nil
+    transitionCandidateRoute = nil
+    transitionCandidateHit = nil
+    transitionCandidateNormal = nil
+    transitionCandidateSupportGap = false
+    clearEdgeFloorApproach()
+    if transitionClaim then
+        wwSafeTransitionAuditCall("safe-state-reset", wwRecordTransitionAuditAbort,
+            transitionClaim, "resetSafeSurfaceState-cleared-claim"
+        )
+    end
+    transitionClaim = nil
+    ceilingContactSupportReachActive = false
     safetySupportPoint = nil
     safetySupportNormal = nil
     safetySupportDistance = nil
@@ -2645,7 +7303,194 @@ end
 -- Gravity-side anti-flip guard. A real side switch happens immediately,
 -- but for 0.1s we refuse ONLY the previously-owned side. This does not delay
 -- the new side and does not block switching to a third side.]=] },
-    { name = '41_isGravitySwitchBackBlocked', source = [=[function isGravitySwitchBackBlocked(candidateUp, now)
+    { name = '41_isGravitySwitchBackBlocked', source = [=[-- A transition can return to its source when actual body-to-surface contact
+-- is verified. Input direction may provide intent, but it is not required when
+-- physical contact itself proves the source surface has been regained. Cached
+-- or distant candidate hits cannot clear the directional guard.
+function wwIsIntentionalSurfaceReturn(candidateUp, moveVector, hit, normal)
+    if not root or not moveVector or moveVector.Magnitude <= 0.05 then return false end
+    if not hit or not hit.Instance or not hit.Instance.Parent or not hit.Position or not normal then
+        return false
+    end
+
+    local candidate = safeUnit(candidateUp, currentUp)
+    local surfaceNormal = safeUnit(normal, candidate)
+    if surfaceNormal:Dot(candidate) < 0.90 then return false end
+
+    -- Source returns require deliberate movement toward the candidate surface.
+    -- Physical proximity by itself must never reverse a transition that has only
+    -- just committed (for example floor->wall->floor on the next physics frame).
+    local worldMove = getWorldMove(moveVector, safeUnit(currentUp, UP))
+    local inputToward = worldMove.Magnitude > 0.05
+        and worldMove.Unit:Dot(-candidate) >= CFG.EdgeFloorApproachInputDot
+    if not inputToward then return false end
+
+    if math.abs(candidate:Dot(UP)) >= 0.985 then
+        -- For floor/ceiling returns, the ray point can be ahead along the plane.
+        -- Test perpendicular body clearance plus a bounded tangent distance so a
+        -- near-plane candidate is not rejected solely by point-to-box distance.
+        local unusedContactGap, planeGap, tangentGap = getBodyPartFloorContactGap(
+            hit.Position, surfaceNormal
+        )
+        local planeLimit = CFG.VerticalSurfaceContactGap + 0.10
+        local tangentLimit = CFG.FloorContactTangentAllowance + 0.60
+        local physicalPlaneContact = planeGap <= planeLimit and tangentGap <= tangentLimit
+        if physicalPlaneContact then
+            return true
+        end
+        local boundsGap = getCharacterSurfaceGap(hit.Position)
+        if boundsGap <= planeLimit then
+            wwWallDiag("WW_ROUTE_SOURCE_RETURN_REJECTED_BODY_GAP",
+                "surface=" .. wwDescribeSurfaceOrientation(candidate)
+                    .. ", boundsGap=" .. string.format("%.2f", boundsGap)
+                    .. ", planeGap=" .. string.format("%.2f", planeGap)
+                    .. ", tangentGap=" .. string.format("%.2f", tangentGap)
+                    .. ", inputToward=true"
+                    .. ", bodyPlaneContact=false"
+                    .. ", planeLimit=" .. string.format("%.2f", planeLimit)
+                    .. ", tangentLimit=" .. string.format("%.2f", tangentLimit), 0.20)
+        end
+        return false
+    end
+
+    local bodyGap = getBodyPartSurfaceGap(hit.Position)
+    local physicalSurfaceContact = bodyGap <= CFG.VerticalSurfaceContactGap + 0.10
+    if physicalSurfaceContact then return true end
+
+    local boundsGap = getCharacterSurfaceGap(hit.Position)
+    if boundsGap <= CFG.VerticalSurfaceContactGap + 0.10 then
+        wwWallDiag("WW_ROUTE_SOURCE_RETURN_REJECTED_BODY_GAP",
+            "surface=" .. wwDescribeSurfaceOrientation(candidate)
+                .. ", boundsGap=" .. string.format("%.2f", boundsGap)
+                .. ", bodyGap=" .. string.format("%.2f", bodyGap)
+                .. ", inputToward=true"
+                .. ", bodyContact=false"
+                .. ", requiredBodyGap=" .. string.format("%.2f", CFG.VerticalSurfaceContactGap + 0.10), 0.20)
+    end
+    return false
+end
+function isGravitySwitchBackBlocked(candidateUp, now, moveVector, hit, normal)
+    local candidate = safeUnit(candidateUp, currentUp)
+    local deliberateSourceReturn = wwIsIntentionalSurfaceReturn(
+        candidate, moveVector, hit, normal
+    )
+    local lock = ceilingToWallLock
+
+    if lock then
+        local age = now - (lock.startedAt or now)
+        local sourceUp = safeUnit(lock.sourceUp, UP)
+        local targetUp = safeUnit(lock.targetUp, currentUp)
+        local candidateIsSourceCeiling = candidate:Dot(sourceUp) >= CFG.GravitySwitchBackDot
+        local targetInstanceValid = lock.targetInstance ~= nil
+            and lock.targetInstance.Parent ~= nil
+
+        local sourceProgress = 0
+        if root and lock.startPosition then
+            sourceProgress = (root.Position - lock.startPosition):Dot(sourceUp)
+        end
+        local movedAway = sourceProgress >= CFG.CeilingToWallLockReleaseProgress
+        local wallSupport = surfaceSupportSeen == true
+            and typeof(surfaceSupportNormal) == "Vector3"
+            and surfaceSupportNormal:Dot(targetUp) >= 0.90
+            and (tonumber(surfaceSupportDistance) or math.huge) <= CFG.CeilingToWallLockSupportDistance
+
+        if age > CFG.CeilingToWallLockMaxTime or not targetInstanceValid then
+            ceilingToWallLock = nil
+            wwWallDiag("CEILING_TO_WALL_LOCK_EXPIRED",
+                "age=" .. string.format("%.2f", age)
+                    .. ", progress=" .. string.format("%.2f", sourceProgress)
+                    .. ", wallSupport=" .. tostring(wallSupport),
+                0
+            )
+        elseif not candidateIsSourceCeiling and movedAway and wallSupport then
+            ceilingToWallLock = nil
+            wwWallDiag("CEILING_TO_WALL_LOCK_RELEASED",
+                "age=" .. string.format("%.2f", age)
+                    .. ", progress=" .. string.format("%.2f", sourceProgress)
+                    .. ", supportDist=" .. string.format("%.2f", tonumber(surfaceSupportDistance) or math.huge),
+                0
+            )
+        elseif candidateIsSourceCeiling and not deliberateSourceReturn then
+            wwWallDiag("CEILING_TO_WALL_RETURN_BLOCKED",
+                "age=" .. string.format("%.2f", age)
+                    .. ", progress=" .. string.format("%.2f", sourceProgress)
+                    .. ", wallSupport=" .. tostring(wallSupport)
+                    .. ", supportDist=" .. tostring(surfaceSupportDistance),
+                0.20
+            )
+            return true
+        elseif candidateIsSourceCeiling and deliberateSourceReturn then
+            wwWallDiag("CEILING_TO_WALL_RETURN_ALLOWED",
+                "reason=directed-input-and-body-contact"
+                    .. ", age=" .. string.format("%.2f", age)
+                    .. ", progress=" .. string.format("%.2f", sourceProgress),
+                0.15
+            )
+        end
+    end
+
+    local floorLock = floorToWallLock
+    if floorLock then
+        local lockAge = now - (floorLock.startedAt or now)
+        local lockRise = 0
+        if root and floorLock.startPosition then
+            lockRise = (root.Position - floorLock.startPosition):Dot(UP)
+        end
+        local targetUp = safeUnit(floorLock.targetUp, currentUp)
+        local targetAligned = floorLock.targetUp ~= nil
+            and safeUnit(currentUp, UP):Dot(targetUp) >= CFG.GravitySwitchBackDot
+        local targetSupportNormalMatches = safetySupportNormal ~= nil
+            and safeUnit(safetySupportNormal, targetUp):Dot(targetUp) >= 0.90
+        local targetSupportRootNear = (tonumber(safetySupportDistance) or math.huge)
+            <= wwGetTransitionRootContactLimit()
+        local targetSupportBodyGap = safetySupportPoint
+            and getBodyPartSurfaceGap(safetySupportPoint) or math.huge
+        local targetSupportBodyContact = targetSupportBodyGap
+            <= CFG.VerticalSurfaceContactGap + 0.10
+        local targetSupportNear = targetSupportNormalMatches
+            and (targetSupportRootNear or targetSupportBodyContact)
+        -- One body-contact frame on the new wall does not mean the character has
+        -- cleared the old floor. Keep the source-floor guard until measurable
+        -- separation occurs or the bounded timeout expires. Directed, verified
+        -- contact back to the source floor is handled by the exception above.
+        local sourceFloorCleared = lockRise >= CFG.FloorToWallReturnLockReleaseProgress
+        local targetStable = transitionClaim == nil and targetAligned and targetSupportNear
+            and sourceFloorCleared
+        local candidateIsSourceFloor = candidate:Dot(UP) >= CFG.GravitySwitchBackDot
+
+        if lockAge > CFG.FloorToWallReturnLockMaxTime or targetStable then
+            floorToWallLock = nil
+            wwWallDiag("FLOOR_TO_WALL_LOCK_RELEASED",
+                "age=" .. string.format("%.2f", lockAge)
+                    .. ", rise=" .. string.format("%.2f", lockRise)
+                    .. ", targetStable=" .. tostring(targetStable)
+                    .. ", targetSupportNear=" .. tostring(targetSupportNear)
+                    .. ", targetSupportBodyGap=" .. string.format("%.2f", targetSupportBodyGap),
+                0
+            )
+        elseif candidateIsSourceFloor and not deliberateSourceReturn then
+            wwWallDiag("FLOOR_TO_WALL_RETURN_BLOCKED",
+                "age=" .. string.format("%.2f", lockAge)
+                    .. ", rise=" .. string.format("%.2f", lockRise)
+                    .. ", targetAligned=" .. tostring(targetAligned)
+                    .. ", targetSupportNear=" .. tostring(targetSupportNear),
+                0.20
+            )
+            return true
+        elseif candidateIsSourceFloor and deliberateSourceReturn then
+            wwWallDiag("FLOOR_TO_WALL_RETURN_ALLOWED",
+                "reason=directed-input-and-body-contact"
+                    .. ", age=" .. string.format("%.2f", lockAge)
+                    .. ", rise=" .. string.format("%.2f", lockRise),
+                0.15
+            )
+        end
+    end
+
+    if deliberateSourceReturn then
+        return false
+    end
+
     if not gravitySwitchBackUp then
         return false
     end
@@ -2654,19 +7499,139 @@ end
         return false
     end
 
-    local candidate = safeUnit(candidateUp, currentUp)
     return candidate:Dot(gravitySwitchBackUp) >= CFG.GravitySwitchBackDot
 end
 ]=] },
     { name = '42_commitGravitySide', source = [=[function commitGravitySide(newUp)
     local oldUp = safeUnit(currentUp, UP)
     local committedUp = safeUnit(newUp, oldUp)
+    ceilingContactSupportReachActive = committedUp:Dot(UP) <= -0.985
+    if committedUp:Dot(UP) < 0.985 then
+        legacyEdgeFloorSourceWallActive = false
+        legacyEdgeFloorSourceUp = nil
+        legacyEdgeFloorHandoffPosition = nil
+        legacyEdgeFloorStartedAt = 0
+        legacyEdgeFloorSourceWallIntentReleased = false
+    end
+
+    -- Only an explicit selection by the isolated v42-style wall-edge handler
+    -- may enable the longer root-contact/adhesion envelope.
+    local useLegacyEdgeCeilingSupport = legacyEdgeCeilingHandoffPending
+    legacyEdgeCeilingHandoffPending = false
+    if useLegacyEdgeCeilingSupport
+        and transitionResolvedRoute == "wall-edge-to-ceiling-underside"
+        and math.abs(oldUp:Dot(UP)) < 0.985
+        and committedUp:Dot(UP) <= -0.985
+    then
+        legacyEdgeCeilingSupportActive = true
+        legacyEdgeCeilingSourceWallHoldActive = true
+        legacyEdgeCeilingSourceUp = oldUp
+        legacyEdgeCeilingHandoffPosition = root and root.Position or nil
+        legacyEdgeCeilingStartedAt = os.clock()
+        wwWallDiag("WW_LEGACY_EDGE_CEILING_SUPPORT_MODE", "enabled=true, rootReach="
+            .. string.format("%.2f", CFG.LegacyWallEdgeCeilingSupportDistance)
+            .. ", sourceWallHold=directional-until-input-or-clear", 0)
+    elseif committedUp:Dot(UP) > -0.985 then
+        legacyEdgeCeilingSupportActive = false
+        legacyEdgeCeilingSourceWallHoldActive = false
+        legacyEdgeCeilingSourceUp = nil
+        legacyEdgeCeilingHandoffPosition = nil
+        legacyEdgeCeilingStartedAt = 0
+    end
+
+    if customActive and oldUp:Dot(committedUp) < CFG.GravitySwitchBackDot then
+        local legacyRoute = transitionCandidateRoute
+        local route = transitionResolvedRoute or legacyRoute
+        local hit = transitionCandidateHit
+        local normal = transitionCandidateNormal
+        local validRoute = wwIsManagedTransitionRoute(route)
+            or legacyRoute == "edge" or legacyRoute == "forward"
+        if validRoute and hit and hit.Instance and hit.Instance.Parent and normal then
+            local targetNormal = safeUnit(normal, committedUp)
+            if targetNormal:Dot(committedUp) >= 0.90 then
+                local handoffGrace = CFG.TransitionSupportGrace
+                if oldUp:Dot(UP) <= -0.985
+                    and math.abs(committedUp:Dot(UP)) < 0.30
+                    and (route == "ceiling-to-wall" or route == "ceiling-edge-to-wall-underside"
+                        or legacyRoute == "forward")
+                then
+                    handoffGrace = CFG.CeilingToWallHandoffGrace
+                elseif route == "floor-edge-to-wall-underside" then
+                    handoffGrace = CFG.FloorEdgeWallHandoffGrace
+                elseif route == "wall-to-ceiling" then
+                    handoffGrace = CFG.WallToCeilingHandoffGrace
+                elseif route == "wall-edge-to-ceiling-underside" then
+                    handoffGrace = CFG.WallEdgeCeilingHandoffGrace
+                end
+                local commitNow = os.clock()
+                local oldClaim = transitionClaim
+                local pipelineState = nil
+                if wwIsManagedTransitionRoute(route) then
+                    pipelineState = wwEnsureTransitionPipelineState(
+                        route, oldUp, committedUp, hit, targetNormal, commitNow
+                    )
+                end
+                if oldClaim then
+                    wwSafeTransitionAuditCall("claim-replacement", wwRecordTransitionAuditClaimReplacement,
+                        oldClaim, route, committedUp, commitNow
+                    )
+                    if oldClaim.pipelineState and oldClaim.pipelineState ~= pipelineState then
+                        wwFinishTransitionClaimRoute(oldClaim, "superseded", "replaced-by-authorized-chain", commitNow)
+                    end
+                end
+                transitionCommitSequence = transitionCommitSequence + 1
+                transitionClaim = {
+                    route = route,
+                    legacyRoute = legacyRoute,
+                    fromUp = oldUp,
+                    targetUp = committedUp,
+                    point = hit.Position,
+                    normal = targetNormal,
+                    instance = hit.Instance,
+                    startedAt = commitNow,
+                    grace = handoffGrace,
+                    leaseId = transitionCommitSequence,
+                    ownerAttemptId = pipelineState and pipelineState.attemptId or nil,
+                    parentLeaseId = oldClaim and oldClaim.leaseId or nil,
+                    pipelineState = pipelineState,
+                    leasePhase = "committed",
+                }
+                wwSafeTransitionAuditCall("commit", wwRecordTransitionAuditCommit, transitionClaim)
+                if pipelineState then
+                    pipelineState.committedAt = commitNow
+                    wwSetTransitionPipelinePhase(pipelineState, "committed", commitNow, "gravity-side-committed")
+                end
+                gravityTransitionActive = true
+                wwWallDiag("TRANSITION_CLAIM_ARMED",
+                    "route=" .. route
+                        .. ", fromY=" .. string.format("%.2f", oldUp:Dot(UP))
+                        .. ", toY=" .. string.format("%.2f", committedUp:Dot(UP)),
+                    0
+                )
+            end
+        end
+    end
 
     -- Only remember a meaningful side change. Tiny normal drift should not
     -- restart the 0.1s anti-flip window every frame.
     if oldUp:Dot(committedUp) < CFG.GravitySwitchBackDot then
         gravitySwitchBackUp = oldUp
         gravitySwitchBackAt = os.clock()
+
+        if oldUp:Dot(UP) >= 0.985 and math.abs(committedUp:Dot(UP)) < 0.30 then
+            floorToWallLock = {
+                targetUp = committedUp,
+                startPosition = root and root.Position or nil,
+                startedAt = os.clock(),
+            }
+            wwWallDiag("FLOOR_TO_WALL_LOCK_ARMED",
+                "targetY=" .. string.format("%.2f", committedUp:Dot(UP))
+                    .. ", maxTime=" .. string.format("%.2f", CFG.FloorToWallReturnLockMaxTime),
+                0
+            )
+        elseif oldUp:Dot(UP) < 0.985 and committedUp:Dot(UP) >= 0.985 then
+            floorToWallLock = nil
+        end
 
         -- Preserve the SURFACE PATH, not just a world-space LookVector.
         -- Prefer the movement direction from immediately before the surface
@@ -2703,11 +7668,110 @@ end
         orientationTransitionUntil = os.clock() + CFG.GravityTransition
     end
 
+    if ceilingToWallLock
+        and committedUp:Dot(safeUnit(ceilingToWallLock.sourceUp, committedUp)) >= CFG.GravitySwitchBackDot
+    then
+        ceilingToWallLock = nil
+        wwWallDiag("CEILING_TO_WALL_LOCK_CLEARED", "reason=returned-to-source-ceiling", 0)
+    end
+
+    if oldUp:Dot(UP) <= -0.985
+        and math.abs(committedUp:Dot(UP)) < 0.30
+        and transitionCandidateRoute == "forward"
+        and transitionCandidateHit
+        and transitionCandidateHit.Instance
+    then
+        ceilingToWallLock = {
+            sourceUp = oldUp,
+            targetUp = committedUp,
+            startPosition = root and root.Position or nil,
+            startedAt = os.clock(),
+            targetInstance = transitionCandidateHit.Instance,
+        }
+        wwWallDiag("CEILING_TO_WALL_LOCK_ARMED",
+            "route=forward, targetY=" .. string.format("%.2f", committedUp:Dot(UP))
+                .. ", maxTime=" .. string.format("%.2f", CFG.CeilingToWallLockMaxTime),
+            0
+        )
+    end
+
     currentUp = committedUp
     return committedUp
 end
 ]=] },
-    { name = '43_updateSurface', source = [=[function updateSurface(dt, moveVector)
+    { name = '42f_updateLegacyEdgeFloorFreshIntent', source = [=[function wwUpdateLegacyEdgeFloorFreshIntent(moveVector)
+    legacyEdgeFloorSourceWallInputDot = 0
+    if not legacyEdgeFloorSourceWallActive then return end
+
+    local sourceWallAge = os.clock() - (legacyEdgeFloorStartedAt or 0)
+    local sourceWallUp = safeUnit(legacyEdgeFloorSourceUp, UP)
+    if moveVector and moveVector.Magnitude > 0.05 then
+        legacyEdgeFloorSourceWallInputDot = moveVector.Unit:Dot(-sourceWallUp)
+    end
+
+    -- Ignore the landing frame and its immediate follow-up, when the movement
+    -- vector may still reflect the source-wall orientation. After the settle
+    -- delay, neutral/away input arms a new deliberate return to the same wall.
+    if sourceWallAge >= CFG.LegacyWallEdgeFloorSourceWallFreshIntentDelay
+        and legacyEdgeFloorSourceWallInputDot < CFG.EdgeFloorApproachInputDot
+        and legacyEdgeFloorSourceWallIntentReleased ~= true
+    then
+        legacyEdgeFloorSourceWallIntentReleased = true
+        wwWallDiag("WW_LEGACY_EDGE_FLOOR_FRESH_INTENT_ARMED",
+            "age=" .. string.format("%.2f", sourceWallAge)
+                .. ", sourceWallInputDot=" .. string.format("%.2f", legacyEdgeFloorSourceWallInputDot)
+                .. ", threshold=" .. string.format("%.2f", CFG.EdgeFloorApproachInputDot)
+                .. ", reason=neutral-or-away-input-after-settle", 0)
+    end
+end
+]=] },
+    { name = '43_updateSurface', source = [=[function wwFindCurrentOwnedPlaneBodyContactSupport(currentUp)
+    if not customActive or not root or not currentUp then return nil end
+    local ownedUp = safeUnit(currentUp, UP)
+    local ownedHit = cast(root.Position, -ownedUp, CFG.FaceProbeMaxSupportDistance)
+    if not ownedHit or not ownedHit.Instance or not ownedHit.Instance.Parent or not ownedHit.Position then
+        return nil
+    end
+
+    local ownedNormal = orientSurfaceNormal(ownedHit, -ownedUp)
+    if not ownedNormal or ownedUp:Dot(ownedNormal) < CFG.SurfaceSafetySupportNormalDot then
+        return nil
+    end
+
+    local ownedCanCollide = true
+    if ownedHit.Instance:IsA("BasePart") then
+        ownedCanCollide = ownedHit.Instance.CanCollide
+    end
+    if not ownedCanCollide then return nil end
+
+    local ownedRootGap = math.abs((root.Position - ownedHit.Position):Dot(ownedNormal))
+    local ownedBodyGap, ownedBodyPlaneGap, ownedBodyTangentGap =
+        getBodyPartFloorContactGap(ownedHit.Position, ownedNormal)
+    local ownedContactLimit = CFG.VerticalSurfaceContactGap + 0.10
+    if ownedRootGap > CFG.FaceProbeMaxSupportDistance
+        or ownedBodyGap > ownedContactLimit
+        or ownedBodyPlaneGap > ownedContactLimit then
+        return nil
+    end
+
+    wwWallDiag("WW_CURRENT_SUPPORT_FROM_OWNED_PLANE_CONTACT",
+        "target=" .. tostring(ownedHit.Instance.Name)
+            .. ", orientation=" .. wwDescribeSurfaceOrientation(ownedUp)
+            .. ", supportDot=" .. string.format("%.2f", ownedUp:Dot(ownedNormal))
+            .. ", rootPlaneGap=" .. string.format("%.2f", ownedRootGap)
+            .. ", bodyContactGap=" .. string.format("%.2f", ownedBodyGap)
+            .. ", bodyPlaneGap=" .. string.format("%.2f", ownedBodyPlaneGap)
+            .. ", bodyTangentGap=" .. string.format("%.2f", ownedBodyTangentGap)
+            .. ", reason=current-plane-ray-and-body-contact-confirmation", 0.20)
+
+    return {
+        point = ownedHit.Position,
+        normal = ownedNormal,
+        distance = ownedRootGap,
+    }
+end
+
+function updateSurface(dt, moveVector)
     if not root then return end
 
     -- Once the safety handoff has returned control to Roblox gravity, do not
@@ -2727,11 +7791,363 @@ end
     end
 
     local detected, surfaceCandidate, supportSeen, supportPoint, supportNormal, supportDistance = getGravityUp(currentUp, moveVector)
+    if surfaceCandidate ~= true then
+        local resumedState = wwTryResumeQueuedTransitionCandidate(currentUp, moveVector, os.clock())
+        if resumedState then
+            detected = safeUnit(resumedState.toUp, currentUp)
+            surfaceCandidate = true
+            transitionCandidateRoute = resumedState.legacyRoute
+            transitionCandidateHit = resumedState.hit
+            transitionCandidateNormal = resumedState.normal
+            transitionCandidateSupportGap = false
+            wwWallDiag("WW_PIPE_QUEUED_CANDIDATE_RETRIED",
+                "attempt=" .. tostring(resumedState.attemptId)
+                    .. ", route=" .. tostring(resumedState.route)
+                    .. ", state=queued-to-live-candidate", 0)
+        end
+    end
+    if surfaceCandidate == true then
+        wwSafeTransitionAuditCall("capture", wwCaptureTransitionCandidate,
+            currentUp,
+            detected,
+            true,
+            transitionCandidateRoute,
+            transitionCandidateHit,
+            transitionCandidateNormal,
+            moveVector,
+            os.clock()
+        )
+    else
+        transitionCandidateAuditCurrent = nil
+    end
+    -- Edge-only landing handoff. The source wall must not steal gravity back
+    -- while native floor physics is settling, but a deliberate input into that
+    -- same wall must still be allowed to use the ordinary floor-to-wall route.
+    if legacyEdgeFloorSourceWallActive then
+        local floorSourceAge = os.clock() - (legacyEdgeFloorStartedAt or 0)
+        wwUpdateLegacyEdgeFloorFreshIntent(moveVector)
+        local floorSourceCandidate = currentUp:Dot(UP) >= 0.985
+            and surfaceCandidate == true
+            and math.abs(detected:Dot(UP)) < 0.985
+            and (transitionCandidateRoute == "forward" or transitionCandidateRoute == "edge")
+            and transitionCandidateHit and transitionCandidateNormal
+            and legacyEdgeFloorSourceUp and legacyEdgeFloorHandoffPosition
+        if floorSourceCandidate then
+            local floorSourceUp = safeUnit(legacyEdgeFloorSourceUp, UP)
+            local floorSourceNormal = safeUnit(transitionCandidateNormal, floorSourceUp)
+            local floorSourceProgress = (root.Position - legacyEdgeFloorHandoffPosition):Dot(floorSourceUp)
+            local floorSourcePlaneOffset = math.abs((transitionCandidateHit.Position - legacyEdgeFloorHandoffPosition):Dot(floorSourceUp))
+            local sameSourceWall = detected:Dot(floorSourceUp) >= 0.90
+                and floorSourceNormal:Dot(floorSourceUp) >= 0.90
+                and floorSourcePlaneOffset <= 3.50
+            if sameSourceWall then
+                local deliberateWallIntent, sourceWallGap = wwIsIntentionalSourceWallTransition(
+                    transitionCandidateHit, UP, moveVector
+                )
+                local floorGrounded = getGrounded(UP)
+                -- Honor the configured settling hold before positional progress
+                -- can release this guard. A fast step previously bypassed the
+                -- 0.55s window (the .98 log showed progress=1.01 at ~0.08s).
+                if deliberateWallIntent and legacyEdgeFloorSourceWallIntentReleased == true then
+                    legacyEdgeFloorSourceWallActive = false
+                    legacyEdgeFloorSourceUp = nil
+                    legacyEdgeFloorHandoffPosition = nil
+                    legacyEdgeFloorStartedAt = 0
+                    legacyEdgeFloorSourceWallIntentReleased = false
+                    wwWallDiag("WW_LEGACY_EDGE_FLOOR_SOURCE_WALL_RELEASED",
+                        "reason=fresh-directed-floor-to-wall, gap=" .. string.format("%.2f", sourceWallGap)
+                            .. ", groundedFloor=" .. tostring(floorGrounded)
+                            .. ", freshIntentReady=true", 0)
+                elseif floorGrounded or floorSourceAge <= CFG.LegacyWallEdgeFloorSourceWallHoldTime then
+                    detected = currentUp
+                    surfaceCandidate = false
+                    transitionCandidateRoute = nil
+                    transitionCandidateHit = nil
+                    transitionCandidateNormal = nil
+                    transitionCandidateSupportGap = false
+                    wwWallDiag("WW_LEGACY_EDGE_FLOOR_SOURCE_WALL_HELD",
+                        "age=" .. string.format("%.2f", floorSourceAge)
+                            .. ", groundedFloor=" .. tostring(floorGrounded)
+                            .. ", progress=" .. string.format("%.2f", floorSourceProgress)
+                            .. ", planeOffset=" .. string.format("%.2f", floorSourcePlaneOffset)
+                            .. ", deliberateWallIntent=" .. tostring(deliberateWallIntent)
+                            .. ", freshIntentReady=" .. tostring(legacyEdgeFloorSourceWallIntentReleased == true)
+                            .. ", sourceWallInputDot=" .. string.format("%.2f", legacyEdgeFloorSourceWallInputDot),
+                        0.12
+                    )
+                elseif floorSourceProgress >= CFG.LegacyWallEdgeFloorSourceWallClearProgress then
+                    legacyEdgeFloorSourceWallActive = false
+                    legacyEdgeFloorSourceUp = nil
+                    legacyEdgeFloorHandoffPosition = nil
+                    legacyEdgeFloorStartedAt = 0
+                    legacyEdgeFloorSourceWallIntentReleased = false
+                    wwWallDiag("WW_LEGACY_EDGE_FLOOR_SOURCE_WALL_RELEASED",
+                        "reason=source-wall-cleared, progress=" .. string.format("%.2f", floorSourceProgress), 0)
+                else
+                    legacyEdgeFloorSourceWallActive = false
+                    legacyEdgeFloorSourceUp = nil
+                    legacyEdgeFloorHandoffPosition = nil
+                    legacyEdgeFloorStartedAt = 0
+                    legacyEdgeFloorSourceWallIntentReleased = false
+                    wwWallDiag("WW_LEGACY_EDGE_FLOOR_SOURCE_WALL_RELEASED",
+                        "reason=unsupported-timeout, groundedFloor=false", 0)
+                end
+            else
+                -- A different wall is not part of this handoff and must never be blocked.
+                legacyEdgeFloorSourceWallActive = false
+                legacyEdgeFloorSourceUp = nil
+                legacyEdgeFloorHandoffPosition = nil
+                legacyEdgeFloorStartedAt = 0
+                legacyEdgeFloorSourceWallIntentReleased = false
+                wwWallDiag("WW_LEGACY_EDGE_FLOOR_SOURCE_WALL_RELEASED",
+                    "reason=different-wall-candidate", 0)
+            end
+        elseif floorSourceAge > CFG.LegacyWallEdgeFloorSourceWallHoldTime and not getGrounded(UP) then
+            legacyEdgeFloorSourceWallActive = false
+            legacyEdgeFloorSourceUp = nil
+            legacyEdgeFloorHandoffPosition = nil
+            legacyEdgeFloorStartedAt = 0
+            legacyEdgeFloorSourceWallIntentReleased = false
+            wwWallDiag("WW_LEGACY_EDGE_FLOOR_SOURCE_WALL_RELEASED",
+                "reason=unsupported-timeout", 0)
+        end
+    end
+
+    -- Keep ceiling adhesion support and source-wall suppression as separate states.
+    -- Only suppress the previous wall while the legacy ceiling handoff is settling;
+    -- pressing toward that wall with verified near-contact releases suppression so
+    -- the ordinary ceiling-to-wall route can run immediately.
+    if legacyEdgeCeilingSourceWallHoldActive
+        and legacyEdgeCeilingSupportActive
+        and currentUp:Dot(UP) <= -0.985
+        and surfaceCandidate == true
+        and math.abs(detected:Dot(UP)) < 0.985
+        and (transitionCandidateRoute == "forward" or transitionCandidateRoute == "edge")
+        and transitionCandidateHit and transitionCandidateNormal
+        and legacyEdgeCeilingSourceUp
+        and legacyEdgeCeilingHandoffPosition
+    then
+        local sourceUp = safeUnit(legacyEdgeCeilingSourceUp, UP)
+        local candidateNormal = safeUnit(transitionCandidateNormal, sourceUp)
+        local sourceAge = os.clock() - (legacyEdgeCeilingStartedAt or 0)
+        local sourceProgress = (root.Position - legacyEdgeCeilingHandoffPosition):Dot(sourceUp)
+        local sourcePlaneOffset = math.abs((transitionCandidateHit.Position - legacyEdgeCeilingHandoffPosition):Dot(sourceUp))
+        local sameSourceWall = detected:Dot(sourceUp) >= 0.90
+            and candidateNormal:Dot(sourceUp) >= 0.90
+            and sourcePlaneOffset <= 3.50
+        if sameSourceWall then
+            local deliberateWallIntent, sourceWallGap = wwIsIntentionalSourceWallTransition(
+                transitionCandidateHit, currentUp, moveVector
+            )
+            if deliberateWallIntent then
+                legacyEdgeCeilingSourceWallHoldActive = false
+                wwWallDiag("WW_LEGACY_EDGE_CEILING_SOURCE_WALL_RELEASED",
+                    "reason=directed-ceiling-to-wall, age=" .. string.format("%.2f", sourceAge)
+                        .. ", gap=" .. string.format("%.2f", sourceWallGap), 0)
+            elseif sourceProgress < CFG.LegacyWallEdgeCeilingSourceWallClearProgress then
+                detected = currentUp
+                surfaceCandidate = false
+                transitionCandidateRoute = nil
+                transitionCandidateHit = nil
+                transitionCandidateNormal = nil
+                transitionCandidateSupportGap = false
+                wwWallDiag("WW_LEGACY_EDGE_CEILING_SOURCE_WALL_HELD",
+                    "age=" .. string.format("%.2f", sourceAge)
+                        .. ", progress=" .. string.format("%.2f", sourceProgress)
+                        .. ", planeOffset=" .. string.format("%.2f", sourcePlaneOffset),
+                    0.20
+                )
+            else
+                legacyEdgeCeilingSourceWallHoldActive = false
+                wwWallDiag("WW_LEGACY_EDGE_CEILING_SOURCE_WALL_RELEASED",
+                    "reason=source-wall-cleared, age=" .. string.format("%.2f", sourceAge)
+                        .. ", progress=" .. string.format("%.2f", sourceProgress), 0)
+            end
+        else
+            -- A different wall is an independent destination, not the previous source.
+            legacyEdgeCeilingSourceWallHoldActive = false
+            wwWallDiag("WW_LEGACY_EDGE_CEILING_SOURCE_WALL_RELEASED",
+                "reason=different-wall-candidate, age=" .. string.format("%.2f", sourceAge), 0)
+        end
+    end
+
+    local legacyEdgeFloorSwitchbackBlocked = false
+    if surfaceCandidate == true
+        and transitionCandidateRoute == "edge"
+        and math.abs(currentUp:Dot(UP)) < 0.985
+        and detected:Dot(UP) >= 0.985
+    then
+        legacyEdgeFloorSwitchbackBlocked = isGravitySwitchBackBlocked(
+            detected, os.clock(), moveVector, transitionCandidateHit, transitionCandidateNormal
+        )
+    end
+    local legacyEdgeHandoffRoute, legacyEdgeFloorGuardOverride = wwGetLegacyWallEdgeHandoffRoute(
+        currentUp,
+        detected,
+        surfaceCandidate == true,
+        transitionCandidateRoute,
+        transitionCandidateHit,
+        transitionCandidateNormal,
+        moveVector,
+        legacyEdgeFloorSwitchbackBlocked,
+        supportSeen == true
+    )
+    if legacyEdgeHandoffRoute and transitionClaim
+        and transitionClaim.route ~= legacyEdgeHandoffRoute
+    then
+        local ownerTargetContact = wwIsClaimTargetPhysicallyReached(currentUp, transitionClaim)
+        local ownerSupportStable = wwIsTransitionClaimSupportStable(transitionClaim, os.clock())
+        -- Preserve the existing special edge-ceiling path. Other legacy fast paths
+        -- cannot skip the owner's stable-support confirmation merely because limbs
+        -- briefly touch its target plane during rotation.
+        local edgeCeilingException = legacyEdgeHandoffRoute == "wall-edge-to-ceiling-underside"
+        if not ownerTargetContact or (not ownerSupportStable and not edgeCeilingException) then
+            wwWallDiag("WW_LEGACY_EDGE_HANDOFF_DEFERRED_BY_OWNER",
+                "owner=" .. tostring(transitionClaim.route)
+                    .. ", candidate=" .. tostring(legacyEdgeHandoffRoute)
+                    .. ", ownerAge=" .. string.format("%.3f", os.clock() - (transitionClaim.startedAt or os.clock()))
+                    .. ", ownerTargetContact=" .. tostring(ownerTargetContact)
+                    .. ", ownerSupportStable=" .. tostring(ownerSupportStable)
+                    .. ", supportStableFor=" .. string.format("%.3f", transitionClaim.supportSince and math.max(0, os.clock() - transitionClaim.supportSince) or 0)
+                    .. ", required=" .. string.format("%.3f", CFG.TransitionSupportConfirmTime)
+                    .. ", reason=legacy-edge-cannot-replace-unconfirmed-owner", 0.08)
+            legacyEdgeHandoffRoute = nil
+            legacyEdgeFloorGuardOverride = false
+        end
+    end
+    legacyEdgeCeilingHandoffPending = legacyEdgeHandoffRoute == "wall-edge-to-ceiling-underside"
+    local routeAllowed = true
+    local resolvedRoute = legacyEdgeHandoffRoute
+    if not legacyEdgeHandoffRoute then
+        routeAllowed, resolvedRoute = wwAuthorizeTransitionCandidate(
+            currentUp,
+            detected,
+            surfaceCandidate == true,
+            transitionCandidateRoute,
+            transitionCandidateHit,
+            transitionCandidateNormal,
+            moveVector,
+            os.clock()
+        )
+    end
+    if transitionCandidateAuditCurrent then
+        wwSafeTransitionAuditCall("decision", wwRecordTransitionCandidateDecision,
+            transitionCandidateAuditCurrent, routeAllowed, resolvedRoute, os.clock()
+        )
+    end
+    transitionResolvedRoute = resolvedRoute
+    if not routeAllowed then
+        detected = currentUp
+        surfaceCandidate = false
+        transitionResolvedRoute = nil
+        transitionCandidateRoute = nil
+        transitionCandidateHit = nil
+        transitionCandidateNormal = nil
+        transitionCandidateSupportGap = false
+    end
+
+    -- v48.76.105: a managed ceiling candidate may itself be the current support.
+    -- The ordinary support fan gates on AdhesionProbeLength (2.75 studs), which
+    -- can miss while the avatar's head/body already touches an underside and the
+    -- root remains about 3.4 studs from that plane. Do not infer support from a
+    -- nearby candidate alone: require a managed ceiling route, a collidable
+    -- target, a matching current gravity normal, and measured body-part contact.
+    if not supportSeen and surfaceCandidate == true and root
+        and transitionCandidateHit and transitionCandidateHit.Instance
+        and transitionCandidateHit.Instance.Parent
+        and transitionCandidateHit.Position and transitionCandidateNormal
+        and (transitionResolvedRoute == "wall-to-ceiling"
+            or transitionCandidateRoute == "wall-to-ceiling"
+            or transitionResolvedRoute == "wall-edge-to-ceiling-underside"
+            or transitionCandidateRoute == "wall-edge-to-ceiling-underside")
+    then
+        local contactUp = safeUnit(currentUp, UP)
+        local candidateNormal = safeUnit(transitionCandidateNormal, contactUp)
+        local candidateInstance = transitionCandidateHit.Instance
+        local candidateCanCollide = true
+        if candidateInstance:IsA("BasePart") then
+            candidateCanCollide = candidateInstance.CanCollide
+        end
+        local supportDot = contactUp:Dot(candidateNormal)
+        local rootPlaneGap = math.abs((root.Position - transitionCandidateHit.Position):Dot(candidateNormal))
+        local bodyContactGap, bodyPlaneGap, bodyTangentGap =
+            getBodyPartFloorContactGap(transitionCandidateHit.Position, candidateNormal)
+        local bodyContactLimit = CFG.VerticalSurfaceContactGap + 0.10
+        if candidateCanCollide
+            and supportDot >= CFG.SurfaceSafetySupportNormalDot
+            and rootPlaneGap <= CFG.FaceProbeMaxSupportDistance
+            and bodyContactGap <= bodyContactLimit
+            and bodyPlaneGap <= bodyContactLimit
+        then
+            supportSeen = true
+            supportPoint = transitionCandidateHit.Position
+            supportNormal = candidateNormal
+            supportDistance = rootPlaneGap
+            wwWallDiag("WW_CURRENT_SUPPORT_FROM_CONTACT_CANDIDATE",
+                "route=" .. tostring(transitionResolvedRoute or transitionCandidateRoute)
+                    .. ", target=" .. tostring(candidateInstance.Name)
+                    .. ", supportDot=" .. string.format("%.2f", supportDot)
+                    .. ", rootPlaneGap=" .. string.format("%.2f", rootPlaneGap)
+                    .. ", bodyContactGap=" .. string.format("%.2f", bodyContactGap)
+                    .. ", bodyPlaneGap=" .. string.format("%.2f", bodyPlaneGap)
+                    .. ", bodyTangentGap=" .. string.format("%.2f", bodyTangentGap)
+                    .. ", reason=managed-target-body-contact-confirms-current-support", 0.25)
+        end
+    end
+
+    -- v48.76.106: after a wall/ceiling handoff, a competing candidate can
+    -- replace transitionCandidateHit before the ordinary support fan reacquires
+    -- the currently owned face. Test that face independently, with real body
+    -- contact, rather than trusting the unrelated transition candidate.
+    if not supportSeen and customActive and root
+        and math.abs(currentUp:Dot(UP)) < 0.985 then
+        local ownedContactSupport = wwFindCurrentOwnedPlaneBodyContactSupport(currentUp)
+        if ownedContactSupport then
+            supportSeen = true
+            supportPoint = ownedContactSupport.point
+            supportNormal = ownedContactSupport.normal
+            supportDistance = ownedContactSupport.distance
+        end
+    end
+
     surfaceSupportSeen = supportSeen == true
     surfaceSupportPoint = supportPoint
     surfaceSupportNormal = supportNormal
     surfaceSupportDistance = supportDistance
     local detectionDot = math.clamp(currentUp:Dot(detected), -1, 1)
+
+    if customActive and math.abs(currentUp:Dot(UP)) < 0.985 then
+        if surfaceCandidate and detected:Dot(UP) < -0.985 then
+            wwWallDiag("WALL_TO_CEILING_CANDIDATE",
+                "dot=" .. string.format("%.2f", detectionDot)
+                    .. ", support=" .. tostring(surfaceSupportSeen)
+                    .. ", supportDist=" .. tostring(surfaceSupportDistance)
+                    .. ", moveMag=" .. string.format("%.2f", moveVector and moveVector.Magnitude or 0)
+                    .. ", posY=" .. string.format("%.2f", root.Position.Y),
+                0.35
+            )
+        elseif surfaceCandidate and detected:Dot(UP) > 0.985 then
+            if wwWallDiagDue("VERTICAL_WALL_FLOOR_NORMAL_CANDIDATE", 0.35) then
+                wwWallDiag("VERTICAL_WALL_FLOOR_NORMAL_CANDIDATE",
+                "meaning=upward-normal-floor-candidate-not-proof-of-edge"
+                    .. ", candidateRoute=" .. tostring(transitionCandidateRoute)
+                    .. ", resolvedRoute=" .. tostring(transitionResolvedRoute)
+                    .. ", target=" .. wwEdgeForensicInstancePath(transitionCandidateHit and transitionCandidateHit.Instance)
+                    .. ", point=" .. wwEdgeForensicVector(transitionCandidateHit and transitionCandidateHit.Position)
+                    .. ", normal=" .. wwEdgeForensicVector(transitionCandidateNormal)
+                    .. ", root=" .. wwEdgeForensicVector(root.Position)
+                    .. ", pointDist=" .. string.format("%.3f", transitionCandidateHit and (transitionCandidateHit.Position - root.Position).Magnitude or math.huge)
+                    .. ", support=" .. tostring(surfaceSupportSeen)
+                    .. ", supportDist=" .. tostring(surfaceSupportDistance)
+                    .. ", supportPoint=" .. wwEdgeForensicVector(surfaceSupportPoint)
+                    .. ", supportNormal=" .. wwEdgeForensicVector(surfaceSupportNormal)
+                    .. ", moveMag=" .. string.format("%.2f", moveVector and moveVector.Magnitude or 0)
+                    .. ", posY=" .. string.format("%.2f", root.Position.Y),
+                0.35
+                )
+            end
+        end
+    end
 
     -- MICRO-SURFACE DEAD BAND:
     -- A brick seam, tiny bevel or 1cm step can produce a perfectly valid
@@ -2746,7 +8162,54 @@ end
     local strongChange = detectionDot < CFG.StrongSwitchDot
     local meaningfulChange = detectionDot < CFG.GravitySwitchDot
     local grounded = getGrounded(currentUp)
-    local switchBackBlocked = isGravitySwitchBackBlocked(detected, os.clock())
+    local switchBackBlocked = isGravitySwitchBackBlocked(
+        detected, os.clock(), moveVector, transitionCandidateHit, transitionCandidateNormal
+    )
+
+    -- v42 floor-edge behaviour: once the edge candidate is within the old
+    -- bounded point-distance and direction/contact qualification, return native
+    -- gravity directly. Do not send this one route through the newer body/tangent
+    -- contact gate or a stale floor-to-wall return claim.
+    if customActive and legacyEdgeHandoffRoute == "wall-edge-to-floor"
+        and (not switchBackBlocked or legacyEdgeFloorGuardOverride) then
+        local edgeFloorPointDistance = (transitionCandidateHit.Position - root.Position).Magnitude
+        local edgeFloorSurfaceGap, edgeFloorPlaneGap, edgeFloorTangentGap =
+            getBodyPartFloorContactGap(transitionCandidateHit.Position, transitionCandidateNormal)
+        local edgeFloorMovingToward = isMovementTowardSurfacePoint(transitionCandidateHit.Position, currentUp, moveVector)
+        local edgeFloorCommitReason = legacyEdgeFloorQualificationReason or "qualification-branch-not-captured"
+        local edgeFloorTangentLimit = CFG.FloorContactTangentAllowance + 0.60
+            + getEdgeHorizontalSpeedLead(currentUp, moveVector)
+        local edgeFloorSourceWallUp = safeUnit(currentUp, UP)
+        local edgeFloorHandoffPosition = root.Position
+        wwWallDiag("EDGE_FLOOR_GRAVITY_COMMIT",
+            "reason=" .. edgeFloorCommitReason
+                .. ", pointDist=" .. string.format("%.2f", edgeFloorPointDistance)
+                .. ", pointLimit=" .. string.format("%.2f", CFG.SurfaceSwitchDistance)
+                .. ", surfaceGap=" .. string.format("%.2f", edgeFloorSurfaceGap)
+                .. ", bodyPlaneGap=" .. string.format("%.2f", edgeFloorPlaneGap)
+                .. ", tangentGap=" .. string.format("%.2f", edgeFloorTangentGap)
+                .. ", tangentLimit=" .. string.format("%.2f", edgeFloorTangentLimit)
+                .. ", pointWithinLimit=" .. tostring(edgeFloorPointDistance <= CFG.SurfaceSwitchDistance)
+                .. ", planeWithinLimit=" .. tostring(edgeFloorPlaneGap <= CFG.VerticalSurfaceContactGap + 0.10)
+                .. ", tangentWithinLimit=" .. tostring(edgeFloorTangentGap <= edgeFloorTangentLimit)
+                .. ", movingToward=" .. tostring(edgeFloorMovingToward)
+                .. ", switchbackOverride=" .. tostring(switchBackBlocked)
+                .. ", contactGuardOverride=" .. tostring(legacyEdgeFloorGuardOverride),
+            0
+        )
+        clearEdgeFloorApproach()
+        commitGravitySide(UP)
+        nativeFloorHandoffInProgress = true
+        leaveCustom()
+        legacyEdgeFloorSourceWallActive = true
+        legacyEdgeFloorSourceUp = edgeFloorSourceWallUp
+        legacyEdgeFloorHandoffPosition = edgeFloorHandoffPosition
+        legacyEdgeFloorStartedAt = os.clock()
+        legacyEdgeFloorSourceWallIntentReleased = false
+        wwWallDiag("WW_LEGACY_EDGE_FLOOR_SOURCE_WALL_HOLD",
+            "enabled=true, hold=" .. string.format("%.2f", CFG.LegacyWallEdgeFloorSourceWallHoldTime), 0)
+        return
+    end
 
     if customActive and surfaceCandidate and microSurfaceChange then
         -- Do not let a tiny support-normal fluctuation rotate gravity. We still
@@ -2783,14 +8246,164 @@ end
             return
         end
     else
+        -- If floor return is blocked briefly by the anti-flip cooldown, log it
+        -- separately from a missing edge candidate or a failed contact gate.
+        if surfaceCandidate and detected:Dot(UP) > 0.985
+            and currentUp:Dot(UP) < 0.985 and switchBackBlocked
+        then
+            wwWallDiag("FLOOR_RESET_SWITCHBACK_BLOCKED",
+                "currentUpY=" .. string.format("%.2f", currentUp:Dot(UP))
+                    .. ", moveMag=" .. string.format("%.2f", moveVector and moveVector.Magnitude or 0)
+                    .. ", surfaceGap=" .. string.format("%.2f", transitionCandidateHit and transitionCandidateHit.Position and transitionCandidateNormal and getBodyPartFloorContactGap(transitionCandidateHit.Position, transitionCandidateNormal) or math.huge),
+                0
+            )
+        end
+
         -- If the detector has reached the ordinary floor again, immediately
         -- hand the Humanoid back to Roblox. Do this BEFORE the generic
         -- surfaceCandidate branch so a floor normal cannot keep the custom
         -- controller alive indefinitely.
-        if detected:Dot(UP) > 0.985 and currentUp:Dot(UP) < 0.985 and not switchBackBlocked then
-            commitGravitySide(UP)
-            leaveCustom()
-            return
+        if surfaceCandidate and detected:Dot(UP) > 0.985
+            and currentUp:Dot(UP) < 0.985
+        then
+            -- Floor acceptance uses body clearance perpendicular to the floor
+            -- plus a bounded tangential allowance. A forward ray can hit ahead
+            -- of the body, so the combined 3D score alone delayed real landings.
+            -- Tangential reach remains bounded to avoid accepting a distant floor.
+            local floorGapLimit = CFG.VerticalSurfaceContactGap
+            local supportFloorPointDistance = surfaceSupportPoint and (surfaceSupportPoint - root.Position).Magnitude or math.huge
+            local supportFloorPlaneDistance = surfaceSupportPoint and surfaceSupportNormal
+                and math.abs((root.Position - surfaceSupportPoint):Dot(surfaceSupportNormal)) or math.huge
+            local supportFloorSurfaceGap = math.huge
+            local supportFloorBodyPlaneGap = math.huge
+            local supportFloorTangentGap = math.huge
+            if surfaceSupportPoint and surfaceSupportNormal then
+                supportFloorSurfaceGap, supportFloorBodyPlaneGap, supportFloorTangentGap =
+                    getBodyPartFloorContactGap(surfaceSupportPoint, surfaceSupportNormal)
+            end
+            local confirmedSupportFloorContact = surfaceSupportSeen
+                and surfaceSupportNormal ~= nil
+                and surfaceSupportNormal:Dot(UP) >= 0.985
+                and supportFloorBodyPlaneGap <= floorGapLimit + 0.10
+                and supportFloorTangentGap <= CFG.FloorContactTangentAllowance + 0.45
+
+            local candidateFloorDistance = math.huge
+            local candidateFloorPointDistance = math.huge
+            local candidateFloorSurfaceGap = math.huge
+            local candidateFloorBodyPlaneGap = math.huge
+            local candidateFloorTangentGap = math.huge
+            local candidateFloorTangentLimit = CFG.FloorContactTangentAllowance + 0.45
+            local candidateFloorMovingToward = false
+            local candidateFloorContact = false
+            local floorCandidateHit = transitionCandidateHit
+            local floorCandidateNormal = transitionCandidateNormal
+            local floorCandidateRoute = transitionCandidateRoute
+            if (floorCandidateRoute == "edge" or floorCandidateRoute == "forward")
+                and floorCandidateHit and floorCandidateHit.Instance and floorCandidateHit.Instance.Parent
+                and floorCandidateNormal and floorCandidateNormal:Dot(UP) >= 0.985
+            then
+                candidateFloorDistance = math.abs((root.Position - floorCandidateHit.Position):Dot(floorCandidateNormal))
+                candidateFloorPointDistance = (root.Position - floorCandidateHit.Position).Magnitude
+                candidateFloorSurfaceGap, candidateFloorBodyPlaneGap, candidateFloorTangentGap =
+                    getBodyPartFloorContactGap(floorCandidateHit.Position, floorCandidateNormal)
+                if floorCandidateRoute == "edge" then
+                    candidateFloorMovingToward = isMovementTowardSurfacePoint(
+                        floorCandidateHit.Position, currentUp, moveVector
+                    )
+                    candidateFloorTangentLimit = candidateFloorTangentLimit
+                        + getEdgeHorizontalSpeedLead(currentUp, moveVector)
+                end
+                candidateFloorContact = candidateFloorBodyPlaneGap <= floorGapLimit + 0.10
+                    and candidateFloorTangentGap <= candidateFloorTangentLimit
+                    and (candidateFloorTangentGap <= CFG.FloorContactTangentAllowance
+                        or candidateFloorMovingToward)
+            end
+
+            local confirmedFloorContact = confirmedSupportFloorContact or candidateFloorContact
+            -- A validated wall-edge -> floor contact is the intended destination,
+            -- not a spurious return to the source floor. Let its plane/tangent
+            -- geometry outrank the short anti-flip guard from the preceding wall
+            -- transition; all other floor returns keep the guard.
+            local intentionalEdgeFloorReturn = floorCandidateRoute == "edge"
+                and transitionResolvedRoute == "wall-edge-to-floor"
+                and candidateFloorContact
+            if confirmedFloorContact and switchBackBlocked and not intentionalEdgeFloorReturn then
+                wwWallDiag("FLOOR_RESET_SOURCE_GUARD_BLOCKED",
+                    "sourceFloor=true"
+                        .. ", contactGap=" .. string.format("%.2f", confirmedSupportFloorContact and supportFloorSurfaceGap or candidateFloorSurfaceGap)
+                        .. ", bodyPlaneGap=" .. string.format("%.2f", confirmedSupportFloorContact and supportFloorBodyPlaneGap or candidateFloorBodyPlaneGap)
+                        .. ", tangentGap=" .. string.format("%.2f", confirmedSupportFloorContact and supportFloorTangentGap or candidateFloorTangentGap),
+                    0.15
+                )
+                return
+            end
+            if confirmedFloorContact then
+                if floorCandidateRoute == "edge"
+                    and transitionResolvedRoute == "wall-edge-to-floor"
+                    and candidateFloorContact
+                then
+                    wwWallDiag("EDGE_FLOOR_GRAVITY_COMMIT",
+                        "reason=validated-edge-contact"
+                            .. ", bodyPlaneGap=" .. string.format("%.2f", candidateFloorBodyPlaneGap)
+                            .. ", tangentGap=" .. string.format("%.2f", candidateFloorTangentGap)
+                            .. ", switchbackOverride=" .. tostring(switchBackBlocked),
+                        0
+                    )
+                end
+                local floorDistance = confirmedSupportFloorContact
+                    and supportFloorPlaneDistance
+                    or candidateFloorDistance
+                local floorSource = confirmedSupportFloorContact and "support-sensor" or "target-plane"
+                wwWallDiag("FLOOR_GRAVITY_RESET",
+                    "source=" .. floorSource
+                        .. ", route=" .. tostring(floorCandidateRoute)
+                        .. ", currentUpY=" .. string.format("%.2f", currentUp:Dot(UP))
+                        .. ", detectedY=" .. string.format("%.2f", detected:Dot(UP))
+                        .. ", support=" .. tostring(surfaceSupportSeen)
+                        .. ", floorPlaneDist=" .. string.format("%.2f", floorDistance)
+                        .. ", floorPointDist=" .. string.format("%.2f", confirmedSupportFloorContact and supportFloorPointDistance or candidateFloorPointDistance)
+                        .. ", contactGap=" .. string.format("%.2f", confirmedSupportFloorContact and supportFloorSurfaceGap or candidateFloorSurfaceGap)
+                        .. ", bodyPlaneGap=" .. string.format("%.2f", confirmedSupportFloorContact and supportFloorBodyPlaneGap or candidateFloorBodyPlaneGap)
+                        .. ", tangentGap=" .. string.format("%.2f", confirmedSupportFloorContact and supportFloorTangentGap or candidateFloorTangentGap)
+                        .. ", gapLimit=" .. string.format("%.2f", floorGapLimit)
+                        .. ", gapMetric=plane-clearance+tangent-excess"
+                        .. ", tangentLimit=" .. string.format("%.2f", confirmedSupportFloorContact
+                            and (CFG.FloorContactTangentAllowance + 0.45) or candidateFloorTangentLimit)
+                        .. ", movingToward=" .. tostring(confirmedSupportFloorContact or candidateFloorMovingToward)
+                        .. ", moveMag=" .. string.format("%.2f", moveVector and moveVector.Magnitude or 0)
+                        .. ", posY=" .. string.format("%.2f", root.Position.Y),
+                    0
+                )
+                clearEdgeFloorApproach()
+                commitGravitySide(UP)
+                nativeFloorHandoffInProgress = transitionResolvedRoute == "wall-edge-to-floor"
+                    or transitionResolvedRoute == "wall-to-floor"
+                leaveCustom()
+                return
+            else
+                -- A broad floor-facing candidate is not enough to cancel wall
+                -- gravity. A route-qualified target must be within the same
+                -- body-to-surface gap; a distant floor underneath the climb
+                -- cannot steal gravity prematurely.
+                wwWallDiag("FLOOR_RESET_REJECTED_NO_CONTACT",
+                    "support=" .. tostring(surfaceSupportSeen)
+                        .. ", supportSensorDistance=" .. tostring(surfaceSupportDistance)
+                        .. ", supportPointDist=" .. string.format("%.2f", supportFloorPointDistance)
+                        .. ", rootPlaneDist=" .. string.format("%.2f", candidateFloorDistance)
+                        .. ", supportContactGap=" .. string.format("%.2f", supportFloorSurfaceGap)
+                        .. ", supportBodyPlaneGap=" .. string.format("%.2f", supportFloorBodyPlaneGap)
+                        .. ", supportTangentGap=" .. string.format("%.2f", supportFloorTangentGap)
+                        .. ", candidateContactGap=" .. string.format("%.2f", candidateFloorSurfaceGap)
+                        .. ", candidateBodyPlaneGap=" .. string.format("%.2f", candidateFloorBodyPlaneGap)
+                        .. ", candidateTangentGap=" .. string.format("%.2f", candidateFloorTangentGap)
+                        .. ", gapLimit=" .. string.format("%.2f", floorGapLimit)
+                        .. ", gapMetric=plane-clearance+tangent-excess"
+                        .. ", worldYVel=" .. string.format("%.2f", root.AssemblyLinearVelocity:Dot(UP))
+                        .. ", posY=" .. string.format("%.2f", root.Position.Y),
+                    0.25
+                )
+                return
+            end
         elseif surfaceCandidate and (strongChange or meaningfulChange)
             and not switchBackBlocked
         then
@@ -2852,6 +8465,11 @@ end
         CFG.AdhesionProbeLength + 0.40,
         CFG.SurfaceSafetySupportDistance + 0.35
     )
+    local supportDistanceLimit = CFG.SurfaceSafetySupportDistance
+    if legacyEdgeCeilingSupportActive and up:Dot(UP) <= -0.985 then
+        supportLength = math.max(supportLength, CFG.LegacyWallEdgeCeilingSupportDistance)
+        supportDistanceLimit = math.max(supportDistanceLimit, CFG.LegacyWallEdgeCeilingSupportDistance)
+    end
 
     local tangentA = projectOnPlane(root.CFrame.RightVector, up)
     tangentA = safeUnit(tangentA, safeUnit(up:Cross(root.CFrame.LookVector), Vector3.xAxis))
@@ -2880,7 +8498,7 @@ end
             local normal = orientSurfaceNormal(hit, -up)
             if normal and up:Dot(normal) >= CFG.SurfaceSafetySupportNormalDot then
                 local distance = math.abs((probeOrigin - hit.Position):Dot(normal))
-                if distance <= CFG.SurfaceSafetySupportDistance and distance < bestDistance then
+                if distance <= supportDistanceLimit and distance < bestDistance then
                     bestHit = hit
                     bestNormal = normal
                     bestDistance = distance
@@ -2914,6 +8532,55 @@ end
     local supportPoint = surfaceSupportPoint
     local supportNormal = surfaceSupportNormal
     local supportDistance = surfaceSupportDistance
+
+    -- Never trust the boolean alone. An earlier exact-face path could mark
+    -- supportSeen=true without returning a point/normal/distance. That is not
+    -- confirmed support and must not clear the loss timer or overwrite the last
+    -- valid support reference with nil values.
+    local supportDistanceValue = tonumber(supportDistance) or math.huge
+    if supportSeen and (not supportPoint or not supportNormal or supportDistanceValue >= math.huge
+        or up:Dot(safeUnit(supportNormal, up)) < CFG.SurfaceSafetySupportNormalDot)
+    then
+        wwWallDiag("SAFETY_INVALID_SUPPORT_REJECTED",
+            "point=" .. tostring(supportPoint ~= nil)
+                .. ", normal=" .. tostring(supportNormal ~= nil)
+                .. ", dist=" .. tostring(supportDistance)
+                .. ", matchesUp=" .. tostring(supportNormal ~= nil
+                    and up:Dot(safeUnit(supportNormal, up)) >= CFG.SurfaceSafetySupportNormalDot),
+            0.50
+        )
+        supportSeen = false
+        supportPoint = nil
+        supportNormal = nil
+        supportDistance = math.huge
+    end
+
+    -- Recheck actual nearby geometry before treating a brief primary-sensor
+    -- miss as a fall. This uses the existing short support fan; it does not
+    -- extend the safety timer and cannot confirm a wall from a distant hit.
+    if not supportSeen then
+        local fanSeen, fanPoint, fanNormal, fanDistance = getSafetySupport()
+        if fanSeen and fanPoint and fanNormal and fanDistance < math.huge then
+            supportSeen = true
+            supportPoint = fanPoint
+            supportNormal = fanNormal
+            supportDistance = fanDistance
+            wwWallDiag("SAFETY_FAN_SUPPORT_CONFIRMED",
+                "dist=" .. string.format("%.2f", fanDistance)
+                    .. ", upY=" .. string.format("%.2f", up:Dot(UP)),
+                0.40
+            )
+        end
+    end
+
+    -- Resolve the claimed destination separately from generic support. A stale
+    -- source face or another same-normal face may keep safety alive, but it cannot
+    -- complete the current handoff. Edge-target probes now follow the support axis.
+    if transitionClaim then
+        supportSeen, supportPoint, supportNormal, supportDistance =
+            wwResolveTransitionTargetSupport(up, transitionClaim, supportSeen,
+                supportPoint, supportNormal, supportDistance)
+    end
 
     -- v48.66: a confirmed ceiling stair is valid support even when the root
     -- support rays momentarily land on the narrow riser/edge. This is the key
@@ -3026,7 +8693,22 @@ end
     end
 
     if supportSeen then
+        ceilingApproachHoldStartedAt = 0
+        ceilingApproachHoldExpired = false
+        ceilingApproachHoldInstance = nil
+        ceilingApproachHoldPoint = nil
+        ceilingApproachHoldNormal = nil
+        if surfaceLostAt > 0 then
+            wwWallDiag("SAFETY_SUPPORT_REGAINED",
+                "lostFor=" .. string.format("%.2f", now - surfaceLostAt)
+                    .. ", upY=" .. string.format("%.2f", up:Dot(UP))
+                    .. ", dist=" .. tostring(supportDistance)
+                    .. ", posY=" .. string.format("%.2f", root.Position.Y),
+                0
+            )
+        end
         surfaceLostAt = 0
+        edgeFloorApproachHoldStartedAt = 0
         safetySupportPoint = supportPoint
         safetySupportNormal = supportNormal
         safetySupportDistance = supportDistance
@@ -3036,14 +8718,255 @@ end
         safetyWorldFallSpeed = 0
         safetyWorldFallAcceleration = 0
 
-        -- The transition is complete only when the normal support sensor sees
-        -- the currently-owned gravity plane again. This keeps the guard from
-        -- becoming a permanent grace state.
-        if gravityTransitionActive and supportNormal and up:Dot(safeUnit(supportNormal, up)) >= CFG.SurfaceSafetySupportNormalDot then
-            gravityTransitionActive = false
+        -- The transition is complete only when support matches the newly-owned
+        -- plane, not merely when any surface remains inside the broad fan.
+        if supportNormal
+            and up:Dot(safeUnit(supportNormal, up)) >= CFG.SurfaceSafetySupportNormalDot
+            and ((transitionClaim and wwIsTransitionTargetSupport(
+                up, transitionClaim, supportPoint, supportNormal, supportDistance
+            )) or (not transitionClaim
+                and (tonumber(supportDistance) or math.huge) <= CFG.SurfaceSafetySupportDistance))
+        then
+            if transitionClaim then
+                wwSafeTransitionAuditCall("support-phase", wwSetTransitionAuditPhaseForClaim,
+                    transitionClaim, "confirming", "target-support-currently-valid"
+                )
+                transitionClaim.leasePhase = "confirming"
+                wwSetTransitionRoutePhase(transitionClaim.route, "confirming", now,
+                    "target-support-currently-valid", transitionClaim.pipelineState)
+                if transitionClaim.supportSince == nil then
+                    transitionClaim.supportSince = now
+                end
+                if now - transitionClaim.supportSince >= CFG.TransitionSupportConfirmTime then
+                    gravityTransitionActive = false
+                    wwWallDiag("TRANSITION_CLAIM_CONFIRMED",
+                        "route=" .. tostring(transitionClaim.route)
+                            .. ", dist=" .. string.format("%.2f", supportDistance)
+                            .. ", stable=" .. string.format("%.2f", now - transitionClaim.supportSince),
+                        0
+                    )
+                    wwSafeTransitionAuditCall("completion", wwRecordTransitionAuditCompletion,
+                        transitionClaim, supportDistance, now - transitionClaim.supportSince
+                    )
+                    if wwIsManagedTransitionRoute(transitionClaim.route) then
+                        wwWallDiag("WW_ROUTE_COMPLETED", "route=" .. transitionClaim.route, 0)
+                        wwClearTransitionRouteState(transitionClaim.route, "completed",
+                            "stable-target-support", transitionClaim.pipelineState)
+                    end
+                    transitionClaim.leasePhase = "completed"
+                    transitionClaim = nil
+                else
+                    wwWallDiag("TRANSITION_SUPPORT_STABILIZING",
+                        "route=" .. tostring(transitionClaim.route)
+                            .. ", stable=" .. string.format("%.2f", now - transitionClaim.supportSince)
+                            .. ", required=" .. string.format("%.2f", CFG.TransitionSupportConfirmTime),
+                        0.12
+                    )
+                end
+            else
+                gravityTransitionActive = false
+            end
+        elseif transitionClaim then
+            transitionClaim.supportSince = nil
+            transitionClaim.leasePhase = "committed"
+            wwSetTransitionRoutePhase(transitionClaim.route, "committed", now,
+                "target-support-not-currently-valid", transitionClaim.pipelineState)
+            wwSafeTransitionAuditCall("support-reset", wwSetTransitionAuditPhaseForClaim,
+                transitionClaim, "committed", "target-support-not-currently-valid"
+            )
         end
 
         return false
+    end
+
+    if transitionClaim then
+        transitionClaim.supportSince = nil
+        transitionClaim.leasePhase = "committed"
+        wwSetTransitionRoutePhase(transitionClaim.route, "committed", now,
+            "support-not-seen", transitionClaim.pipelineState)
+        wwSafeTransitionAuditCall("support-reset", wwSetTransitionAuditPhaseForClaim,
+            transitionClaim, "committed", "support-not-seen"
+        )
+    end
+
+    -- Edge floor approach hold: retain wall gravity while the cached real floor
+    -- hit remains fresh/reachable and input or velocity is directed toward it.
+    -- Candidate freshness must cover the bounded hold; a 0.20s cache timeout
+    -- would expire alongside the safety timer before slow approaches reach contact.
+    -- The fixed contact-gap gate still decides when gravity can actually switch.
+    if not jumped and math.abs(up:Dot(UP)) < 0.985
+        and edgeFloorApproachHit and edgeFloorApproachHit.Position
+        and edgeFloorApproachHit.Instance and edgeFloorApproachHit.Instance.Parent
+        and edgeFloorApproachNormal and edgeFloorApproachNormal:Dot(UP) >= 0.985
+        and now - (edgeFloorApproachAt or 0) <= CFG.EdgeFloorApproachCandidateLifetime
+    then
+        local floorPoint = edgeFloorApproachHit.Position
+        local floorNormal = safeUnit(edgeFloorApproachNormal, UP)
+        local floorPlaneDistance = math.abs((root.Position - floorPoint):Dot(floorNormal))
+        local floorSurfaceGap = getBodyPartFloorContactGap(floorPoint, floorNormal)
+        local worldMove = ZERO
+        if moveVector and moveVector.Magnitude > 0.05 then
+            worldMove = getWorldMove(moveVector, up)
+        end
+        local movingTowardFloor, inputTowardFloor, velocityTowardFloor =
+            isMovementTowardSurfacePoint(floorPoint, up, moveVector)
+        local verticalMove = worldMove:Dot(UP)
+        local verticalVelocity = root.AssemblyLinearVelocity:Dot(UP)
+
+        if floorPlaneDistance <= CFG.EdgeFloorApproachDistance
+            and movingTowardFloor
+            and floorSurfaceGap > CFG.VerticalSurfaceContactGap
+        then
+            if edgeFloorApproachHoldStartedAt <= 0 then
+                edgeFloorApproachHoldStartedAt = now
+            end
+            local holdAge = now - edgeFloorApproachHoldStartedAt
+            if holdAge <= CFG.EdgeFloorApproachMaxHold then
+                surfaceLostAt = 0
+                wwWallDiag("EDGE_FLOOR_APPROACH_HOLD",
+                    "planeDist=" .. string.format("%.2f", floorPlaneDistance)
+                        .. ", surfaceGap=" .. string.format("%.2f", floorSurfaceGap)
+                        .. ", switchGap=" .. string.format("%.2f", CFG.VerticalSurfaceContactGap)
+                        .. ", moveY=" .. string.format("%.2f", verticalMove)
+                        .. ", velY=" .. string.format("%.2f", verticalVelocity)
+                        .. ", inputToward=" .. tostring(inputTowardFloor)
+                        .. ", velocityToward=" .. tostring(velocityTowardFloor)
+                        .. ", holdAge=" .. string.format("%.2f", holdAge),
+                    0.20
+                )
+                return false
+            else
+                wwWallDiag("EDGE_FLOOR_APPROACH_HOLD_EXPIRED",
+                    "holdAge=" .. string.format("%.2f", holdAge)
+                        .. ", planeDist=" .. string.format("%.2f", floorPlaneDistance)
+                        .. ", surfaceGap=" .. string.format("%.2f", floorSurfaceGap),
+                    0
+                )
+                clearEdgeFloorApproach()
+            end
+        else
+            edgeFloorApproachHoldStartedAt = 0
+            if floorSurfaceGap <= CFG.VerticalSurfaceContactGap then
+                clearEdgeFloorApproach()
+            end
+        end
+    end
+
+    -- Before the near-contact wall gate accepts a ceiling -> vertical-wall
+    -- transition, a valid wall candidate may already be visible while the player
+    -- has just left the ceiling edge. Hold only while the candidate remains
+    -- fresh/reachable and input or velocity is actually aimed toward it. This is
+    -- target-conditioned approach protection, not a longer general safety timer.
+    if not jumped and up:Dot(UP) <= -0.985 then
+        local pendingWall = forwardTransitionPending
+        if edgeTransitionPending and (not pendingWall
+            or (edgeTransitionPending.lastSeen or 0) > (pendingWall.lastSeen or 0))
+        then
+            pendingWall = edgeTransitionPending
+        end
+
+        if pendingWall and pendingWall.hit and pendingWall.hit.Instance and pendingWall.hit.Instance.Parent
+            and pendingWall.normal and pendingWall.oldUp
+            and pendingWall.oldUp:Dot(up) >= 0.90
+            and math.abs(pendingWall.normal:Dot(UP)) < CFG.StairRiserGravityVerticalDot
+            and now - (pendingWall.lastSeen or 0) <= CFG.EdgeTransitionPendingLifetime
+        then
+            local toTarget = projectOnPlane(pendingWall.hit.Position - root.Position, up)
+            local moveWorld = ZERO
+            if moveVector and moveVector.Magnitude > 0.05 then
+                moveWorld = getWorldMove(moveVector, up)
+            end
+
+            local inputToward = moveWorld.Magnitude > 0.05 and toTarget.Magnitude > 0.05
+                and moveWorld.Unit:Dot(toTarget.Unit) >= 0.15
+            local tangentVelocity = projectOnPlane(root.AssemblyLinearVelocity, up)
+            local velocityToward = tangentVelocity.Magnitude > 0.50 and toTarget.Magnitude > 0.05
+                and tangentVelocity.Unit:Dot(toTarget.Unit) >= 0.15
+            local intendedSpeed = 0
+            if humanoid then
+                intendedSpeed = math.max(0, tonumber(humanoid.WalkSpeed) or 0)
+                    * math.clamp(moveVector and moveVector.Magnitude or 0, 0, 1)
+            end
+            local approachSpeed = math.max(tangentVelocity.Magnitude, intendedSpeed)
+            local approachReach = CFG.TransitionProbeLength
+                + math.clamp(approachSpeed * 0.12, 0, 2.50)
+            local candidateDistance = toTarget.Magnitude
+            local candidatePointDistance = (pendingWall.hit.Position - root.Position).Magnitude
+
+            if candidateDistance <= approachReach and (inputToward or velocityToward) then
+                surfaceLostAt = 0
+                wwWallDiag("CEILING_TO_WALL_APPROACH_HOLD",
+                    "route=" .. tostring(pendingWall.route)
+                        .. ", tangentDist=" .. string.format("%.2f", candidateDistance)
+                        .. ", pointDist=" .. string.format("%.2f", candidatePointDistance)
+                        .. ", reach=" .. string.format("%.2f", approachReach)
+                        .. ", inputToward=" .. tostring(inputToward)
+                        .. ", velocityToward=" .. tostring(velocityToward)
+                        .. ", moveMag=" .. string.format("%.2f", moveVector and moveVector.Magnitude or 0),
+                    0.25
+                )
+                return false
+            end
+        end
+    end
+
+    -- A route-qualified handoff may temporarily lose its support ray while the
+    -- body rotates/settles onto the destination plane. Keep gravity only while
+    -- the original confirmed target still exists, the target normal matches
+    -- currentUp, its plane remains reachable, and the bounded grace has not
+    -- elapsed. This does not extend the ordinary safety timer for arbitrary falls.
+    if not jumped and transitionClaim then
+        local claim = transitionClaim
+        local claimAge = now - (claim.startedAt or now)
+        local claimValid = wwIsManagedTransitionRoute(claim.route)
+            or claim.route == "edge" or claim.route == "forward"
+        if not claim.instance or not claim.instance.Parent or not claim.normal or not claim.point then
+            claimValid = false
+        end
+        if claimValid and claim.normal:Dot(up) < 0.90 then
+            claimValid = false
+        end
+        if claimAge > (claim.grace or CFG.TransitionSupportGrace) then
+            claimValid = false
+        end
+
+        local claimDistance = math.huge
+        if claimValid then
+            claimDistance = math.abs((root.Position - claim.point):Dot(claim.normal))
+            local claimDistanceLimit = CFG.TransitionHandoffMaxDistance
+            if claim.route == "wall-edge-to-ceiling-underside" then
+                claimDistanceLimit = CFG.WallEdgeCeilingHandoffMaxDistance
+            end
+            if claimDistance > claimDistanceLimit then
+                claimValid = false
+            end
+        end
+
+        if claimValid then
+            surfaceLostAt = 0
+            wwWallDiag("TRANSITION_HANDOFF_HOLD",
+                "route=" .. tostring(claim.route)
+                    .. ", age=" .. string.format("%.2f", claimAge)
+                    .. ", dist=" .. string.format("%.2f", claimDistance),
+                0.20
+            )
+            return false
+        end
+
+        wwWallDiag("TRANSITION_CLAIM_EXPIRED",
+            "route=" .. tostring(claim.route)
+                .. ", age=" .. string.format("%.2f", claimAge)
+                .. ", dist=" .. string.format("%.2f", claimDistance),
+            0
+        )
+        wwSafeTransitionAuditCall("expiry", wwRecordTransitionAuditExpiry, transitionClaim, "surface-safety-claim-expired")
+        if wwIsManagedTransitionRoute(transitionClaim.route) then
+            wwClearTransitionRouteState(transitionClaim.route, "expired",
+                "surface-safety-claim-expired", transitionClaim.pipelineState)
+        end
+        transitionClaim.leasePhase = "expired"
+        transitionClaim = nil
+        gravityTransitionActive = false
     end
 
     -- During a confirmed gravity-plane handoff, do not allow the normal 0.2s
@@ -3104,12 +9027,168 @@ end
         end
     end
 
+    -- A blocked return-to-ceiling candidate must not immediately turn into a
+    -- native-gravity fall while the player is still deliberately approaching
+    -- that same ceiling. Hold only for a bounded window and only while an actual
+    -- ceiling candidate is reachable and movement is directed upward. Body-part
+    -- contact is logged separately from the broader character-bounds candidate.
+    do
+        local wallOriented = not jumped and math.abs(up:Dot(UP)) < 0.985
+        local approachMove = ZERO
+        local upwardIntent = 0
+        local moveMagnitude = moveVector and moveVector.Magnitude or 0
+        if wallOriented and moveMagnitude > 0.05 then
+            approachMove = getWorldMove(moveVector, up)
+            upwardIntent = approachMove:Dot(UP)
+        end
+        local upwardSpeed = root.AssemblyLinearVelocity:Dot(UP)
+        local directedTowardCeiling = upwardIntent > 0.05
+            or (moveMagnitude <= 0.05 and upwardSpeed > 0.35)
+        local approachHit, approachNormal = nil, nil
+        local approachSource = "none"
+        local approachDistance = math.huge
+        if wallOriented and directedTowardCeiling then
+            approachHit, approachNormal = findWallToCeilingSurface(up, approachMove, true)
+            if approachHit and approachNormal then
+                approachSource = "wall-to-ceiling-scan"
+            end
+            -- During an owned ceiling-edge handoff, use the legacy edge fan as
+            -- a bounded safety fallback. This avoids dropping safety grace just
+            -- because the ordinary wall-to-ceiling ray fan misses one frame.
+            if not approachHit and (legacyEdgeCeilingSupportActive == true
+                or legacyEdgeCeilingHandoffPending == true
+                or (transitionClaim and (transitionClaim.route == "ceiling-to-wall"
+                    or transitionClaim.route == "ceiling-edge-to-wall-underside"
+                    or transitionClaim.route == "wall-edge-to-ceiling-underside"))
+                or transitionResolvedRoute == "wall-edge-to-ceiling-underside") then
+                approachHit, approachNormal = findLegacyWallEdgeCeilingSurface(up, approachMove)
+                if approachHit and approachNormal then
+                    approachSource = "legacy-edge-ceiling-scan"
+                end
+            end
+            -- Ray fans can flicker for a frame while the character crosses the
+            -- lip. Reuse only the last confirmed ceiling ray hit, for this same
+            -- bounded approach window and only while the target remains nearby.
+            if not approachHit and ceilingApproachHoldInstance
+                and ceilingApproachHoldInstance.Parent and ceilingApproachHoldPoint
+                and ceilingApproachHoldNormal and ceilingApproachHoldNormal:Dot(UP) <= -0.90
+            then
+                approachDistance = (ceilingApproachHoldPoint - root.Position).Magnitude
+                if approachDistance <= CFG.WallEdgeCeilingHandoffMaxDistance
+                    and (ceilingApproachHoldPoint - root.Position):Dot(UP) >= -0.50
+                then
+                    approachHit = {
+                        Instance = ceilingApproachHoldInstance,
+                        Position = ceilingApproachHoldPoint,
+                    }
+                    approachNormal = ceilingApproachHoldNormal
+                    approachSource = "recent-ceiling-hit-cache"
+                end
+            end
+        end
+        -- During a jump between ceiling platforms, the live wall-to-ceiling
+        -- scan can disappear for a frame even though updateSurface still has a
+        -- recent, nearby ceiling destination candidate. Bridge that sensor gap
+        -- using only the same managed route, a downward-facing ceiling normal,
+        -- a fresh candidate audit, and a strict distance limit. This does not
+        -- confirm support or commit gravity; it only preserves bounded safety
+        -- grace while the candidate remains reachable.
+        if not approachHit and up:Dot(UP) <= -0.90
+            and transitionCandidateHit and transitionCandidateHit.Instance
+            and transitionCandidateHit.Instance.Parent
+            and transitionCandidateHit.Position and transitionCandidateNormal
+            and transitionCandidateNormal:Dot(UP) <= -0.90
+            and (transitionResolvedRoute == "wall-to-ceiling"
+                or transitionCandidateRoute == "wall-to-ceiling") then
+            local candidateAuditAge = transitionCandidateAuditLatest
+                and (now - (transitionCandidateAuditLatest.lastSeenAt or now)) or math.huge
+            local candidateDistance = (transitionCandidateHit.Position - root.Position).Magnitude
+            if candidateAuditAge <= CFG.EdgeTransitionPendingLifetime
+                and candidateDistance <= CFG.WallEdgeCeilingHandoffMaxDistance then
+                approachHit = transitionCandidateHit
+                approachNormal = transitionCandidateNormal
+                approachSource = "recent-managed-ceiling-candidate"
+                approachDistance = candidateDistance
+                wwWallDiag("SAFETY_CEILING_CANDIDATE_BRIDGE",
+                    "route=wall-to-ceiling"
+                        .. ", target=" .. tostring(transitionCandidateHit.Instance.Name)
+                        .. ", candidateAge=" .. string.format("%.2f", candidateAuditAge)
+                        .. ", dist=" .. string.format("%.2f", candidateDistance)
+                        .. ", normalY=" .. string.format("%.2f", transitionCandidateNormal:Dot(UP))
+                        .. ", reason=recent-nearby-target-bridges-scan-miss", 0.20)
+            end
+        end
+
+        if approachHit and approachNormal and approachNormal:Dot(UP) <= -0.90 then
+            approachDistance = (approachHit.Position - root.Position).Magnitude
+            local approachBodyGap = getBodyPartSurfaceGap(approachHit.Position)
+            if approachDistance <= CFG.WallEdgeCeilingHandoffMaxDistance then
+                if ceilingApproachHoldStartedAt <= 0 then
+                    ceilingApproachHoldStartedAt = now
+                    ceilingApproachHoldExpired = false
+                end
+                ceilingApproachHoldInstance = approachHit.Instance
+                ceilingApproachHoldPoint = approachHit.Position
+                ceilingApproachHoldNormal = safeUnit(approachNormal, -UP)
+                local holdAge = now - ceilingApproachHoldStartedAt
+                local holdLimit = math.max(CFG.EdgeTransitionPendingLifetime, 0.65)
+                if holdAge <= holdLimit then
+                    surfaceLostAt = 0
+                    wwWallDiag("SAFETY_CEILING_APPROACH_HOLD",
+                        "orientation=" .. wwDescribeSurfaceOrientation(up)
+                            .. ", targetSource=" .. approachSource
+                            .. ", target=" .. tostring(approachHit.Instance.Name)
+                            .. ", supportSensor=miss"
+                            .. ", dist=" .. string.format("%.2f", approachDistance)
+                            .. ", boundsGap=" .. string.format("%.2f", getCharacterSurfaceGap(approachHit.Position))
+                            .. ", bodyGap=" .. string.format("%.2f", approachBodyGap)
+                            .. ", inputUp=" .. string.format("%.2f", upwardIntent)
+                            .. ", worldYVel=" .. string.format("%.2f", upwardSpeed)
+                            .. ", holdAge=" .. string.format("%.2f", holdAge)
+                            .. ", holdLimit=" .. string.format("%.2f", holdLimit)
+                            .. ", reason=bounded-directed-ceiling-approach", 0.25)
+                    return false
+                elseif not ceilingApproachHoldExpired then
+                    ceilingApproachHoldExpired = true
+                    wwWallDiag("SAFETY_CEILING_APPROACH_HOLD_EXPIRED",
+                        "orientation=" .. wwDescribeSurfaceOrientation(up)
+                            .. ", targetSource=" .. approachSource
+                            .. ", target=" .. tostring(approachHit.Instance.Name)
+                            .. ", dist=" .. string.format("%.2f", approachDistance)
+                            .. ", bodyGap=" .. string.format("%.2f", approachBodyGap)
+                            .. ", holdAge=" .. string.format("%.2f", holdAge)
+                            .. ", outcome=normal-safety-timer-resumes", 0)
+                end
+            else
+                ceilingApproachHoldStartedAt = 0
+                ceilingApproachHoldExpired = false
+                ceilingApproachHoldInstance = nil
+                ceilingApproachHoldPoint = nil
+                ceilingApproachHoldNormal = nil
+            end
+        else
+            ceilingApproachHoldStartedAt = 0
+            ceilingApproachHoldExpired = false
+            ceilingApproachHoldInstance = nil
+            ceilingApproachHoldPoint = nil
+            ceilingApproachHoldNormal = nil
+        end
+    end
+
     if surfaceLostAt <= 0 then
         surfaceLostAt = now
+        wwWallDiag("SAFETY_LOST_START",
+            "upY=" .. string.format("%.2f", up:Dot(UP))
+                .. ", moveMag=" .. string.format("%.2f", moveVector and moveVector.Magnitude or 0)
+                .. ", stair=" .. tostring(stairTraversalActive)
+                .. ", posY=" .. string.format("%.2f", root.Position.Y),
+            0
+        )
         return false
     end
 
     local safetyDelay = CFG.SurfaceSafetyDelay
+
     if up:Dot(UP) <= CFG.UpsideDownStairSafetyDot and stairTraversalActive then
         -- Ceiling stairs need a longer continuous-loss window because a narrow
         -- tread can disappear from the probes while the root is physically
@@ -3123,6 +9202,28 @@ end
 
     -- Continuous loss for the full delay: release custom gravity and let
     -- Roblox take over. No teleport and no saved-position recovery.
+    local releaseSupportDot = -1
+    if supportNormal then
+        releaseSupportDot = safeUnit(supportNormal, up):Dot(up)
+    end
+    wwWallDiag("SAFETY_RELEASE",
+        "lostFor=" .. string.format("%.2f", now - surfaceLostAt)
+            .. ", orientation=" .. wwDescribeSurfaceOrientation(up)
+            .. ", upY=" .. string.format("%.2f", up:Dot(UP))
+            .. ", supportSensor=" .. tostring(supportSeen == true)
+            .. ", supportDot=" .. string.format("%.2f", releaseSupportDot)
+            .. ", supportDist=" .. tostring(supportDistance)
+            .. ", claimRoute=" .. tostring(transitionClaim and transitionClaim.route or "none")
+            .. ", candidateRoute=" .. tostring(transitionResolvedRoute or transitionCandidateRoute or "none")
+            .. ", lastAuditRoute=" .. tostring(transitionCandidateAuditLatest and transitionCandidateAuditLatest.route or "none")
+            .. ", lastAuditPhase=" .. tostring(transitionCandidateAuditLatest and transitionCandidateAuditLatest.phase or "none")
+            .. ", lastAuditAge=" .. string.format("%.2f", transitionCandidateAuditLatest and (now - (transitionCandidateAuditLatest.lastSeenAt or now)) or math.huge)
+            .. ", moveMag=" .. string.format("%.2f", moveVector and moveVector.Magnitude or 0)
+            .. ", worldYVelocity=" .. string.format("%.2f", root.AssemblyLinearVelocity:Dot(UP))
+            .. ", stair=" .. tostring(stairTraversalActive)
+            .. ", posY=" .. string.format("%.2f", root.Position.Y),
+        0
+    )
     surfaceLostAt = 0
     safetyReleased = true
     safetySupportPoint = nil
@@ -3161,7 +9262,14 @@ end
     local velocity = root.AssemblyLinearVelocity
     local normalVelocity = velocity:Dot(currentUp)
     local tangentVelocity = velocity - normalVelocity * currentUp
-    local desired = CFG.WalkSpeed * worldMove
+    local movementSpeed = CFG.WalkSpeed
+    if humanoid then
+        local liveWalkSpeed = tonumber(humanoid.WalkSpeed)
+        if liveWalkSpeed and liveWalkSpeed >= 0 then
+            movementSpeed = liveWalkSpeed
+        end
+    end
+    local desired = movementSpeed * worldMove
     local delta = desired - tangentVelocity
 
     -- The ceiling staircase has a short active ramp window. Native gravity is
@@ -3219,8 +9327,36 @@ end
         force = force + delta.Unit * acceleration * mass
     end
 
-    local hit = cast(root.Position, -currentUp, CFG.AdhesionProbeLength)
+    local adhesionProbeLength = CFG.AdhesionProbeLength
+    if ceilingContactSupportReachActive and currentUp:Dot(UP) <= -0.985 then
+        adhesionProbeLength = math.max(adhesionProbeLength, CFG.LegacyWallEdgeCeilingSupportDistance)
+        wwWallDiag("CEILING_CONTACT_ADHESION_REACH_ARMED",
+            "extendedProbe=true, probeReach=" .. string.format("%.2f", adhesionProbeLength), 1.00)
+    end
+    if legacyEdgeCeilingSupportActive and currentUp:Dot(UP) <= -0.985 then
+        adhesionProbeLength = math.max(adhesionProbeLength, CFG.LegacyWallEdgeCeilingSupportDistance)
+    end
+    local hit = cast(root.Position, -currentUp, adhesionProbeLength)
     local surfaceNormal = hit and orientSurfaceNormal(hit, -currentUp)
+    if ceilingContactSupportReachActive and currentUp:Dot(UP) <= -0.985
+        and hit and surfaceNormal and currentUp:Dot(surfaceNormal) > 0.92
+        and math.abs((root.Position - hit.Position):Dot(surfaceNormal)) <= CFG.AdhesionProbeLength - 0.12
+    then
+        ceilingContactSupportReachActive = false
+        wwWallDiag("CEILING_CONTACT_ADHESION_REACH_CLEARED", "extendedProbe=false, reason=root-contact", 1.00)
+    end
+    if legacyEdgeCeilingSupportActive and currentUp:Dot(UP) <= -0.985 then
+        if hit and surfaceNormal and currentUp:Dot(surfaceNormal) > 0.92 then
+            if math.abs((root.Position - hit.Position):Dot(surfaceNormal)) <= CFG.AdhesionProbeLength - 0.12 then
+                legacyEdgeCeilingSupportActive = false
+                legacyEdgeCeilingSourceWallHoldActive = false
+                legacyEdgeCeilingSourceUp = nil
+                legacyEdgeCeilingHandoffPosition = nil
+                legacyEdgeCeilingStartedAt = 0
+                wwWallDiag("WW_LEGACY_EDGE_CEILING_SUPPORT_MODE", "enabled=false, reason=normal-root-contact", 0)
+            end
+        end
+    end
     local normalSpeed = velocity:Dot(currentUp)
     local groundedNow = surfaceNormal and currentUp:Dot(surfaceNormal) > 0.92 and normalSpeed <= 1.5
     if groundedNow and not jumped and not justLanded and (not CFG.WallAdhesionOnly or currentUp:Dot(UP) < 0.985) then
@@ -3427,7 +9563,55 @@ function applyCameraModuleUpTransform(cameraModule, dt)
     end
     local cameraRay = adjustedCFrame.Position - focus.Position
     if cameraRay.Magnitude > 0.05 then
-        local hit = workspace:Raycast(focus.Position, cameraRay, cameraCollisionParams)
+        cameraCollisionParams.FilterDescendantsInstances = character and {character} or {}
+        local ignoredForCamera = {}
+        local hit = nil
+        local rayStart = focus.Position
+        local rayDirection = cameraRay
+        local tries = 0
+
+        -- The normal Roblox camera ignores character bodies and often passes
+        -- through non-collidable/glass parts. Mirror that behavior for this
+        -- extra gravity-oriented collision check instead of pulling the camera
+        -- in whenever it touches a player or a window.
+        while tries < 16 do
+            hit = workspace:Raycast(rayStart, rayDirection, cameraCollisionParams)
+            if not hit then
+                break
+            end
+
+            local hitInstance = hit.Instance
+            local skipHit = false
+            if hitInstance and hitInstance:IsA("BasePart") then
+                if not hitInstance.CanCollide
+                    or hitInstance.Transparency >= 0.35
+                    or hitInstance.Material == Enum.Material.Glass then
+                    skipHit = true
+                end
+            end
+
+            local hitModel = hitInstance and hitInstance:FindFirstAncestorOfClass("Model")
+            if hitModel and hitModel ~= character
+                and hitModel:FindFirstChildOfClass("Humanoid") then
+                skipHit = true
+            end
+
+            if not skipHit then
+                break
+            end
+
+            ignoredForCamera[#ignoredForCamera + 1] = hitInstance
+            local filterList = {}
+            if character then
+                filterList[#filterList + 1] = character
+            end
+            for ignoreIndex = 1, #ignoredForCamera do
+                filterList[#filterList + 1] = ignoredForCamera[ignoreIndex]
+            end
+            cameraCollisionParams.FilterDescendantsInstances = filterList
+            tries = tries + 1
+        end
+
         if hit then
             local safeDistance = math.max(0.05, (hit.Position - focus.Position).Magnitude - 0.25)
             if safeDistance < cameraRay.Magnitude then
@@ -3978,6 +10162,43 @@ end
 
     updateSurface(dt, moveVector)
 
+    do
+        local stateUp = safeUnit(currentUp, UP)
+        local supportDot = -1
+        local supportBodyGap = math.huge
+        if surfaceSupportNormal then
+            supportDot = safeUnit(surfaceSupportNormal, stateUp):Dot(stateUp)
+        end
+        if surfaceSupportPoint then
+            supportBodyGap = getBodyPartSurfaceGap(surfaceSupportPoint)
+        end
+        local claimRoute = transitionClaim and transitionClaim.route or "none"
+        local routeName = transitionResolvedRoute or transitionCandidateRoute or "none"
+        local bodyUpDot = root.CFrame.UpVector:Dot(stateUp)
+        local safetyLostFor = surfaceLostAt > 0 and (os.clock() - surfaceLostAt) or 0
+        local lastAudit = transitionCandidateAuditLatest
+        local lastAuditRoute = lastAudit and lastAudit.route or "none"
+        local lastAuditPhase = lastAudit and lastAudit.phase or "none"
+        local lastAuditAge = lastAudit and (os.clock() - (lastAudit.lastSeenAt or os.clock())) or math.huge
+        wwWallDiag("WW_SURFACE_STATE",
+            "orientation=" .. wwDescribeSurfaceOrientation(stateUp)
+                .. ", gravityOwner=" .. tostring(customActive and "WallWalk" or "Roblox")
+                .. ", supportSensor=" .. tostring(surfaceSupportSeen == true)
+                .. ", supportMatchesGravity=" .. tostring(surfaceSupportSeen == true and supportDot >= CFG.SurfaceSafetySupportNormalDot)
+                .. ", supportDot=" .. string.format("%.2f", supportDot)
+                .. ", supportDist=" .. tostring(surfaceSupportDistance)
+                .. ", supportBodyGap=" .. string.format("%.2f", supportBodyGap)
+                .. ", bodyUpDot=" .. string.format("%.2f", bodyUpDot)
+                .. ", claimRoute=" .. tostring(claimRoute)
+                .. ", candidateRoute=" .. tostring(routeName)
+                .. ", lastAuditRoute=" .. tostring(lastAuditRoute)
+                .. ", lastAuditPhase=" .. tostring(lastAuditPhase)
+                .. ", lastAuditAge=" .. string.format("%.2f", lastAuditAge)
+                .. ", safetyLostFor=" .. string.format("%.2f", safetyLostFor)
+                .. ", worldYVelocity=" .. string.format("%.2f", root.AssemblyLinearVelocity:Dot(UP)),
+            0.50)
+    end
+
     if checkSurfaceSafety(dt, moveVector) then return end
 
     if not customActive then
@@ -4066,7 +10287,7 @@ end
     local tangentSpeed = projectOnPlane(root.AssemblyLinearVelocity, currentUp).Magnitude
     local grounded = getGrounded(currentUp)
     if customActive then
-        updateAnimations(worldMove.Magnitude > 0.05, grounded, tangentSpeed)
+        updateAnimations(worldMove.Magnitude > 0.05, grounded, tangentSpeed, dt)
     end
 end
 ]=] },
@@ -4163,7 +10384,7 @@ function createUI()
     title.TextSize = 11
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.TextColor3 = Color3.new(1, 1, 1)
-    title.Text = "WallWalk v48.76.19"
+    title.Text = "WallWalk v48.76.113"
     title.TextTruncate = Enum.TextTruncate.AtEnd
     title.Parent = panel
 
@@ -4373,24 +10594,24 @@ end)]=] },
 for _, module in ipairs(modules) do
     local chunk, compileError = compiler(module.source)
     if not chunk then
-        warn("VGD WallWalk v48.76.19 POV compile failure in " .. module.name .. ": " .. tostring(compileError))
+        warn("VGD WallWalk v48.76.113 compile failure in " .. module.name .. ": " .. tostring(compileError))
         return
     end
     if type(setfenv) == "function" then
         local envOk, envError = pcall(setfenv, chunk, sharedEnvironment)
         if not envOk then
-            warn("VGD WallWalk v48.76.19 POV environment failure in " .. module.name .. ": " .. tostring(envError))
+            warn("VGD WallWalk v48.76.113 environment failure in " .. module.name .. ": " .. tostring(envError))
             return
         end
     end
     local runOk, runError = pcall(chunk)
     if not runOk then
-        warn("VGD WallWalk v48.76.19 POV runtime failure in " .. module.name .. ": " .. tostring(runError))
+        warn("VGD WallWalk v48.76.113 runtime failure in " .. module.name .. ": " .. tostring(runError))
         return
     end
 end
 
-print("VGD WallWalk v48.76.19 POV: all " .. tostring(#modules) .. " source segments loaded.")
+print("VGD WallWalk v48.76.113: all " .. tostring(#modules) .. " source segments loaded.")
 
 -- The controller is returned from the outer bootstrap environment, while the
 -- actual WallWalk state/functions live in sharedEnvironment. Always address
