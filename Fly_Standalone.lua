@@ -1,4 +1,4 @@
--- VGD Fly H18.5 / OP V233 — V259 read-only Normal vertical-physics diagnostic
+-- VGD Fly H18.5 / OP V262 — Fidget Action4 + Execute-Time Animation Preload
 -- Protected behavior source: V255. No movement/animation behavior changes.
 -- V229 baseline retained separately; Fly 2 integration is experimental.
 -- Behavior baseline: H15. Stable Fly_Standalone.lua remains untouched.
@@ -72,6 +72,7 @@ local flyServices = {
     RunService = game:GetService("RunService"),
     UserInputService = game:GetService("UserInputService"),
     ContextActionService = game:GetService("ContextActionService"),
+    ContentProvider = game:GetService("ContentProvider"),
     GuiService = game:GetService("GuiService"),
     Player = nil,
 }
@@ -94,6 +95,9 @@ local flyRuntime = {
     AnimateScript = nil,
     AnimateScriptDisabled = false,
     Tracks = {},
+    AnimationPreloadReady = false,
+    AnimationPreloadError = nil,
+    AnimationPreloadDeadline = os.clock() + 20,
     Fly2StartupPending = false,
     Fly2TornadoHandoffPending = false,
     NormalOrientationAttachment = nil,
@@ -657,6 +661,51 @@ local flyIdleFidget = {
     currentWeight = 0,
     diagnosticElapsed = 0,
 }
+
+
+-- V262: preload every Fly animation asset as soon as the script executes.
+-- Track creation still uses the current character's Animator when Fly is enabled;
+-- this warms the asset cache before the first startup/idle/fidget transition.
+task.spawn(function()
+    local animations = {}
+    local seen = {}
+    local animationIds = {
+        FLY_CONFIG.FLY2_STARTUP_ANIMATION_ID,
+        FLY_CONFIG.FLY2_TORNADO_ANIMATION_ID,
+        FLY_CONFIG.IDLE_ANIMATION_ID,
+        FLY_CONFIG.MOVE_ANIMATION_ID,
+        FLY_CONFIG.BACKWARD_ANIMATION_ID,
+        FLY_CONFIG.FLY_STARTUP_ANIMATION_ID,
+        FLY_CONFIG.FLY_STARTUP_ASCEND_ANIMATION_ID,
+    }
+
+    for _, variant in ipairs(flyIdleFidget.variants) do
+        table.insert(animationIds, variant.animationId)
+    end
+
+    for _, animationId in ipairs(animationIds) do
+        if type(animationId) == "string" and animationId ~= "" and not seen[animationId] then
+            seen[animationId] = true
+            local animation = Instance.new("Animation")
+            animation.Name = "VGD_Fly_V262_Preload"
+            animation.AnimationId = animationId
+            table.insert(animations, animation)
+        end
+    end
+
+    local ok, preloadError = pcall(function()
+        flyServices.ContentProvider:PreloadAsync(animations)
+    end)
+
+    for _, animation in ipairs(animations) do
+        pcall(function() animation:Destroy() end)
+    end
+
+    if not ok then
+        flyRuntime.AnimationPreloadError = tostring(preloadError)
+    end
+    flyRuntime.AnimationPreloadReady = true
+end)
 
 -- V178: Startup ON uses the new dedicated takeoff animation normally.
 -- The animation begins in the desired landing/crouch pose, so there is no
@@ -1964,19 +2013,19 @@ local function loadFlyAnimations(humanoid)
         flyRuntime.Tracks.backward = load(FLY_CONFIG.BACKWARD_ANIMATION_ID, Enum.AnimationPriority.Action)
     end
     if flyProfile == "Fly 1" then
-    flyRuntime.Tracks.fidget1 = load(flyIdleFidget.variants[1].animationId, Enum.AnimationPriority.Action, false)
+    flyRuntime.Tracks.fidget1 = load(flyIdleFidget.variants[1].animationId, Enum.AnimationPriority.Action4, false)
     end
     if flyProfile == "Fly 1" then
-    flyRuntime.Tracks.fidget2 = load(flyIdleFidget.variants[2].animationId, Enum.AnimationPriority.Action, false)
+    flyRuntime.Tracks.fidget2 = load(flyIdleFidget.variants[2].animationId, Enum.AnimationPriority.Action4, false)
     end
     if flyProfile == "Fly 1" then
-    flyRuntime.Tracks.fidget3 = load(flyIdleFidget.variants[3].animationId, Enum.AnimationPriority.Action, false)
+    flyRuntime.Tracks.fidget3 = load(flyIdleFidget.variants[3].animationId, Enum.AnimationPriority.Action4, false)
     end
     if flyProfile == "Fly 1" then
-    flyRuntime.Tracks.fidget4 = load(flyIdleFidget.variants[4].animationId, Enum.AnimationPriority.Action, false)
+    flyRuntime.Tracks.fidget4 = load(flyIdleFidget.variants[4].animationId, Enum.AnimationPriority.Action4, false)
     end
     if flyProfile == "Fly 1" then
-    flyRuntime.Tracks.fidget5 = load(flyIdleFidget.variants[5].animationId, Enum.AnimationPriority.Action, false)
+    flyRuntime.Tracks.fidget5 = load(flyIdleFidget.variants[5].animationId, Enum.AnimationPriority.Action4, false)
     end
 
     -- V169: NEVER start a Fly-owned animation at full weight during loading.
@@ -4657,6 +4706,12 @@ end
 local function enableFly()
     if flyRuntime.Enabled then return true end
 
+    -- V262: don't begin the first transition while the execute-time asset preload is still running.
+    while not flyRuntime.AnimationPreloadReady
+        and os.clock() < flyRuntime.AnimationPreloadDeadline do
+        task.wait()
+    end
+
     -- v93: invalidate every callback belonging to the previous session.
     flyCameraHandoff.SessionId += 1
     local thisFlySession = flyCameraHandoff.SessionId
@@ -5789,7 +5844,7 @@ ui.versionLabel = Instance.new("TextLabel")
 ui.versionLabel.Size = UDim2.fromOffset(34, 18)
 ui.versionLabel.Position = UDim2.new(1, -67, 0, 10)
 ui.versionLabel.BackgroundTransparency = 1
-ui.versionLabel.Text = "OP V236 DEV"
+ui.versionLabel.Text = "V262"
 ui.versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
 ui.versionLabel.Font = Enum.Font.Gotham
 ui.versionLabel.TextSize = 9
