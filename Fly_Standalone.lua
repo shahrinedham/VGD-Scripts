@@ -1,6 +1,7 @@
--- VGD Fly H18.5 / OP V262 — Fidget Action4 + Execute-Time Animation Preload
--- Protected behavior source: V255. No movement/animation behavior changes.
--- V229 baseline retained separately; Fly 2 integration is experimental.
+-- VGD Fly H19.2 / OP V285 — Idle-Gated In-Flight Profile Switching
+-- V285 changes: allow idle-only in-flight profile switching with a smooth outgoing/incoming idle crossfade; preserve V283 startup and movement behavior.
+-- V267 candidate: correct backward lean sign, soften falling animation with idle blend, use 1.5-stud lift and slightly longer handoff.
+-- V264 source retained unchanged. V263 profile selector and Fly 1/2 behavior retained.
 -- Behavior baseline: H15. Stable Fly_Standalone.lua remains untouched.
 -- V213: keep resumeAlpha in scope for the completion check; preserve the final resume frame.
 -- H15.6 fidget handoff polish: preserve the live directional blend while
@@ -12,6 +13,16 @@ local FLY_CONFIG = {
     FLY2_STARTUP_ANIMATION_ID = "rbxassetid://79757971761739",
     FLY2_TORNADO_ANIMATION_ID = "rbxassetid://99288885472129",
     FLY2_TORNADO_SPEED = 1.5,
+    FLY3_IDLE_ANIMATION_ID = "rbxassetid://98789048056989",
+    FLY3_STARTUP_ANIMATION_ID = "rbxassetid://91163018452577",
+    FLY3_FORWARD_ANIMATION_ID = "rbxassetid://106416702755347",
+    FLY3_BACKWARD_ANIMATION_ID = "rbxassetid://75020966076281",
+    FLY3_STARTUP_PLAY_SECONDS = 6.0,
+    FLY3_STARTUP_HEADACHE_SECONDS = 1.2,
+    FLY3_STARTUP_ASCEND_SPEED = 2.0,
+    FLY3_STARTUP_SPEED_RAMP_SECONDS = 0.25,
+    FLY3_HANDOFF_LIFT = 1.5,
+    FLY3_HANDOFF_BLEND_TIME = 1.35,
     FLY2_STARTUP_PLAY_SECONDS = 3.0,
     FLY2_TRANSITION_BLEND = 0.65,
     FLY2_TORNADO_RELEASE_AT = 0.90,
@@ -32,6 +43,8 @@ local FLY_CONFIG = {
     -- arm pose has time to redirect instead of snapping.
     FLY_FIDGET_DIRECTION_REDIRECT_RESPONSE = 0.32,
     FLY_IDLE_STABLE_THRESHOLD = 0.05,
+    PROFILE_SWITCH_IDLE_REQUIRED = 0.45,
+    PROFILE_SWITCH_BLEND_TIME = 0.55,
     FLY_CAMERA_TOUCH_ROTATION_SPEED = Vector2.new(0.82, 0.54) * math.rad(1),
     FLY_CAMERA_MOUSE_ROTATION_SPEED = Vector2.new(1, 0.77) * math.rad(0.5),
     FLY_CAMERA_LOOK_SMOOTHNESS = 34,
@@ -42,7 +55,7 @@ local FLY_CONFIG = {
     FLY_CAMERA_MIN_PITCH = math.rad(-89),
     FLY_CAMERA_MAX_PITCH = math.rad(89),
     FLY_CAMERA_ZOOM_MIN = 0,
-    FLY_CAMERA_ZOOM_MAX = 40,
+    FLY_CAMERA_ZOOM_MAX = 200,
 
     -- V198 animation/startup configuration (consolidated for register headroom).
     IDLE_ANIMATION_ID = "rbxassetid://106706162821039",
@@ -100,6 +113,24 @@ local flyRuntime = {
     AnimationPreloadDeadline = os.clock() + 20,
     Fly2StartupPending = false,
     Fly2TornadoHandoffPending = false,
+    Fly3StartupPending = false,
+    Fly3StartupHandoffActive = false,
+    Fly3StartupHandoffTrack = nil,
+    Fly3StartupHandoffElapsed = 0,
+    Fly3StartupHandoffLiftApplied = 0,
+    Fly3StartupHandoffLiftStep = 0,
+    ProfileSwitchIdleTime = 0,
+    ProfileSwitchReady = false,
+    ProfileSwitchNotice = nil,
+    ProfileSwitchNoticeToken = 0,
+    ProfileSwitchBlend = {
+        Active = false,
+        Elapsed = 0,
+        Duration = 0.55,
+        IncomingTrack = nil,
+        OutgoingWeights = {},
+        OutgoingTracks = {},
+    },
     NormalOrientationAttachment = nil,
     NormalOrientationAlign = nil,
     NormalOrientationTarget = CFrame.identity,
@@ -110,6 +141,7 @@ local flyRuntime = {
     -- V250 telemetry state. Read-only diagnostics; does not steer motion.
 }
 local flyProfile = "Fly 1"
+local flyBackwardWeight = 0
 local flyGui = {
     GUI_CONTROLLED = false,
     ScreenGui = nil,
@@ -663,7 +695,7 @@ local flyIdleFidget = {
 }
 
 
--- V262: preload every Fly animation asset as soon as the script executes.
+-- V263: preload every configured Fly 1/2/3 animation asset as soon as the script executes.
 -- Track creation still uses the current character's Animator when Fly is enabled;
 -- this warms the asset cache before the first startup/idle/fidget transition.
 task.spawn(function()
@@ -672,6 +704,10 @@ task.spawn(function()
     local animationIds = {
         FLY_CONFIG.FLY2_STARTUP_ANIMATION_ID,
         FLY_CONFIG.FLY2_TORNADO_ANIMATION_ID,
+        FLY_CONFIG.FLY3_IDLE_ANIMATION_ID,
+        FLY_CONFIG.FLY3_STARTUP_ANIMATION_ID,
+        FLY_CONFIG.FLY3_FORWARD_ANIMATION_ID,
+        FLY_CONFIG.FLY3_BACKWARD_ANIMATION_ID,
         FLY_CONFIG.IDLE_ANIMATION_ID,
         FLY_CONFIG.MOVE_ANIMATION_ID,
         FLY_CONFIG.BACKWARD_ANIMATION_ID,
@@ -687,7 +723,7 @@ task.spawn(function()
         if type(animationId) == "string" and animationId ~= "" and not seen[animationId] then
             seen[animationId] = true
             local animation = Instance.new("Animation")
-            animation.Name = "VGD_Fly_V262_Preload"
+            animation.Name = "VGD_Fly_V285_Preload"
             animation.AnimationId = animationId
             table.insert(animations, animation)
         end
@@ -854,6 +890,225 @@ local function findJointForBodyPart(character, bodyPartName)
 
     return nil, "None"
 end
+
+-- V279: normalize the authored backward pose at both animated torso joints without Euler gimbal snaps.
+-- Keep the intentional forward/backward pitch, but blend root/waist yaw and
+-- roll toward neutral and remove horizontal joint offsets as the backward track
+-- takes over. This prevents the torso from twisting toward the camera while
+-- keeping the character's actual HumanoidRootPart/Shift Lock heading untouched.
+-- Supports both legacy Motor6D and Avatar Joint Upgrade AnimationConstraint.
+local fly3RootMotionJoint = nil
+local fly3RootMotionCharacter = nil
+local fly3RootMotionResolved = false
+local fly3RootMotionConnection = nil
+local fly3RootMotionJointClass = "None"
+local fly3RootMotionDiagnosticLogged = false
+local fly3WaistJoint = nil
+local fly3WaistCharacter = nil
+
+local function getFly3RootMotionJoint(character)
+    if not character then return nil end
+    if fly3RootMotionCharacter == character and fly3RootMotionResolved then
+        if fly3RootMotionJoint and fly3RootMotionJoint.Parent then
+            return fly3RootMotionJoint
+        end
+        return nil
+    end
+
+    fly3RootMotionCharacter = character
+    fly3RootMotionJoint = nil
+    fly3RootMotionJointClass = "None"
+    fly3RootMotionResolved = true
+    fly3RootMotionDiagnosticLogged = false
+
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    local lowerTorso = character:FindFirstChild("LowerTorso")
+    if not rootPart or not lowerTorso then return nil end
+
+    for _, instance in ipairs(character:GetDescendants()) do
+        if instance:IsA("Motor6D") then
+            if instance.Part0 == rootPart and instance.Part1 == lowerTorso then
+                fly3RootMotionJoint = instance
+                fly3RootMotionJointClass = "Motor6D"
+                break
+            end
+        elseif instance:IsA("AnimationConstraint") then
+            local attachment0 = instance.Attachment0
+            local attachment1 = instance.Attachment1
+            if attachment0 and attachment1
+                and attachment0.Parent == rootPart
+                and attachment1.Parent == lowerTorso then
+                fly3RootMotionJoint = instance
+                fly3RootMotionJointClass = "AnimationConstraint"
+                break
+            end
+        end
+    end
+
+    return fly3RootMotionJoint
+end
+
+local function getFly3WaistJoint(character)
+    if not character then return nil end
+    if fly3WaistCharacter == character and fly3WaistJoint and fly3WaistJoint.Parent then
+        return fly3WaistJoint
+    end
+    fly3WaistCharacter = character
+    fly3WaistJoint = nil
+    local lower = character:FindFirstChild("LowerTorso")
+    local upper = character:FindFirstChild("UpperTorso")
+    if not lower or not upper then return nil end
+    for _, joint in ipairs(character:GetDescendants()) do
+        if joint:IsA("Motor6D") then
+            if joint.Part0 == lower and joint.Part1 == upper then
+                fly3WaistJoint = joint
+                break
+            end
+        elseif joint:IsA("AnimationConstraint") then
+            local a0, a1 = joint.Attachment0, joint.Attachment1
+            if a0 and a1 and a0.Parent == lower and a1.Parent == upper then
+                fly3WaistJoint = joint
+                break
+            end
+        end
+    end
+    return fly3WaistJoint
+end
+
+-- V279: normalize backward rotation using quaternion X-twist extraction instead
+-- of Euler decomposition. ToOrientation/ToEulerAnglesYXZ can jump at +/-90 deg
+-- pitch (gimbal lock), which can reintroduce yaw/roll and make the pose snap
+-- toward the camera midway through the falling animation. Preserve only the
+-- local X twist, reduce its angle to 48%, and slerp from the authored pose using
+-- backwardWeight so transitions stay continuous. Handles Motor6D and
+-- AnimationConstraint using the Animator-compatible PreSimulation timing.
+local FLY3_BACKWARD_PITCH_KEEP = 0.48
+local fly3TwistCharacter = nil
+local fly3PreviousRootTwist = nil
+local fly3PreviousWaistTwist = nil
+
+local function getContinuousXTwistAngle(rotation, previousAngle)
+    local axis, angle = rotation:ToAxisAngle()
+    local halfAngle = angle * 0.5
+    local quaternionX = axis.X * math.sin(halfAngle)
+    local quaternionW = math.cos(halfAngle)
+    local twistMagnitude = math.sqrt(
+        quaternionX * quaternionX + quaternionW * quaternionW
+    )
+
+    if twistMagnitude < 0.00001 then
+        return previousAngle or 0
+    end
+
+    quaternionX = quaternionX / twistMagnitude
+    quaternionW = quaternionW / twistMagnitude
+    local twistAngle = 2 * math.atan2(quaternionX, quaternionW)
+
+    -- Quaternion signs can flip at the equivalent +/-180-degree representation.
+    -- Unwrap to the nearest equivalent angle so the extracted twist stays smooth.
+    if previousAngle ~= nil then
+        twistAngle = twistAngle + (2 * math.pi)
+            * math.floor((previousAngle - twistAngle) / (2 * math.pi) + 0.5)
+    end
+    return twistAngle
+end
+
+fly3RootMotionConnection = flyServices.RunService.PreSimulation:Connect(function()
+    if not flyRuntime.Enabled or flyProfile ~= "Fly 3" then return end
+    local backwardWeight = math.clamp(flyBackwardWeight or 0, 0, 1)
+    if backwardWeight <= 0.001 then
+        fly3PreviousRootTwist = nil
+        fly3PreviousWaistTwist = nil
+        return
+    end
+
+    local character = flyServices.Player.Character
+    if fly3TwistCharacter ~= character then
+        fly3TwistCharacter = character
+        fly3PreviousRootTwist = nil
+        fly3PreviousWaistTwist = nil
+    end
+
+    local rootJoint = getFly3RootMotionJoint(character)
+    if not rootJoint then
+        if not fly3RootMotionDiagnosticLogged then
+            fly3RootMotionDiagnosticLogged = true
+            warn("[VGD Fly3 Backward Normalize] Root -> LowerTorso joint not found; expected Motor6D or AnimationConstraint.")
+        end
+        return
+    end
+
+    local keep = 1 - backwardWeight
+    local rootTransform = rootJoint.Transform
+    local rootPosition = rootTransform.Position
+    local rootRotation = rootTransform.Rotation
+    local rootTwist = getContinuousXTwistAngle(rootRotation, fly3PreviousRootTwist)
+    fly3PreviousRootTwist = rootTwist
+    local rootTargetRotation = CFrame.fromAxisAngle(
+        Vector3.new(1, 0, 0),
+        rootTwist * FLY3_BACKWARD_PITCH_KEEP
+    )
+    local normalizedRootRotation = rootRotation:Lerp(rootTargetRotation, backwardWeight)
+    rootJoint.Transform = CFrame.new(
+        rootPosition.X * keep,
+        rootPosition.Y,
+        rootPosition.Z * keep
+    ) * normalizedRootRotation
+
+    local waist = getFly3WaistJoint(character)
+    local rootYaw, rootRoll = 0, 0
+    local waistYaw, waistRoll = 0, 0
+    local waistSideOffset = 0
+    if waist then
+        local waistTransform = waist.Transform
+        local waistPosition = waistTransform.Position
+        local waistRotation = waistTransform.Rotation
+        local _, rawRootYaw, rawRootRoll = rootRotation:ToOrientation()
+        local _, rawWaistYaw, rawWaistRoll = waistRotation:ToOrientation()
+        rootYaw = rawRootYaw
+        rootRoll = rawRootRoll
+        waistYaw = rawWaistYaw
+        waistRoll = rawWaistRoll
+        waistSideOffset = waistPosition.X
+
+        local waistTwist = getContinuousXTwistAngle(
+            waistRotation,
+            fly3PreviousWaistTwist
+        )
+        fly3PreviousWaistTwist = waistTwist
+        local waistTargetRotation = CFrame.fromAxisAngle(
+            Vector3.new(1, 0, 0),
+            waistTwist * FLY3_BACKWARD_PITCH_KEEP
+        )
+        local normalizedWaistRotation = waistRotation:Lerp(
+            waistTargetRotation,
+            backwardWeight
+        )
+        waist.Transform = CFrame.new(
+            waistPosition.X * keep,
+            waistPosition.Y,
+            waistPosition.Z * keep
+        ) * normalizedWaistRotation
+    else
+        fly3PreviousWaistTwist = nil
+    end
+
+    if not fly3RootMotionDiagnosticLogged and backwardWeight >= 0.90 then
+        fly3RootMotionDiagnosticLogged = true
+        print(string.format(
+            "[VGD Fly3 Backward Normalize] joint=%s; quaternion twist root/waist=%.1f/%.1f deg; source yaw/roll root=%.1f/%.1f deg, waist=%.1f/%.1f deg; waist side offset=%.3f studs; pitch keep=%.2f.",
+            fly3RootMotionJointClass,
+            math.deg(rootTwist),
+            math.deg(fly3PreviousWaistTwist or 0),
+            math.deg(rootYaw),
+            math.deg(rootRoll),
+            math.deg(waistYaw),
+            math.deg(waistRoll),
+            waistSideOffset,
+            FLY3_BACKWARD_PITCH_KEEP
+        ))
+    end
+end)
 
 local function beginFlyJointDiagnostic(character)
     flyJointDiagnostic.Active = true
@@ -1623,7 +1878,8 @@ local function startNormalFlyAnimationSet(smoothBlend)
         -- pose on one frame. Disabling Animate here was the remaining source
         -- of the visible Startup OFF snap after PlatformStand was removed.
         task.delay(0.90, function()
-            if not flyRuntime.Enabled or flyStartup.Active then
+            if not flyRuntime.Enabled or flyStartup.Active
+                or flyRuntime.Fly3StartupHandoffActive then
                 return
             end
 
@@ -1917,7 +2173,7 @@ end
 -- v56: explicit per-track blend weights owned by Fly.
 local flyIdleWeight = 1
 local flyMoveWeight = 0
-local flyBackwardWeight = 0
+flyBackwardWeight = 0
 
 -- V220: hold playback phase while a directional track is genuinely dormant.
 -- The per-frame movement-speed updater must not override AdjustSpeed(0) while held.
@@ -2007,6 +2263,11 @@ local function loadFlyAnimations(humanoid)
     -- the Animate controller is disabled.
     if flyProfile == "Fly 2" then
         flyRuntime.Tracks.tornado = load(FLY_CONFIG.FLY2_TORNADO_ANIMATION_ID, Enum.AnimationPriority.Action)
+    elseif flyProfile == "Fly 3" then
+        flyRuntime.Tracks.idle = load(FLY_CONFIG.FLY3_IDLE_ANIMATION_ID, Enum.AnimationPriority.Action4)
+        flyRuntime.Tracks.move = load(FLY_CONFIG.FLY3_FORWARD_ANIMATION_ID, Enum.AnimationPriority.Action4)
+        flyRuntime.Tracks.backward = load(FLY_CONFIG.FLY3_BACKWARD_ANIMATION_ID, Enum.AnimationPriority.Action4)
+        flyRuntime.Tracks.fly3Startup = load(FLY_CONFIG.FLY3_STARTUP_ANIMATION_ID, Enum.AnimationPriority.Action4, false)
     else
         flyRuntime.Tracks.idle = load(FLY_CONFIG.IDLE_ANIMATION_ID, Enum.AnimationPriority.Action)
         flyRuntime.Tracks.move = load(FLY_CONFIG.MOVE_ANIMATION_ID, Enum.AnimationPriority.Action)
@@ -2037,7 +2298,156 @@ local function loadFlyAnimations(humanoid)
 
 end
 
+local function updateFly3Animations(isMoving, moveDirection, deltaTime, forwardInput)
+    local idle = flyRuntime.Tracks.idle
+    local move = flyRuntime.Tracks.move
+    local backward = flyRuntime.Tracks.backward
+    if not idle then return end
+    if flyStartup.Active or flyRuntime.Fly3StartupPending then
+        flyIdleWeight = 0
+        flyMoveWeight = 0
+        flyBackwardWeight = 0
+        return
+    end
+
+    local desiredState = "Idle"
+    if isMoving and moveDirection.Magnitude > 0.001 then
+        local inputForward = forwardInput or 0
+        -- Backward-input hysteresis prevents a brief dot-product fluctuation
+        -- near the direction threshold from fading out the backward track and
+        -- exposing its authored camera-facing keyframes mid-animation.
+        local wasBackward = animState.flyAnimState == "Backward"
+        local backwardThreshold = wasBackward and 0.08 or -0.22
+        desiredState = inputForward < backwardThreshold and "Backward" or "Forward"
+    end
+    animState.flyAnimState = desiredState
+    animState.flyPreviousDesiredState = desiredState
+    if desiredState ~= "Idle" then
+        animState.flyLastDirectionalState = desiredState
+    end
+
+    local idleTarget = desiredState == "Idle" and 1 or 0
+    local moveTarget = desiredState == "Forward" and 1 or 0
+    local backwardTarget = desiredState == "Backward" and 1 or 0
+    if flyRuntime.Fly3StartupHandoffActive then
+        local duration = math.max(FLY_CONFIG.FLY3_HANDOFF_BLEND_TIME, 0.05)
+        flyRuntime.Fly3StartupHandoffElapsed = math.min(
+            duration,
+            flyRuntime.Fly3StartupHandoffElapsed + math.max(deltaTime, 0)
+        )
+        local t = math.clamp(flyRuntime.Fly3StartupHandoffElapsed / duration, 0, 1)
+        local eased = t * t * (3 - 2 * t)
+
+        -- Crossfade the outgoing startup and incoming flight state with one
+        -- shared eased curve so the two tracks cannot race each other.
+        flyIdleWeight = idleTarget * eased
+        flyMoveWeight = moveTarget * eased
+        flyBackwardWeight = backwardTarget * eased
+
+        local startupTrack = flyRuntime.Fly3StartupHandoffTrack
+        if startupTrack then
+            pcall(function() startupTrack:AdjustWeight(1 - eased, 0) end)
+        end
+
+        -- Turn the old one-time handoff lift into small, accumulated per-frame
+        -- increments driven by this same progress curve.
+        local targetLift = FLY_CONFIG.FLY3_HANDOFF_LIFT * eased
+        flyRuntime.Fly3StartupHandoffLiftStep =
+            targetLift - flyRuntime.Fly3StartupHandoffLiftApplied
+        flyRuntime.Fly3StartupHandoffLiftApplied = targetLift
+
+        if t >= 1 then
+            flyRuntime.Fly3StartupHandoffActive = false
+            if startupTrack then
+                pcall(function()
+                    startupTrack:AdjustWeight(0, 0)
+                    startupTrack:Stop(0)
+                    startupTrack:AdjustSpeed(1)
+                end)
+            end
+            flyRuntime.Fly3StartupHandoffTrack = nil
+        end
+    else
+        local blendAlpha = 1 - math.exp(-math.max(deltaTime, 0) / 0.30)
+        flyIdleWeight = flyIdleWeight + (idleTarget - flyIdleWeight) * blendAlpha
+        flyMoveWeight = flyMoveWeight + (moveTarget - flyMoveWeight) * blendAlpha
+        flyBackwardWeight = flyBackwardWeight + (backwardTarget - flyBackwardWeight) * blendAlpha
+        flyRuntime.Fly3StartupHandoffLiftStep = 0
+    end
+
+    if not idle.IsPlaying then idle:Play(0, 0, 1) end
+    if move and not move.IsPlaying then move:Play(0, 0, 1) end
+    if backward and not backward.IsPlaying then backward:Play(0, 0, 1) end
+    -- Preserve Fly 3's actual backward animation at its full state weight.
+    -- Procedural counter-lean is handled separately; do not suppress this track.
+    idle:AdjustWeight(math.clamp(flyIdleWeight, 0, 1), 0)
+    if move then applyDirectionalWeightWithPhaseGuard(move, "Forward", flyMoveWeight) end
+    if backward then applyDirectionalWeightWithPhaseGuard(backward, "Backward", flyBackwardWeight) end
+
+    local speedTarget = isMoving and math.clamp(moveDirection.Magnitude, 0, 1) or 0
+    animState.speedBlend += (speedTarget - animState.speedBlend)
+        * (1 - math.exp(-math.max(deltaTime, 0) / 0.16))
+    if move and move.IsPlaying and not flyDirectionalPaused.Forward then
+        move:AdjustSpeed(math.clamp(0.75 + animState.speedBlend * 0.75, 0.75, 1.5))
+    end
+    if backward and backward.IsPlaying and not flyDirectionalPaused.Backward then
+        backward:AdjustSpeed(math.clamp(0.80 + animState.speedBlend * 0.60, 0.80, 1.4))
+    end
+end
+
 local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardInput)
+    local profileBlend = flyRuntime.ProfileSwitchBlend
+    if profileBlend and profileBlend.Active then
+        profileBlend.Elapsed = math.min(
+            profileBlend.Elapsed + math.max(deltaTime or 0, 0),
+            profileBlend.Duration
+        )
+        local progress = math.clamp(
+            profileBlend.Elapsed / math.max(profileBlend.Duration, 0.001),
+            0,
+            1
+        )
+        local eased = progress * progress * (3 - 2 * progress)
+        local incomingTrack = profileBlend.IncomingTrack
+        if incomingTrack and incomingTrack.IsPlaying then
+            pcall(function() incomingTrack:AdjustWeight(eased, 0) end)
+        end
+        for _, outgoing in ipairs(profileBlend.OutgoingWeights) do
+            local track = outgoing.Track
+            if track and track.IsPlaying then
+                pcall(function()
+                    track:AdjustWeight(outgoing.StartWeight * (1 - eased), 0)
+                end)
+            end
+        end
+
+        if progress >= 1 then
+            for _, oldTrack in ipairs(profileBlend.OutgoingTracks) do
+                if oldTrack and oldTrack ~= incomingTrack then
+                    pcall(function() oldTrack:Stop(0) end)
+                    pcall(function() oldTrack:Destroy() end)
+                end
+            end
+            profileBlend.Active = false
+            profileBlend.IncomingTrack = nil
+            table.clear(profileBlend.OutgoingWeights)
+            table.clear(profileBlend.OutgoingTracks)
+            flyIdleWeight = 1
+            flyMoveWeight = 0
+            flyBackwardWeight = 0
+            animState.flyAnimState = "Idle"
+            animState.flyPreviousDesiredState = "Idle"
+            animState.flyIdleStableTime = 0
+            flyIdleFidget.idleTime = 0
+            flyIdleFidget.active = false
+            flyIdleFidget.elapsed = 0
+            flyIdleFidget.interrupting = false
+            flyIdleFidget.interruptElapsed = 0
+            flyIdleFidget.interruptRemaining = 0
+        end
+        return
+    end
+
     local idle = flyRuntime.Tracks.idle
     local move = flyRuntime.Tracks.move
     local backward = flyRuntime.Tracks.backward
@@ -2056,6 +2466,10 @@ local function updateFlyAnimations(isMoving, moveDirection, deltaTime, forwardIn
                 end
             end
         end
+        return
+    end
+    if flyProfile == "Fly 3" then
+        updateFly3Animations(isMoving, moveDirection, deltaTime, forwardInput)
         return
     end
     if not idle then return end
@@ -3683,26 +4097,21 @@ end
 local function syncRobloxCameraZoomState(distance)
     if not distance or flyInput.SpectatingOtherPlayer then return end
 
-    -- Keep Roblox CameraModule's own nominal zoom distance synchronized
-    -- while Fly is active. CameraModule stores currentSubjectDistance
-    -- separately from Camera.CFrame, so merely moving the Scriptable camera
-    -- cannot teach the normal camera about Fly's zoom. Using matching limits
-    -- forces CameraModule to clamp its internal distance to the live Fly
-    -- distance. The limits are restored on Fly exit.
-    local clamped = math.clamp(
-        distance,
-        0.5,
-        40
-    )
-
-    if not flyCameraSaved.MinZoom or not flyCameraSaved.MaxZoom then
-        return
+    -- V285: do not force CameraMinZoomDistance and CameraMaxZoomDistance
+    -- to the current zoom every frame. That made the user's zoom range
+    -- collapse to one distance and could leave the normal camera with
+    -- altered limits after Fly ended. Keep the captured zoom-in minimum
+    -- and a stable 200-stud maximum instead.
+    local minimum = flyCameraSaved.MinZoom
+    if minimum == nil then
+        minimum = flyServices.Player.CameraMinZoomDistance
     end
 
-    if math.abs(flyServices.Player.CameraMinZoomDistance - clamped) > 0.02
-        or math.abs(flyServices.Player.CameraMaxZoomDistance - clamped) > 0.02 then
-        flyServices.Player.CameraMinZoomDistance = clamped
-        flyServices.Player.CameraMaxZoomDistance = clamped
+    if math.abs(flyServices.Player.CameraMinZoomDistance - minimum) > 0.02 then
+        flyServices.Player.CameraMinZoomDistance = minimum
+    end
+    if math.abs(flyServices.Player.CameraMaxZoomDistance - 200) > 0.02 then
+        flyServices.Player.CameraMaxZoomDistance = 200
     end
 end
 
@@ -4062,6 +4471,29 @@ local function updateFly(deltaTime)
         frame.isMoving = false
     end
 
+    -- V285: profile changes are allowed only after a sustained no-input idle.
+    -- Startup and transition windows do not count as idle even if movement is zero.
+    frame.profileSwitchBlocked = startupFrame
+        or flyStartup.Active
+        or flyStartup.LaunchActive
+        or flyStartup.FinalBlendActive
+        or flyRuntime.Fly2StartupPending
+        or flyRuntime.Fly2TornadoHandoffPending
+        or flyRuntime.Fly3StartupPending
+        or flyRuntime.Fly3StartupHandoffActive
+        or (flyRuntime.ProfileSwitchBlend and flyRuntime.ProfileSwitchBlend.Active)
+    if frame.isMoving or frame.profileSwitchBlocked then
+        flyRuntime.ProfileSwitchIdleTime = 0
+        flyRuntime.ProfileSwitchReady = false
+    else
+        flyRuntime.ProfileSwitchIdleTime = math.min(
+            flyRuntime.ProfileSwitchIdleTime + frame.dt,
+            FLY_CONFIG.PROFILE_SWITCH_IDLE_REQUIRED
+        )
+        flyRuntime.ProfileSwitchReady =
+            flyRuntime.ProfileSwitchIdleTime >= FLY_CONFIG.PROFILE_SWITCH_IDLE_REQUIRED
+    end
+
     -- ================================================================
     -- v57 FLIGHT DYNAMICS / MOMENTUM VISUALS
     -- ================================================================
@@ -4221,6 +4653,12 @@ local function updateFly(deltaTime)
         )
     end
 
+    -- Fly 3 backward has an authored falling pose. Camera-relative yaw in
+    -- Shift Lock must not add a procedural turn-bank on top of that pose.
+    if flyProfile == "Fly 3" and flyGui.ShiftLockOn then
+        frame.targetBank = frame.targetBank * (1 - math.clamp(flyBackwardWeight or 0, 0, 1))
+    end
+
     -- Enter a turn quickly, but let the body recover a little more lazily.
     -- That small asymmetry makes the real character feel like it has weight
     -- instead of mechanically matching the camera every frame.
@@ -4348,10 +4786,22 @@ local function updateFly(deltaTime)
     frame.brakingPitch = math.rad(5)
         * flyState.flyDecelerationBlend * b
 
-    frame.flyLeanPitch = math.rad(16) * frame.movementForward * b
-        + frame.accelerationPitch
-        - frame.brakingPitch
+    if flyProfile == "Fly 3" then
+        -- Preserve Fly 3's authored backward pose. Do not add the old 60-degree
+        -- procedural pitch to the falling animation; sideways normalization is
+        -- handled on the Root -> LowerTorso joint in PreSimulation.
+        frame.flyLeanPitch = math.rad(5) * math.max(frame.movementForward, 0) * b
+            + frame.accelerationPitch - frame.brakingPitch
+    else
+        frame.flyLeanPitch = math.rad(16) * frame.movementForward * b
+            + frame.accelerationPitch
+            - frame.brakingPitch
+    end
     frame.flyLeanRoll = math.rad(14) * frame.movementRight * b
+    -- V273 deliberately adds no extra global pitch/roll for Fly 3 backward.
+    -- The previous +30-degree pitch used the wrong axis, and the previous
+    -- positive roll was negated by the final pose equation. Correct the source
+    -- root-joint roll in PreSimulation instead, leaving flight orientation alone.
 
     -- Direction-change reaction: briefly counter-roll into a sharp change,
     -- then let the existing turn-bank system take over.
@@ -4364,6 +4814,10 @@ local function updateFly(deltaTime)
         * frame.directionSign
         * flyState.flyDirectionChangeBlend
         * b
+    if flyProfile == "Fly 3" and flyGui.ShiftLockOn then
+        frame.directionChangeRoll = frame.directionChangeRoll
+            * (1 - math.clamp(flyBackwardWeight or 0, 0, 1))
+    end
 
     frame.verticalTravelRatio = 0
     if frame.moveVector.Magnitude > 0.001 then
@@ -4388,15 +4842,28 @@ local function updateFly(deltaTime)
         frame.moveVector.X, 0, frame.moveVector.Z
     ).Magnitude
 
+    -- V279: in Shift Lock, moving backward multiplies cameraLook.Y by a
+    -- negative forward input, which reverses the pitch response even though
+    -- the camera is still looking up/down in the same direction. For Fly 3
+    -- backward travel only, rebuild this vertical component from camera pitch
+    -- and the magnitude of backward input. Keep independent vertical input's
+    -- sign unchanged, and leave other profiles/directions on the original path.
+    frame.flightPitchVertical = frame.moveVector.Y
+    if flyProfile == "Fly 3" and flyGui.ShiftLockOn and frame.forwardInput < -0.1 then
+        frame.flightPitchVertical =
+            frame.cameraLook.Y * math.abs(frame.forwardInput)
+            + flyRuntime.VerticalInput
+    end
+
     frame.flightPitchTarget = 0
     if frame.isMoving then
         if frame.travelHorizontalMagnitude > 0.001 then
             frame.flightPitchTarget = math.atan2(
-                frame.moveVector.Y,
+                frame.flightPitchVertical,
                 frame.travelHorizontalMagnitude
             )
-        elseif math.abs(frame.moveVector.Y) > 0.001 then
-            frame.flightPitchTarget = frame.moveVector.Y > 0
+        elseif math.abs(frame.flightPitchVertical) > 0.001 then
+            frame.flightPitchTarget = frame.flightPitchVertical > 0
                 and math.rad(90)
                 or math.rad(-90)
         end
@@ -4462,9 +4929,16 @@ local function updateFly(deltaTime)
     if flyRuntime.NormalVelocityAlign then
         flyRuntime.NormalVelocityAlign.Enabled = not startupFrame
     end
+    local handoffLiftStep = flyRuntime.Fly3StartupHandoffLiftStep or 0
+    flyRuntime.Fly3StartupHandoffLiftStep = 0
     if flyGui.MovementMode == "Normal" and not startupFrame and flyRuntime.NormalOrientationAlign then
         -- V245: Normal mode delegates root orientation to AlignOrientation.
-        -- Keep translation physics-owned; do not write root.CFrame here.
+        -- Translation remains physics-owned, except for the small eased v280
+        -- handoff-lift increments that avoid a one-frame vertical discontinuity.
+        if math.abs(handoffLiftStep) > 0.000001 then
+            root.CFrame = CFrame.new(root.Position + Vector3.new(0, handoffLiftStep, 0))
+                * root.CFrame.Rotation
+        end
         flyRuntime.NormalOrientationTarget = frame.animatedCFrame.Rotation
         flyRuntime.Position = root.Position
 
@@ -4472,11 +4946,18 @@ local function updateFly(deltaTime)
         -- Startup owns the root position even when No Clip is OFF so physics
         -- cannot cancel the procedural takeoff. Once startup finishes, the
         -- normal No Clip ON/OFF position ownership resumes unchanged.
+        if math.abs(handoffLiftStep) > 0.000001 then
+            flyRuntime.Position = flyRuntime.Position + Vector3.new(0, handoffLiftStep, 0)
+        end
         root.CFrame = CFrame.new(flyRuntime.Position) * frame.animatedCFrame.Rotation
         root.AssemblyLinearVelocity = Vector3.zero
     else
-        root.CFrame = CFrame.new(root.Position) * frame.animatedCFrame.Rotation
-        flyRuntime.Position = root.Position
+        local finalRootPosition = root.Position
+        if math.abs(handoffLiftStep) > 0.000001 then
+            finalRootPosition = finalRootPosition + Vector3.new(0, handoffLiftStep, 0)
+        end
+        root.CFrame = CFrame.new(finalRootPosition) * frame.animatedCFrame.Rotation
+        flyRuntime.Position = finalRootPosition
     end
     -- Normal mode delegates angular response to its physics actuator. Zeroing
     -- angular velocity every render step would continually oppose that actuator.
@@ -4703,6 +5184,108 @@ local function startFly2Startup(humanoid)
     return true
 end
 
+local function startFly3Startup(humanoid)
+    local track = flyRuntime.Tracks.fly3Startup
+    if not humanoid or not track then
+        return false
+    end
+
+    flyRuntime.Fly3StartupPending = true
+    flyRuntime.Fly3StartupHandoffActive = false
+    flyRuntime.Fly3StartupHandoffTrack = nil
+    flyRuntime.Fly3StartupHandoffElapsed = 0
+    flyRuntime.Fly3StartupHandoffLiftApplied = 0
+    flyRuntime.Fly3StartupHandoffLiftStep = 0
+    flyStartup.Active = true
+    flyStartup.AssetActive = true
+    flyStartup.AnimationReady = true
+    flyStartup.Time = 0
+    flyStartup.StartPosition = flyRuntime.Position
+    flyStartup.LaunchActive = false
+    flyStartup.FinalBlendActive = false
+    track.Priority = Enum.AnimationPriority.Action4
+    track.Looped = false
+    track:Play(0.12, 1, 1)
+
+    local sessionId = flyCameraHandoff.SessionId
+    task.spawn(function()
+        local lengthDeadline = os.clock() + 2
+        while flyRuntime.Enabled and flyRuntime.Fly3StartupPending
+            and sessionId == flyCameraHandoff.SessionId
+            and flyProfile == "Fly 3" and track.Length <= 0.05
+            and os.clock() < lengthDeadline do
+            task.wait()
+        end
+
+        if not flyRuntime.Enabled or not flyRuntime.Fly3StartupPending
+            or sessionId ~= flyCameraHandoff.SessionId or flyProfile ~= "Fly 3" then
+            return
+        end
+
+        if track.Length > 0.05 then
+            local startupLength = track.Length
+            local startupStopAt = math.min(
+                math.max(startupLength - 0.04, 0),
+                FLY_CONFIG.FLY3_STARTUP_PLAY_SECONDS
+            )
+            -- V285: keep the headache section at its authored 1x speed.
+            -- Once the same track reaches 1.2 seconds, smoothly ramp playback
+            -- to 2x over 0.25 seconds so the ascent feels quicker without a
+            -- time-position reset or a second startup animation.
+            local ascentRampStartedAt = nil
+            local ascentRampComplete = false
+            while flyRuntime.Enabled and flyRuntime.Fly3StartupPending
+                and sessionId == flyCameraHandoff.SessionId and flyProfile == "Fly 3"
+                and track.IsPlaying and track.TimePosition < startupStopAt do
+                if not ascentRampStartedAt
+                    and track.TimePosition >= FLY_CONFIG.FLY3_STARTUP_HEADACHE_SECONDS then
+                    ascentRampStartedAt = os.clock()
+                end
+                if ascentRampStartedAt and not ascentRampComplete then
+                    local speedRampAlpha = math.clamp(
+                        (os.clock() - ascentRampStartedAt)
+                            / math.max(FLY_CONFIG.FLY3_STARTUP_SPEED_RAMP_SECONDS, 0.01),
+                        0,
+                        1
+                    )
+                    local playbackSpeed = 1
+                        + (FLY_CONFIG.FLY3_STARTUP_ASCEND_SPEED - 1) * speedRampAlpha
+                    pcall(function() track:AdjustSpeed(playbackSpeed) end)
+                    ascentRampComplete = speedRampAlpha >= 1
+                end
+                task.wait()
+            end
+        end
+
+        if not flyRuntime.Enabled or not flyRuntime.Fly3StartupPending
+            or sessionId ~= flyCameraHandoff.SessionId or flyProfile ~= "Fly 3" then
+            return
+        end
+
+        flyRuntime.Fly3StartupPending = false
+        flyStartup.Active = false
+        flyStartup.AssetActive = false
+        flyStartup.AnimationReady = false
+        flyStartup.Time = 0
+        flyStartup.StartPosition = nil
+
+        -- V280: hold the last startup pose while it crossfades into the live
+        -- flight state. The outgoing/incoming tracks and startup lift use the
+        -- same eased progress, avoiding both a pose pop and a one-frame root jump.
+        flyRuntime.Fly3StartupHandoffTrack = track
+        flyRuntime.Fly3StartupHandoffActive = true
+        flyRuntime.Fly3StartupHandoffElapsed = 0
+        flyRuntime.Fly3StartupHandoffLiftApplied = 0
+        flyRuntime.Fly3StartupHandoffLiftStep = 0
+        pcall(function()
+            track:AdjustSpeed(0)
+            track:AdjustWeight(1, 0)
+        end)
+        startNormalFlyAnimationSet(true)
+    end)
+    return true
+end
+
 local function enableFly()
     if flyRuntime.Enabled then return true end
 
@@ -4773,6 +5356,17 @@ local function enableFly()
     end
 
     flyRuntime.Enabled = true
+    flyRuntime.ProfileSwitchIdleTime = 0
+    flyRuntime.ProfileSwitchReady = false
+    flyRuntime.ProfileSwitchNotice = nil
+    flyRuntime.ProfileSwitchBlend = {
+        Active = false,
+        Elapsed = 0,
+        Duration = FLY_CONFIG.PROFILE_SWITCH_BLEND_TIME,
+        IncomingTrack = nil,
+        OutgoingWeights = {},
+        OutgoingTracks = {},
+    }
     -- Preserve the user's Shift Lock state across Fly disable/enable.
     -- It defaults to ON for the first session, then follows the user's last choice.
     -- Do not reset flyGui.ShiftLockOn here.
@@ -4987,6 +5581,24 @@ local function enableFly()
         else
             startNormalFlyAnimationSet(true)
         end
+    elseif flyProfile == "Fly 3" then
+        if flyStartup.AnimationEnabled then
+            if not startFly3Startup(humanoid) then
+                flyStartup.Active = false
+                flyStartup.AssetActive = false
+                flyStartup.AnimationReady = false
+                flyStartup.Time = 0
+                flyStartup.StartPosition = nil
+                startNormalFlyAnimationSet(true)
+            end
+        else
+            flyStartup.Active = false
+            flyStartup.AssetActive = false
+            flyStartup.AnimationReady = false
+            flyStartup.Time = 0
+            flyStartup.StartPosition = nil
+            startNormalFlyAnimationSet(true)
+        end
     elseif flyStartup.AnimationEnabled then
         local usingStartupAsset = startFlyStartupAnimation(humanoid)
         if not usingStartupAsset then
@@ -5084,7 +5696,7 @@ local function stopFlyCameraHandoff()
             flyServices.Player.CameraMinZoomDistance = savedMinZoom
         end
         if savedMaxZoom ~= nil then
-            flyServices.Player.CameraMaxZoomDistance = savedMaxZoom
+            flyServices.Player.CameraMaxZoomDistance = 200
         end
     end)
 
@@ -5277,8 +5889,31 @@ local function disableFly()
     end
 
     flyRuntime.Enabled = false
+    flyRuntime.ProfileSwitchIdleTime = 0
+    flyRuntime.ProfileSwitchReady = false
+    if flyRuntime.ProfileSwitchBlend then
+        -- A Fly disable can interrupt a profile crossfade. Explicitly clean the
+        -- outgoing profile's tracks before dropping their references, because
+        -- they are no longer stored in flyRuntime.Tracks during the blend.
+        for _, oldTrack in ipairs(flyRuntime.ProfileSwitchBlend.OutgoingTracks) do
+            if oldTrack then
+                pcall(function() oldTrack:Stop(0) end)
+                pcall(function() oldTrack:Destroy() end)
+            end
+        end
+        flyRuntime.ProfileSwitchBlend.Active = false
+        flyRuntime.ProfileSwitchBlend.IncomingTrack = nil
+        table.clear(flyRuntime.ProfileSwitchBlend.OutgoingWeights)
+        table.clear(flyRuntime.ProfileSwitchBlend.OutgoingTracks)
+    end
     flyRuntime.Fly2StartupPending = false
     flyRuntime.Fly2TornadoHandoffPending = false
+    flyRuntime.Fly3StartupPending = false
+    flyRuntime.Fly3StartupHandoffActive = false
+    flyRuntime.Fly3StartupHandoffTrack = nil
+    flyRuntime.Fly3StartupHandoffElapsed = 0
+    flyRuntime.Fly3StartupHandoffLiftApplied = 0
+    flyRuntime.Fly3StartupHandoffLiftStep = 0
     if flyProfile == "Fly 2" then
         -- Tear down both profile-owned tracks on the same session boundary.
         -- The delayed startup transition is separately invalidated by SessionId.
@@ -5377,7 +6012,7 @@ local function disableFly()
                         flyServices.Player.CameraMinZoomDistance = savedMinZoom
                     end
                     if savedMaxZoom ~= nil then
-                        flyServices.Player.CameraMaxZoomDistance = savedMaxZoom
+                        flyServices.Player.CameraMaxZoomDistance = 200
                     end
                 end
             )
@@ -5683,6 +6318,16 @@ flyServices.Player.CharacterAdded:Connect(function(character)
                 end
 
                 flyRuntime.Saved = nil
+                -- A respawn invalidates any crossfade tracks owned by the old
+                -- Animator; never keep an active switch lock across characters.
+                flyRuntime.ProfileSwitchIdleTime = 0
+                flyRuntime.ProfileSwitchReady = false
+                if flyRuntime.ProfileSwitchBlend then
+                    flyRuntime.ProfileSwitchBlend.Active = false
+                    flyRuntime.ProfileSwitchBlend.IncomingTrack = nil
+                    table.clear(flyRuntime.ProfileSwitchBlend.OutgoingWeights)
+                    table.clear(flyRuntime.ProfileSwitchBlend.OutgoingTracks)
+                end
                 saveCharacterState(newHumanoid, root)
                 bindFlyDeathCleanup(newHumanoid, thisFlySession)
 
@@ -5711,6 +6356,7 @@ flyServices.Player.CharacterAdded:Connect(function(character)
                 flyStartup.Time = 0
                 flyStartup.StartPosition = flyStartup.AnimationEnabled and flyRuntime.Position or nil
                 stopFlyStartupAnimation()
+                loadFlyAnimations(newHumanoid)
                 cacheFlyStartupJoints(newHumanoid.Parent)
                 if flyGui.ShiftLockOn then
                     flyBodyYaw = flyState.flyCameraYaw
@@ -5722,15 +6368,36 @@ flyServices.Player.CharacterAdded:Connect(function(character)
                 end
                 bankingState.PreviousDesiredYaw = flyBodyYaw
                 if flyStartup.AnimationEnabled then
-                    local usingStartupAsset = startFlyStartupAnimation(newHumanoid)
-                    if not usingStartupAsset then
+                    if flyProfile == "Fly 2" then
                         flyStartup.Active = false
-                        flyStartup.Time = 0
-                        flyStartup.StartPosition = nil
-                        startNormalFlyAnimationSet(true)
+                        if not startFly2Startup(newHumanoid) then
+                            startNormalFlyAnimationSet(true)
+                        end
+                    elseif flyProfile == "Fly 3" then
+                        if not startFly3Startup(newHumanoid) then
+                            flyStartup.Active = false
+                            flyStartup.AssetActive = false
+                            flyStartup.AnimationReady = false
+                            flyStartup.Time = 0
+                            flyStartup.StartPosition = nil
+                            startNormalFlyAnimationSet(true)
+                        end
+                    else
+                        local usingStartupAsset = startFlyStartupAnimation(newHumanoid)
+                        if not usingStartupAsset then
+                            flyStartup.Active = false
+                            flyStartup.Time = 0
+                            flyStartup.StartPosition = nil
+                            startNormalFlyAnimationSet(true)
+                        end
                     end
                 else
+                    flyRuntime.Fly2StartupPending = false
+                    flyRuntime.Fly2TornadoHandoffPending = false
+                    flyRuntime.Fly3StartupPending = false
                     flyStartup.Active = false
+                    flyStartup.AssetActive = false
+                    flyStartup.AnimationReady = false
                     flyStartup.Time = 0
                     flyStartup.StartPosition = nil
                     startNormalFlyAnimationSet(true)
@@ -5844,7 +6511,7 @@ ui.versionLabel = Instance.new("TextLabel")
 ui.versionLabel.Size = UDim2.fromOffset(34, 18)
 ui.versionLabel.Position = UDim2.new(1, -67, 0, 10)
 ui.versionLabel.BackgroundTransparency = 1
-ui.versionLabel.Text = "V262"
+ui.versionLabel.Text = "V285"
 ui.versionLabel.TextColor3 = Color3.fromRGB(145, 145, 145)
 ui.versionLabel.Font = Enum.Font.Gotham
 ui.versionLabel.TextSize = 9
@@ -5974,6 +6641,35 @@ ui.profileToggle.TextSize = 10
 ui.profileToggle.Parent = ui.panel
 Instance.new("UICorner", ui.profileToggle).CornerRadius = UDim.new(0, 8)
 
+ui.profileDropdown = Instance.new("Frame")
+ui.profileDropdown.Name = "ProfileDropdown"
+ui.profileDropdown.Size = UDim2.fromOffset(200, 96)
+ui.profileDropdown.Position = UDim2.fromOffset(10, 266)
+ui.profileDropdown.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+ui.profileDropdown.BackgroundTransparency = 0.02
+ui.profileDropdown.BorderSizePixel = 0
+ui.profileDropdown.Visible = false
+ui.profileDropdown.ZIndex = 20
+ui.profileDropdown.Parent = ui.panel
+Instance.new("UICorner", ui.profileDropdown).CornerRadius = UDim.new(0, 8)
+ui.profileOptions = {}
+for profileIndex, profileName in ipairs({"Fly 1", "Fly 2", "Fly 3"}) do
+    local option = Instance.new("TextButton")
+    option.Name = "Select" .. string.gsub(profileName, " ", "")
+    option.Size = UDim2.new(1, -8, 0, 27)
+    option.Position = UDim2.fromOffset(4, 3 + (profileIndex - 1) * 30)
+    option.BackgroundColor3 = Color3.fromRGB(43, 43, 43)
+    option.BorderSizePixel = 0
+    option.TextColor3 = Color3.new(1, 1, 1)
+    option.Font = Enum.Font.GothamBold
+    option.TextSize = 10
+    option.Text = profileName
+    option.ZIndex = 21
+    option.Parent = ui.profileDropdown
+    Instance.new("UICorner", option).CornerRadius = UDim.new(0, 6)
+    ui.profileOptions[profileName] = option
+end
+
 ui.hint.Parent = ui.panel
 
 -- Small shortcut button used after the mini GUI is hidden.
@@ -6025,7 +6721,9 @@ flyGui.ShiftLockButton.Activated:Connect(function()
 end)
 
 local function refreshUI()
-    if flyRuntime.Enabled and flyStartup.Active then
+    if flyRuntime.ProfileSwitchNotice then
+        ui.status.Text = flyRuntime.ProfileSwitchNotice
+    elseif flyRuntime.Enabled and flyStartup.Active then
         ui.status.Text = "TAKEOFF  •  Speed " .. tostring(math.floor(flyRuntime.Speed + 0.5))
     elseif flyRuntime.Enabled then
         ui.status.Text = "ON  •  Speed " .. tostring(math.floor(flyRuntime.Speed + 0.5))
@@ -6040,6 +6738,10 @@ local function refreshUI()
     ui.cameraFeelToggle.Text = "CAMERA FEEL  •  " .. (flyGui.CameraFeelOn and "ON" or "OFF")
     ui.startupAnimationToggle.Text = "STARTUP ANIMATION  •  " .. (flyStartup.AnimationEnabled and "ON" or "OFF")
     ui.profileToggle.Text = "PROFILE  •  " .. flyProfile
+    for profileName, option in pairs(ui.profileOptions) do
+        option.BackgroundColor3 = profileName == flyProfile
+            and Color3.fromRGB(24, 82, 132) or Color3.fromRGB(43, 43, 43)
+    end
 end
 
 local function showMiniGui(show)
@@ -6057,13 +6759,189 @@ ui.closeButton.Activated:Connect(function()
     end
 end)
 
-ui.profileToggle.Activated:Connect(function()
-    if flyRuntime.Enabled then return end
-    flyProfile = flyProfile == "Fly 1" and "Fly 2" or "Fly 1"
+local function setProfileSwitchNotice(message, duration)
+    flyRuntime.ProfileSwitchNoticeToken += 1
+    local noticeToken = flyRuntime.ProfileSwitchNoticeToken
+    flyRuntime.ProfileSwitchNotice = message
     refreshUI()
+    task.delay(duration or 1.4, function()
+        if flyRuntime.ProfileSwitchNoticeToken == noticeToken then
+            flyRuntime.ProfileSwitchNotice = nil
+            refreshUI()
+        end
+    end)
+end
+
+local function switchProfileInPlace(targetProfile)
+    if targetProfile == flyProfile then
+        ui.profileDropdown.Visible = false
+        refreshUI()
+        return true
+    end
+
+    if not flyRuntime.Enabled then
+        flyProfile = targetProfile
+        ui.profileDropdown.Visible = false
+        refreshUI()
+        return true
+    end
+
+    local profileBlend = flyRuntime.ProfileSwitchBlend
+    if not flyRuntime.ProfileSwitchReady or not profileBlend or profileBlend.Active then
+        local waitingForStartup = flyStartup.Active
+            or flyStartup.LaunchActive
+            or flyStartup.FinalBlendActive
+            or flyRuntime.Fly2StartupPending
+            or flyRuntime.Fly2TornadoHandoffPending
+            or flyRuntime.Fly3StartupPending
+            or flyRuntime.Fly3StartupHandoffActive
+        setProfileSwitchNotice(
+            waitingForStartup and "WAIT FOR FLIGHT IDLE" or "STOP MOVING TO SWITCH",
+            1.35
+        )
+        return false
+    end
+
+    local humanoid = select(1, getHumanoidAndRoot())
+    if not humanoid then
+        setProfileSwitchNotice("CHARACTER NOT READY", 1.35)
+        return false
+    end
+
+    local previousProfile = flyProfile
+    local outgoingTracks = flyRuntime.Tracks
+    flyRuntime.Tracks = {}
+    flyProfile = targetProfile
+    loadFlyAnimations(humanoid)
+    local incomingTracks = flyRuntime.Tracks
+    local incomingTrack = targetProfile == "Fly 2"
+        and incomingTracks.tornado
+        or incomingTracks.idle
+
+    if not incomingTrack then
+        for _, track in pairs(incomingTracks) do
+            pcall(function() track:Stop(0) end)
+            pcall(function() track:Destroy() end)
+        end
+        flyRuntime.Tracks = outgoingTracks
+        flyProfile = previousProfile
+        setProfileSwitchNotice("PROFILE LOAD FAILED", 1.6)
+        return false
+    end
+
+    local outgoingWeights = {}
+    local outgoingAllTracks = {}
+    for _, track in pairs(outgoingTracks) do
+        if track then
+            table.insert(outgoingAllTracks, track)
+            if track.IsPlaying then
+                local startWeight = 1
+                pcall(function() startWeight = track.WeightCurrent end)
+                if startWeight > 0.001 then
+                    table.insert(outgoingWeights, {
+                        Track = track,
+                        StartWeight = startWeight,
+                    })
+                end
+            end
+        end
+    end
+
+    local incomingSpeed = targetProfile == "Fly 2"
+        and FLY_CONFIG.FLY2_TORNADO_SPEED
+        or 1
+    pcall(function()
+        incomingTrack:Play(0, 0, incomingSpeed)
+        incomingTrack:AdjustWeight(0, 0)
+    end)
+
+    flyRuntime.ProfileSwitchBlend = {
+        Active = true,
+        Elapsed = 0,
+        Duration = FLY_CONFIG.PROFILE_SWITCH_BLEND_TIME,
+        IncomingTrack = incomingTrack,
+        OutgoingWeights = outgoingWeights,
+        OutgoingTracks = outgoingAllTracks,
+    }
+    flyRuntime.ProfileSwitchIdleTime = 0
+    flyRuntime.ProfileSwitchReady = false
+    flyIdleWeight = 0
+    flyMoveWeight = 0
+    flyBackwardWeight = 0
+    animState.flyAnimState = "Idle"
+    animState.flyPreviousDesiredState = "Idle"
+    animState.flyIdleStableTime = 0
+    flyIdleFidget.idleTime = 0
+    flyIdleFidget.active = false
+    flyIdleFidget.elapsed = 0
+    flyIdleFidget.interrupting = false
+    flyIdleFidget.interruptElapsed = 0
+    flyIdleFidget.interruptRemaining = 0
+
+    ui.profileDropdown.Visible = false
+    setProfileSwitchNotice("SWITCHING TO " .. string.upper(targetProfile), 1.6)
+    return true
+end
+
+local profilePressState = {
+    input = nil,
+    token = 0,
+    longTriggered = false,
+    holdSeconds = 0.45,
+}
+
+ui.profileToggle.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+        and input.UserInputType ~= Enum.UserInputType.Touch then
+        return
+    end
+    profilePressState.token += 1
+    local token = profilePressState.token
+    profilePressState.input = input
+    profilePressState.longTriggered = false
+    task.delay(profilePressState.holdSeconds, function()
+        if profilePressState.token ~= token or profilePressState.input ~= input then
+            return
+        end
+        profilePressState.longTriggered = true
+        ui.profileDropdown.Visible = true
+    end)
 end)
 
+ui.profileToggle.InputEnded:Connect(function(input)
+    if input ~= profilePressState.input then return end
+    profilePressState.input = nil
+    profilePressState.token += 1
+    if profilePressState.longTriggered then
+        profilePressState.longTriggered = false
+        return
+    end
+    local currentIndex = flyProfile == "Fly 1" and 1 or (flyProfile == "Fly 2" and 2 or 3)
+    currentIndex = currentIndex % 3 + 1
+    local targetProfile = "Fly " .. tostring(currentIndex)
+    if flyRuntime.Enabled then
+        switchProfileInPlace(targetProfile)
+    else
+        flyProfile = targetProfile
+        ui.profileDropdown.Visible = false
+        refreshUI()
+    end
+end)
+
+for profileName, option in pairs(ui.profileOptions) do
+    option.Activated:Connect(function()
+        if flyRuntime.Enabled then
+            switchProfileInPlace(profileName)
+        else
+            flyProfile = profileName
+            ui.profileDropdown.Visible = false
+            refreshUI()
+        end
+    end)
+end
+
 ui.toggle.Activated:Connect(function()
+    ui.profileDropdown.Visible = false
     if flyRuntime.Enabled then disableFly() else enableFly() end
 end)
 
@@ -6112,7 +6990,19 @@ ui.startupAnimationToggle.Activated:Connect(function()
     -- affects the next Fly activation (not the current session).
     if not flyStartup.AnimationEnabled and flyRuntime.Enabled then
         local fly2StartupTrack = flyRuntime.Tracks.fly2Startup
-        if flyProfile == "Fly 2" and flyRuntime.Fly2StartupPending then
+        local fly3StartupTrack = flyRuntime.Tracks.fly3Startup
+        if flyProfile == "Fly 3" and flyRuntime.Fly3StartupPending then
+            flyRuntime.Fly3StartupPending = false
+            flyStartup.Active = false
+            flyStartup.AssetActive = false
+            flyStartup.AnimationReady = false
+            flyStartup.Time = 0
+            flyStartup.StartPosition = nil
+            if fly3StartupTrack then
+                pcall(function() fly3StartupTrack:Stop(0.25) end)
+            end
+            startNormalFlyAnimationSet(true)
+        elseif flyProfile == "Fly 2" and flyRuntime.Fly2StartupPending then
             flyRuntime.Fly2StartupPending = false
             flyRuntime.Fly2TornadoHandoffPending = false
             if fly2StartupTrack then
